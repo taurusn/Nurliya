@@ -97,6 +97,8 @@ class ScrapeJob(Base):
     error_message = Column(Text)
     created_at = Column(TIMESTAMP, default=datetime.utcnow)
     completed_at = Column(TIMESTAMP)
+    notification_email = Column(String(255))  # User's email for completion report
+    email_sent_at = Column(TIMESTAMP)  # Prevents duplicate email sends
 
 
 def get_session():

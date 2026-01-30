@@ -189,13 +189,14 @@ def run_producer_sync(csv_path: str) -> dict:
     return result
 
 
-def create_scrape_job(query: str) -> ScrapeJob:
+def create_scrape_job(query: str, notification_email: str = None) -> ScrapeJob:
     """Create a new ScrapeJob record."""
     session = get_session()
     try:
         job = ScrapeJob(
             query=query,
             status="pending",
+            notification_email=notification_email,
         )
         session.add(job)
         session.commit()

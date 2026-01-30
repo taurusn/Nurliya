@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nurliya Report: {{ query }}</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+            line-height: 1.5;
+            color: #1a1a1a;
+            background-color: #f3f4f6;
+            padding: 20px;
+        }
+        .container {
+            max-width: 640px;
+            margin: 0 auto;
+            background: #fff;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+        }
+
+        /* Header */
+        .header {
+            background: linear-gradient(135deg, #1e3a5f 0%, #2d5a87 100%);
+            color: #fff;
+            padding: 28px 24px;
+            text-align: center;
+        }
+        .header h1 {
+            font-size: 20px;
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+        .header .subtitle {
+            font-size: 13px;
+            opacity: 0.85;
+        }
+
+        /* Urgent Banner */
+        .urgent-banner {
+            background: #fef2f2;
+            border-bottom: 2px solid #ef4444;
+            padding: 16px 24px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .urgent-banner .icon {
+            width: 40px;
+            height: 40px;
+            background: #ef4444;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #fff;
+            font-size: 20px;
+            flex-shrink: 0;
+        }
+        .urgent-banner .content h3 {
+            color: #991b1b;
+            font-size: 14px;
+            font-weight: 600;
+        }
+        .urgent-banner .content p {
+            color: #b91c1c;
+            font-size: 13px;
+        }
+
+        /* Section */
+        .section {
+            padding: 24px;
+            border-bottom: 1px solid #e5e7eb;
+        }
+        .section:last-child { border-bottom: none; }
+        .section-title {
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: #6b7280;
+            margin-bottom: 16px;
+        }
+
+        /* Place Card */
+        .place-card {
+            background: #f9fafb;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 16px;
+        }
+        .place-name {
+            font-size: 18px;
+            font-weight: 600;
+            color: #111827;
+            margin-bottom: 4px;
+        }
+        .place-meta {
+            font-size: 13px;
+            color: #6b7280;
+            margin-bottom: 16px;
+        }
+
+        /* Stats Row */
+        .stats-row {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+        .stat-box {
+            flex: 1;
+            background: #fff;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 12px;
+            text-align: center;
+        }
+        .stat-value {
+            font-size: 24px;
+            font-weight: 700;
+            color: #111827;
+        }
+        .stat-value.positive { color: #059669; }
+        .stat-value.negative { color: #dc2626; }
+        .stat-value.neutral { color: #d97706; }
+        .stat-label {
+            font-size: 11px;
+            color: #6b7280;
+            margin-top: 2px;
+        }
+
+        /* Sentiment Bar */
+        .sentiment-bar-container {
+            margin-bottom: 16px;
+        }
+        .sentiment-bar {
+            height: 8px;
+            border-radius: 4px;
+            overflow: hidden;
+            display: flex;
+            background: #e5e7eb;
+        }
+        .sentiment-bar .positive { background: #10b981; }
+        .sentiment-bar .neutral { background: #f59e0b; }
+        .sentiment-bar .negative { background: #ef4444; }
+        .sentiment-legend {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 8px;
+            font-size: 12px;
+            color: #6b7280;
+        }
+
+        /* Insights */
+        .insight-box {
+            background: #fff;
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 12px;
+            border-left: 4px solid;
+        }
+        .insight-box.positive {
+            border-color: #10b981;
+            background: #f0fdf4;
+        }
+        .insight-box.negative {
+            border-color: #ef4444;
+            background: #fef2f2;
+        }
+        .insight-box h4 {
+            font-size: 13px;
+            font-weight: 600;
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .insight-box.positive h4 { color: #065f46; }
+        .insight-box.negative h4 { color: #991b1b; }
+
+        /* Topic Tags */
+        .topics {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-bottom: 12px;
+        }
+        .topic-tag {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        .topic-tag.positive {
+            background: #d1fae5;
+            color: #065f46;
+        }
+        .topic-tag.negative {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+
+        /* Review Quote */
+        .review-quote {
+            font-size: 13px;
+            color: #374151;
+            font-style: italic;
+            padding: 10px 12px;
+            background: rgba(255,255,255,0.7);
+            border-radius: 6px;
+            margin-top: 8px;
+        }
+        .review-quote::before { content: '"'; }
+        .review-quote::after { content: '"'; }
+
+        /* Rating Stars */
+        .rating-display {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 12px;
+        }
+        .stars {
+            color: #fbbf24;
+            font-size: 16px;
+        }
+        .rating-text {
+            font-size: 14px;
+            font-weight: 600;
+            color: #374151;
+        }
+
+        /* Action Items */
+        .action-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            padding: 12px;
+            background: #eff6ff;
+            border-radius: 8px;
+            margin-bottom: 8px;
+        }
+        .action-item .number {
+            width: 24px;
+            height: 24px;
+            background: #2563eb;
+            color: #fff;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 12px;
+            font-weight: 600;
+            flex-shrink: 0;
+        }
+        .action-item p {
+            font-size: 13px;
+            color: #1e40af;
+        }
+
+        /* Footer */
+        .footer {
+            background: #f9fafb;
+            padding: 20px 24px;
+            text-align: center;
+        }
+        .footer p {
+            font-size: 12px;
+            color: #6b7280;
+        }
+        .footer .brand {
+            font-weight: 600;
+            color: #1e3a5f;
+        }
+
+        /* RTL Support */
+        .ar {
+            direction: rtl;
+            text-align: right;
+            font-family: 'Segoe UI', Tahoma, Arial, sans-serif;
+        }
+
+        /* Mobile */
+        @media (max-width: 480px) {
+            body { padding: 10px; }
+            .stats-row { flex-direction: column; }
+            .section { padding: 20px 16px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <h1>Sentiment Analysis Report</h1>
+            <div class="subtitle">{{ query }} | {{ generated_at }}</div>
+        </div>
+
+        {% if total_urgent > 0 %}
+        <!-- Urgent Alert -->
+        <div class="urgent-banner">
+            <div class="icon">!</div>
+            <div class="content">
+                <h3>{{ total_urgent }} Urgent Issue{{ 's' if total_urgent > 1 else '' }} Detected</h3>
+                <p>Reviews flagged for immediate attention - check negative feedback below</p>
+            </div>
+        </div>
+        {% endif %}
+
+        <!-- Executive Summary -->
+        <div class="section">
+            <div class="section-title">Executive Summary</div>
+
+            <div class="stats-row">
+                <div class="stat-box">
+                    <div class="stat-value">{{ total_reviews }}</div>
+                    <div class="stat-label">Reviews Analyzed</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value positive">{{ overall_positive_pct }}%</div>
+                    <div class="stat-label">Positive</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value {% if overall_negative_pct > 20 %}negative{% else %}neutral{% endif %}">{{ overall_negative_pct }}%</div>
+                    <div class="stat-label">Negative</div>
+                </div>
+            </div>
+
+            <div class="sentiment-bar-container">
+                <div class="sentiment-bar">
+                    {% if overall_positive_pct > 0 %}<div class="positive" style="width: {{ overall_positive_pct }}%"></div>{% endif %}
+                    {% if overall_neutral_pct > 0 %}<div class="neutral" style="width: {{ overall_neutral_pct }}%"></div>{% endif %}
+                    {% if overall_negative_pct > 0 %}<div class="negative" style="width: {{ overall_negative_pct }}%"></div>{% endif %}
+                </div>
+                <div class="sentiment-legend">
+                    <span>Positive: {{ overall_positive }}</span>
+                    <span>Neutral: {{ overall_neutral }}</span>
+                    <span>Negative: {{ overall_negative }}</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Per Place Details -->
+        {% for place in places_stats %}
+        <div class="section">
+            <div class="section-title">Place Analysis</div>
+
+            <div class="place-card">
+                <div class="place-name">{{ place.name }}</div>
+                <div class="place-meta">
+                    {% if place.category %}{{ place.category }} | {% endif %}
+                    {% if place.google_rating %}Google Rating: {{ place.google_rating }} ({{ place.google_review_count }} reviews){% endif %}
+                </div>
+
+                {% set total = place.sentiment.positive + place.sentiment.neutral + place.sentiment.negative %}
+                {% if total > 0 %}
+                <div class="sentiment-bar-container">
+                    <div class="sentiment-bar">
+                        {% set pos_pct = (place.sentiment.positive / total * 100)|round(0)|int %}
+                        {% set neu_pct = (place.sentiment.neutral / total * 100)|round(0)|int %}
+                        {% set neg_pct = (place.sentiment.negative / total * 100)|round(0)|int %}
+                        {% if pos_pct > 0 %}<div class="positive" style="width: {{ pos_pct }}%"></div>{% endif %}
+                        {% if neu_pct > 0 %}<div class="neutral" style="width: {{ neu_pct }}%"></div>{% endif %}
+                        {% if neg_pct > 0 %}<div class="negative" style="width: {{ neg_pct }}%"></div>{% endif %}
+                    </div>
+                    <div class="sentiment-legend">
+                        <span>+{{ place.sentiment.positive }}</span>
+                        <span>~{{ place.sentiment.neutral }}</span>
+                        <span>-{{ place.sentiment.negative }}</span>
+                    </div>
+                </div>
+                {% endif %}
+            </div>
+
+            <!-- What Customers Love -->
+            {% if place.top_positive or place.positive_summaries %}
+            <div class="insight-box positive">
+                <h4>What Customers Love</h4>
+                {% if place.top_positive %}
+                <div class="topics">
+                    {% for topic in place.top_positive[:5] %}
+                    <span class="topic-tag positive">{{ topic.name }} ({{ topic.count }})</span>
+                    {% endfor %}
+                </div>
+                {% endif %}
+                {% if place.positive_summaries %}
+                {% for summary in place.positive_summaries[:2] %}
+                <div class="review-quote">{{ summary }}</div>
+                {% endfor %}
+                {% endif %}
+            </div>
+            {% endif %}
+
+            <!-- Areas for Improvement -->
+            {% if place.top_negative or place.negative_summaries %}
+            <div class="insight-box negative">
+                <h4>Areas for Improvement</h4>
+                {% if place.top_negative %}
+                <div class="topics">
+                    {% for topic in place.top_negative[:5] %}
+                    <span class="topic-tag negative">{{ topic.name }} ({{ topic.count }})</span>
+                    {% endfor %}
+                </div>
+                {% endif %}
+                {% if place.negative_summaries %}
+                {% for summary in place.negative_summaries[:2] %}
+                <div class="review-quote">{{ summary }}</div>
+                {% endfor %}
+                {% endif %}
+            </div>
+            {% endif %}
+
+            {% if place.urgent_count > 0 %}
+            <!-- Urgent Reviews -->
+            <div class="insight-box negative">
+                <h4>Urgent: {{ place.urgent_count }} Review{{ 's' if place.urgent_count > 1 else '' }} Need Attention</h4>
+                {% if place.urgent_summaries %}
+                {% for summary in place.urgent_summaries[:3] %}
+                <div class="review-quote">{{ summary }}</div>
+                {% endfor %}
+                {% endif %}
+            </div>
+            {% endif %}
+        </div>
+        {% endfor %}
+
+        <!-- Recommended Actions -->
+        {% if actions %}
+        <div class="section">
+            <div class="section-title">Recommended Actions</div>
+            {% for action in actions[:3] %}
+            <div class="action-item">
+                <div class="number">{{ loop.index }}</div>
+                <p>{{ action }}</p>
+            </div>
+            {% endfor %}
+        </div>
+        {% endif %}
+
+        <!-- Footer -->
+        <div class="footer">
+            <p>Generated by <span class="brand">Nurliya</span> - AI-powered review analysis</p>
+            <p style="margin-top: 8px; direction: rtl;">تم إنشاؤه بواسطة نورليا - تحليل المراجعات بالذكاء الاصطناعي</p>
+        </div>
+    </div>
+</body>
+</html>

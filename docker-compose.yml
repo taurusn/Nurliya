@@ -41,11 +41,7 @@ services:
     volumes:
       - scraper_data:/data
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
+      disable: true
     restart: unless-stopped
 
   api:
@@ -63,6 +59,13 @@ services:
       VLLM_BASE_URL: ${VLLM_BASE_URL:-http://host.docker.internal:8080/v1}
       VLLM_API_KEY: ${VLLM_API_KEY:-token-sadnxai}
       RESULTS_DIR: /app/results
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - results_data:/app/results
     depends_on:
@@ -71,7 +74,7 @@ services:
       rabbitmq:
         condition: service_healthy
       scraper:
-        condition: service_healthy
+        condition: service_started
     restart: unless-stopped
 
   worker:
@@ -84,6 +87,13 @@ services:
       RABBITMQ_URL: amqp://nurliya:${RABBITMQ_PASSWORD:-nurliya123}@rabbitmq:5672/
       VLLM_BASE_URL: ${VLLM_BASE_URL:-http://host.docker.internal:8080/v1}
       VLLM_API_KEY: ${VLLM_API_KEY:-token-sadnxai}
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy

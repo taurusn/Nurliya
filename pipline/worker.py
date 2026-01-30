@@ -3,9 +3,11 @@ import time
 import signal
 import sys
 from datetime import datetime
+from sqlalchemy import text
 from rabbitmq import get_consumer_channel, QUEUE_NAME
 from llm_client import analyze_review
-from database import Review, ReviewAnalysis, Job, get_session
+from database import Review, ReviewAnalysis, Job, ScrapeJob, get_session
+from email_service import send_completion_report, gather_scrape_job_stats
 
 
 # Graceful shutdown
@@ -21,8 +23,9 @@ signal.signal(signal.SIGTERM, signal_handler)
 
 
 def update_job_progress(job_id: str):
-    """Increment processed_reviews count."""
+    """Increment processed_reviews count and check for scrape job completion."""
     session = get_session()
+    job_completed = False
     try:
         job = session.query(Job).filter_by(id=job_id).first()
         if job:
@@ -30,9 +33,101 @@ def update_job_progress(job_id: str):
             if job.processed_reviews >= job.total_reviews:
                 job.status = "completed"
                 job.completed_at = datetime.utcnow()
+                job_completed = True
             else:
                 job.status = "processing"
             session.commit()
+    finally:
+        session.close()
+
+    # If this job just completed, check if the parent scrape job is done
+    if job_completed:
+        check_and_send_scrape_job_report(job_id)
+
+
+def check_and_send_scrape_job_report(completed_job_id: str):
+    """
+    Check if all pipeline jobs for a scrape job are complete,
+    and send the email report exactly once using advisory locks.
+    """
+    session = get_session()
+    try:
+        # Find the parent ScrapeJob that contains this pipeline job
+        completed_job = session.query(Job).filter_by(id=completed_job_id).first()
+        if not completed_job:
+            return
+
+        # Find scrape job that has this pipeline job in its list
+        scrape_job = (
+            session.query(ScrapeJob)
+            .filter(ScrapeJob.pipeline_job_ids.any(completed_job.id))
+            .first()
+        )
+
+        if not scrape_job:
+            return
+
+        # No email configured
+        if not scrape_job.notification_email:
+            return
+
+        # Use the scrape job's UUID integer value as lock key
+        # UUID.int gives a deterministic 128-bit integer, we take modulo to fit PostgreSQL's bigint
+        lock_key = scrape_job.id.int % (2**63 - 1)
+
+        # Try to acquire advisory lock (non-blocking)
+        lock_result = session.execute(
+            text("SELECT pg_try_advisory_lock(:key)"),
+            {"key": lock_key}
+        ).scalar()
+
+        if not lock_result:
+            # Another worker has the lock, they'll handle it
+            return
+
+        try:
+            # Re-fetch scrape job within lock to get fresh state
+            session.refresh(scrape_job)
+
+            # Check if email already sent
+            if scrape_job.email_sent_at is not None:
+                return
+
+            # Check if ALL pipeline jobs are completed
+            all_completed = True
+            if scrape_job.pipeline_job_ids:
+                for pipeline_job_id in scrape_job.pipeline_job_ids:
+                    pipeline_job = session.query(Job).filter_by(id=pipeline_job_id).first()
+                    if not pipeline_job or pipeline_job.status != "completed":
+                        all_completed = False
+                        break
+
+            if not all_completed:
+                return
+
+            # Mark email as sent BEFORE actually sending (prevents duplicates)
+            scrape_job.email_sent_at = datetime.utcnow()
+            session.commit()
+
+        finally:
+            # Release advisory lock
+            session.execute(
+                text("SELECT pg_advisory_unlock(:key)"),
+                {"key": lock_key}
+            )
+
+        # Send email OUTSIDE the transaction/lock
+        # Gather stats and send
+        report_data = gather_scrape_job_stats(str(scrape_job.id))
+        if report_data:
+            send_completion_report(
+                to_email=scrape_job.notification_email,
+                report_data=report_data,
+            )
+            print(f"[Worker] Email report triggered for scrape job {scrape_job.id}")
+
+    except Exception as e:
+        print(f"[Worker] Error checking scrape job completion: {e}")
     finally:
         session.close()
 

@@ -5,7 +5,7 @@ Provides REST API for scraping, job tracking, and review analysis.
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 from typing import Optional, List
 from uuid import UUID
 
@@ -39,6 +39,7 @@ class ScrapeRequest(BaseModel):
     depth: int = Field(10, ge=1, le=50, description="Scroll depth for results")
     lang: str = Field("en", description="Language code (en, ar)")
     max_time: int = Field(300, ge=60, le=1800, description="Max scrape time in seconds")
+    notification_email: Optional[EmailStr] = Field(None, description="Email address for completion report")
 
 
 class ScrapeResponse(BaseModel):
@@ -145,7 +146,7 @@ async def start_scrape(request: ScrapeRequest, background_tasks: BackgroundTasks
     3. Automatically process results when scraping completes
     """
     # Create job record
-    job = create_scrape_job(request.query)
+    job = create_scrape_job(request.query, notification_email=request.notification_email)
 
     # Start background task
     background_tasks.add_task(

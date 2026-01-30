@@ -30,6 +30,13 @@ VLLM_MODEL = os.getenv("VLLM_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
 API_HOST = os.getenv("API_HOST", "0.0.0.0")
 API_PORT = int(os.getenv("API_PORT", "8000"))
 
+# SMTP settings for email notifications
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")  # Gmail address
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")  # Gmail App Password
+SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL", "")  # Same as SMTP_USER typically
+
 # Deprecated - kept for backwards compatibility
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = "gemini-2.0-flash-lite"
