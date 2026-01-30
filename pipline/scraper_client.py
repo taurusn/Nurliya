@@ -24,6 +24,7 @@ class ScraperClient:
         email: bool = False,
         fast_mode: bool = False,
         max_time: int = 300,
+        extra_reviews: bool = True,  # Enable extended reviews (~300 max)
     ) -> str:
         """
         Create a new scrape job.
@@ -35,6 +36,7 @@ class ScraperClient:
             email: Extract emails from websites
             fast_mode: Use fast mode with reduced data
             max_time: Maximum scrape time in seconds
+            extra_reviews: Collect extended reviews up to ~300 (default True)
 
         Returns:
             Job ID from the scraper
@@ -50,6 +52,7 @@ class ScraperClient:
                     "email": email,
                     "fast_mode": fast_mode,
                     "max_time": max_time,
+                    "extra_reviews": extra_reviews,
                 },
             )
             response.raise_for_status()

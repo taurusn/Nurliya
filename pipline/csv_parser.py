@@ -1,6 +1,25 @@
 import json
+import math
 import pandas as pd
 from database import Place, Review, get_session
+
+
+def clean_value(value):
+    """Clean pandas NaN values to None for JSON serialization."""
+    if value is None:
+        return None
+    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+        return None
+    if pd.isna(value):
+        return None
+    return value
+
+
+def clean_dict(d):
+    """Recursively clean NaN values from a dictionary."""
+    if d is None:
+        return None
+    return {k: clean_value(v) if not isinstance(v, dict) else clean_dict(v) for k, v in d.items()}
 
 
 def parse_json_field(value):
@@ -21,14 +40,14 @@ def parse_csv(csv_path: str) -> list[dict]:
     for _, row in df.iterrows():
         # Parse place metadata
         place_data = {
-            "name": row.get("title"),
-            "place_id": row.get("place_id"),
-            "category": row.get("category"),
-            "address": row.get("address"),
+            "name": clean_value(row.get("title")),
+            "place_id": clean_value(row.get("place_id")),
+            "category": clean_value(row.get("category")),
+            "address": clean_value(row.get("address")),
             "rating": float(row["review_rating"]) if pd.notna(row.get("review_rating")) else None,
             "review_count": int(row["review_count"]) if pd.notna(row.get("review_count")) else 0,
             "reviews_per_rating": parse_json_field(row.get("reviews_per_rating")),
-            "metadata": {
+            "metadata": clean_dict({
                 "link": row.get("link"),
                 "website": row.get("website"),
                 "phone": row.get("phone"),
@@ -36,13 +55,16 @@ def parse_csv(csv_path: str) -> list[dict]:
                 "longitude": row.get("longitude"),
                 "open_hours": parse_json_field(row.get("open_hours")),
                 "complete_address": parse_json_field(row.get("complete_address")),
-            }
+            })
         }
 
-        # Parse reviews from user_reviews JSON field
+        # Parse reviews from user_reviews and user_reviews_extended JSON fields
         reviews_raw = parse_json_field(row.get("user_reviews")) or []
+        reviews_extended = parse_json_field(row.get("user_reviews_extended")) or []
+        # Combine both sources (extended has more reviews when extra_reviews is enabled)
+        all_reviews_raw = reviews_raw + reviews_extended
         reviews = []
-        for r in reviews_raw:
+        for r in all_reviews_raw:
             reviews.append({
                 "author": r.get("Name"),
                 "rating": r.get("Rating"),
