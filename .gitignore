@@ -1,0 +1,41 @@
+# Environment & Secrets
+.env
+.env.production
+*.env.local
+pipline/.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+
+# Results & Data
+results/*.csv
+results/*.json
+*.csv
+*.json
+!package.json
+!docker-compose.yml
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+*.log
+
+# Credentials
+credentials.json
+*.pem
+*.key

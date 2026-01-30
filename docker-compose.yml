@@ -1,0 +1,105 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: nurliya-postgres
+    environment:
+      POSTGRES_USER: nurliya
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-nurliya123}
+      POSTGRES_DB: nurliya
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nurliya"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: nurliya-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: nurliya
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-nurliya123}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_running"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  scraper:
+    build:
+      context: ./google-maps-scraper
+      dockerfile: Dockerfile
+    container_name: nurliya-scraper
+    command: ["-web", "-addr", ":8080", "-data-folder", "/data"]
+    volumes:
+      - scraper_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ./pipline
+      dockerfile: Dockerfile
+    container_name: nurliya-api
+    command: ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://nurliya:${DB_PASSWORD:-nurliya123}@postgres:5432/nurliya
+      RABBITMQ_URL: amqp://nurliya:${RABBITMQ_PASSWORD:-nurliya123}@rabbitmq:5672/
+      SCRAPER_API_URL: http://scraper:8080
+      VLLM_BASE_URL: ${VLLM_BASE_URL:-http://host.docker.internal:8080/v1}
+      VLLM_API_KEY: ${VLLM_API_KEY:-token-sadnxai}
+      RESULTS_DIR: /app/results
+    volumes:
+      - results_data:/app/results
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      scraper:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./pipline
+      dockerfile: Dockerfile
+    command: ["python", "worker.py"]
+    environment:
+      DATABASE_URL: postgresql://nurliya:${DB_PASSWORD:-nurliya123}@postgres:5432/nurliya
+      RABBITMQ_URL: amqp://nurliya:${RABBITMQ_PASSWORD:-nurliya123}@rabbitmq:5672/
+      VLLM_BASE_URL: ${VLLM_BASE_URL:-http://host.docker.internal:8080/v1}
+      VLLM_API_KEY: ${VLLM_API_KEY:-token-sadnxai}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      mode: replicated
+      replicas: 2
+
+volumes:
+  postgres_data:
+  rabbitmq_data:
+  scraper_data:
+  results_data:
+
+# For Linux hosts, add this to access host's vLLM:
+# extra_hosts:
+#   - "host.docker.internal:host-gateway"
