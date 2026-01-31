@@ -1,22 +1,36 @@
+"""
+Queue worker for processing review analysis tasks.
+Consumes messages from RabbitMQ and analyzes reviews using LLM.
+"""
+
 import json
 import time
 import signal
 import sys
 from datetime import datetime
 from sqlalchemy import text
+
+from logging_config import get_logger
 from rabbitmq import get_consumer_channel, QUEUE_NAME
 from llm_client import analyze_review
-from database import Review, ReviewAnalysis, Job, ScrapeJob, get_session
+from database import Review, ReviewAnalysis, Job, ScrapeJob, Place, get_session
 from email_service import send_completion_report, gather_scrape_job_stats
+from activity_logger import (
+    log_review_analyzed, log_job_completed, log_worker_started,
+    log_worker_stopped, log_rate_limited, log_system_error
+)
 
+logger = get_logger(__name__, service="worker")
 
 # Graceful shutdown
 shutdown_requested = False
 
+
 def signal_handler(signum, frame):
     global shutdown_requested
-    print("\nShutdown requested, finishing current task...")
+    logger.info("Shutdown signal received, finishing current task...")
     shutdown_requested = True
+
 
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
@@ -26,19 +40,36 @@ def update_job_progress(job_id: str):
     """Increment processed_reviews count and check for scrape job completion."""
     session = get_session()
     job_completed = False
+    place_name = None
+    total_reviews = 0
     try:
         job = session.query(Job).filter_by(id=job_id).first()
         if job:
             job.processed_reviews += 1
+            total_reviews = job.total_reviews
+            # Get place name for logging
+            if job.place_id:
+                place = session.query(Place).filter_by(id=job.place_id).first()
+                if place:
+                    place_name = place.name
+
             if job.processed_reviews >= job.total_reviews:
                 job.status = "completed"
                 job.completed_at = datetime.utcnow()
                 job_completed = True
+                logger.info(
+                    "Job completed",
+                    extra={"extra_data": {"job_id": job_id, "total_reviews": job.total_reviews}}
+                )
             else:
                 job.status = "processing"
             session.commit()
     finally:
         session.close()
+
+    # Log job completion
+    if job_completed and place_name:
+        log_job_completed(job_id, place_name, total_reviews)
 
     # If this job just completed, check if the parent scrape job is done
     if job_completed:
@@ -83,6 +114,7 @@ def check_and_send_scrape_job_report(completed_job_id: str):
 
         if not lock_result:
             # Another worker has the lock, they'll handle it
+            logger.debug("Advisory lock not acquired, another worker handling email")
             return
 
         try:
@@ -124,10 +156,20 @@ def check_and_send_scrape_job_report(completed_job_id: str):
                 to_email=scrape_job.notification_email,
                 report_data=report_data,
             )
-            print(f"[Worker] Email report triggered for scrape job {scrape_job.id}")
+            logger.info(
+                "Email report sent",
+                extra={"extra_data": {
+                    "scrape_job_id": str(scrape_job.id),
+                    "email": scrape_job.notification_email
+                }}
+            )
 
     except Exception as e:
-        print(f"[Worker] Error checking scrape job completion: {e}")
+        logger.error(
+            "Error checking scrape job completion",
+            extra={"extra_data": {"completed_job_id": completed_job_id}},
+            exc_info=True
+        )
     finally:
         session.close()
 
@@ -139,7 +181,7 @@ def save_analysis(review_id: str, analysis: dict):
         # Check if already analyzed
         existing = session.query(ReviewAnalysis).filter_by(review_id=review_id).first()
         if existing:
-            print(f"  Review {review_id} already analyzed, skipping")
+            logger.debug("Review already analyzed, skipping", extra={"extra_data": {"review_id": review_id}})
             return
 
         review_analysis = ReviewAnalysis(
@@ -170,24 +212,29 @@ def process_message(ch, method, properties, body):
         review_id = message["review_id"]
         job_id = message["job_id"]
 
-        print(f"Processing review: {review_id}")
+        logger.info("Processing review", extra={"extra_data": {"review_id": review_id, "job_id": job_id}})
 
         # Fetch review from DB
         session = get_session()
+        place_name = None
         try:
             review = session.query(Review).filter_by(id=review_id).first()
             if not review:
-                print(f"  Review not found, acknowledging")
+                logger.warning("Review not found, acknowledging", extra={"extra_data": {"review_id": review_id}})
                 ch.basic_ack(delivery_tag=method.delivery_tag)
                 return
 
             review_text = review.text
             review_rating = review.rating
+
+            # Get place name for activity logging
+            if review.place:
+                place_name = review.place.name
         finally:
             session.close()
 
         if not review_text:
-            print(f"  Empty review text, skipping")
+            logger.debug("Empty review text, skipping", extra={"extra_data": {"review_id": review_id}})
             ch.basic_ack(delivery_tag=method.delivery_tag)
             update_job_progress(job_id)
             return
@@ -205,25 +252,51 @@ def process_message(ch, method, properties, body):
                 if "429" in error_msg or "ResourceExhausted" in error_msg:
                     if attempt < max_retries - 1:
                         wait_time = retry_delay * (attempt + 1)
-                        print(f"  Rate limited, waiting {wait_time}s...")
+                        logger.warning(
+                            "Rate limited, retrying",
+                            extra={"extra_data": {"wait_seconds": wait_time, "attempt": attempt + 1}}
+                        )
+                        log_rate_limited("LLM", wait_time)
                         time.sleep(wait_time)
                     else:
-                        print(f"  Rate limit exceeded, requeueing")
+                        logger.error("Rate limit exceeded, requeueing", extra={"extra_data": {"review_id": review_id}})
                         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
                         return
                 else:
-                    print(f"  Error: {error_msg}")
+                    logger.error(
+                        "LLM analysis error",
+                        extra={"extra_data": {"review_id": review_id, "attempt": attempt + 1, "error": error_msg}}
+                    )
                     if attempt < max_retries - 1:
                         time.sleep(5)
                     else:
                         # Dead letter after max retries
-                        print(f"  Max retries reached, dead-lettering")
+                        logger.error("Max retries reached, dead-lettering", extra={"extra_data": {"review_id": review_id}})
+                        log_system_error("worker", f"Max retries for review {review_id}", {"review_id": review_id})
                         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
                         return
 
         # Save analysis
         save_analysis(review_id, analysis)
-        print(f"  Sentiment: {analysis.get('sentiment')} ({analysis.get('score')})")
+
+        # Log activity
+        sentiment = analysis.get("sentiment")
+        score = analysis.get("score", 0)
+        urgent = analysis.get("urgent", False)
+
+        logger.info(
+            "Analysis complete",
+            extra={"extra_data": {
+                "review_id": review_id,
+                "sentiment": sentiment,
+                "score": score,
+                "urgent": urgent
+            }}
+        )
+
+        # Log to activity logs (every 10th review to avoid too much noise, or if urgent)
+        if urgent or (hash(review_id) % 10 == 0):
+            log_review_analyzed(job_id, place_name or "Unknown", sentiment, score, urgent)
 
         # Update job progress
         update_job_progress(job_id)
@@ -235,7 +308,8 @@ def process_message(ch, method, properties, body):
         time.sleep(2)
 
     except Exception as e:
-        print(f"  Unexpected error: {e}")
+        logger.error("Unexpected error processing message", exc_info=True)
+        log_system_error("worker", str(e))
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
 
@@ -243,11 +317,11 @@ def run_worker():
     """Start consuming messages from queue."""
     global shutdown_requested
 
-    print("Connecting to RabbitMQ...")
+    logger.info("Connecting to RabbitMQ...")
     connection, channel = get_consumer_channel()
 
-    print(f"Waiting for messages on queue '{QUEUE_NAME}'...")
-    print("Press Ctrl+C to stop\n")
+    logger.info(f"Worker started, listening on queue '{QUEUE_NAME}'")
+    log_worker_started()
 
     # Set up consumer
     channel.basic_consume(queue=QUEUE_NAME, on_message_callback=process_message)
@@ -258,9 +332,10 @@ def run_worker():
     except KeyboardInterrupt:
         pass
     finally:
-        print("Closing connection...")
+        logger.info("Closing connection...")
         connection.close()
-        print("Worker stopped")
+        logger.info("Worker stopped")
+        log_worker_stopped()
 
 
 if __name__ == "__main__":

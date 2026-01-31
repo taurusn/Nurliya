@@ -1,3 +1,8 @@
+"""
+Configuration management for Nurliya Pipeline.
+Supports GCP Secret Manager with fallback to environment variables.
+"""
+
 import os
 import logging
 from dotenv import load_dotenv
@@ -5,8 +10,7 @@ from functools import lru_cache
 
 load_dotenv()
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Get logger (will use logging_config if imported, otherwise basic)
 logger = logging.getLogger(__name__)
 
 # GCP Secret Manager settings
@@ -30,9 +34,9 @@ def _get_secret_manager_client():
             from google.cloud import secretmanager
             _secret_manager_client = secretmanager.SecretManagerServiceClient()
             _secret_manager_available = True
-            logger.info("GCP Secret Manager client initialized successfully")
+            logger.info("GCP Secret Manager client initialized")
         except ImportError:
-            logger.warning("google-cloud-secret-manager not installed, using environment variables")
+            logger.debug("google-cloud-secret-manager not installed, using environment variables")
             _secret_manager_available = False
             return None
         except Exception as e:
@@ -76,11 +80,9 @@ def get_secret(secret_name: str, default: str = "") -> str:
     # Fall back to environment variable
     env_value = os.getenv(secret_name)
     if env_value is not None:
-        logger.debug(f"Loaded '{secret_name}' from environment variable")
         return env_value
 
     # Return default
-    logger.debug(f"Using default value for '{secret_name}'")
     return default
 
 
@@ -93,12 +95,6 @@ def get_secret_int(secret_name: str, default: int) -> int:
         logger.warning(f"Invalid integer value for '{secret_name}', using default: {default}")
         return default
 
-
-# Log configuration source
-if USE_SECRET_MANAGER and GCP_PROJECT_ID:
-    logger.info(f"Configuration: Using GCP Secret Manager (project: {GCP_PROJECT_ID}) with env fallback")
-else:
-    logger.info("Configuration: Using environment variables only")
 
 # Database
 DATABASE_URL = get_secret("DATABASE_URL", "postgresql://nurliya:nurliya123@localhost:5432/nurliya")
@@ -118,10 +114,10 @@ SCRAPER_POLL_INTERVAL = get_secret_int("SCRAPER_POLL_INTERVAL", 5)
 # Results directory (non-sensitive)
 RESULTS_DIR = os.getenv("RESULTS_DIR", "../results")
 
-# vLLM settings (sensitive)
+# LLM settings (named VLLM for backwards compatibility)
 VLLM_BASE_URL = get_secret("VLLM_BASE_URL", "http://localhost:8080/v1")
 VLLM_API_KEY = get_secret("VLLM_API_KEY", "")
-VLLM_MODEL = get_secret("VLLM_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
+VLLM_MODEL = get_secret("VLLM_MODEL", "gemini-2.0-flash")
 
 # API settings (non-sensitive)
 API_HOST = os.getenv("API_HOST", "0.0.0.0")

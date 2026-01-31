@@ -13,9 +13,12 @@ from typing import Optional, List, Set
 from uuid import UUID
 from sqlalchemy import func, text
 
-from database import Place, Review, ReviewAnalysis, Job, ScrapeJob, get_session, create_tables
+from logging_config import get_logger
+from database import Place, Review, ReviewAnalysis, Job, ScrapeJob, ActivityLog, get_session, create_tables
 from config import RABBITMQ_URL, QUEUE_NAME
 from scraper_client import ScraperClient
+
+logger = get_logger(__name__, service="api")
 
 
 # WebSocket connection manager
@@ -131,7 +134,7 @@ async def poll_database():
                 finally:
                     session.close()
         except Exception as e:
-            print(f"Poll error: {e}")
+            logger.error("WebSocket poll error", exc_info=True)
 
         await asyncio.sleep(2)
 
@@ -139,15 +142,19 @@ async def poll_database():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
+    logger.info("Starting Nurliya API...")
     create_tables()
     # Start background polling task
     poll_task = asyncio.create_task(poll_database())
+    logger.info("API started successfully")
     yield
+    logger.info("Shutting down API...")
     poll_task.cancel()
     try:
         await poll_task
     except asyncio.CancelledError:
         pass
+    logger.info("API shutdown complete")
 
 
 from orchestrator import (
@@ -685,10 +692,92 @@ async def get_system_health():
     }
 
 
+@app.get("/api/logs")
+async def get_logs(
+    page: int = 1,
+    limit: int = 10,
+    category: Optional[str] = None,
+    level: Optional[str] = None,
+):
+    """
+    Get paginated activity logs.
+
+    Args:
+        page: Page number (1-indexed)
+        limit: Items per page (default 10, max 100)
+        category: Filter by category (job, analysis, email, scraper, worker, system)
+        level: Filter by level (info, warning, error, success)
+
+    Returns:
+        Paginated logs with metadata
+    """
+    # Validate pagination
+    page = max(1, page)
+    limit = min(max(1, limit), 100)
+    offset = (page - 1) * limit
+
+    session = get_session()
+    try:
+        # Build query
+        query = session.query(ActivityLog)
+
+        # Apply filters
+        if category:
+            query = query.filter(ActivityLog.category == category)
+        if level:
+            query = query.filter(ActivityLog.level == level)
+
+        # Get total count
+        total = query.count()
+
+        # Get paginated results
+        logs = (
+            query
+            .order_by(ActivityLog.timestamp.desc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+
+        # Calculate pagination metadata
+        total_pages = (total + limit - 1) // limit
+        has_next = page < total_pages
+        has_prev = page > 1
+
+        return {
+            "logs": [
+                {
+                    "id": str(log.id),
+                    "timestamp": log.timestamp.isoformat() if log.timestamp else None,
+                    "level": log.level,
+                    "category": log.category,
+                    "action": log.action,
+                    "message": log.message,
+                    "details": log.details,
+                    "job_id": str(log.job_id) if log.job_id else None,
+                    "scrape_job_id": str(log.scrape_job_id) if log.scrape_job_id else None,
+                    "place_id": str(log.place_id) if log.place_id else None,
+                }
+                for log in logs
+            ],
+            "pagination": {
+                "page": page,
+                "limit": limit,
+                "total": total,
+                "total_pages": total_pages,
+                "has_next": has_next,
+                "has_prev": has_prev,
+            }
+        }
+    finally:
+        session.close()
+
+
 # WebSocket endpoint for real-time updates
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
+    logger.info("WebSocket client connected", extra={"extra_data": {"total_connections": len(manager.active_connections)}})
     try:
         while True:
             # Keep connection alive, receive any client messages
@@ -696,6 +785,7 @@ async def websocket_endpoint(websocket: WebSocket):
             # Could handle client commands here if needed
     except WebSocketDisconnect:
         manager.disconnect(websocket)
+        logger.info("WebSocket client disconnected", extra={"extra_data": {"total_connections": len(manager.active_connections)}})
 
 
 if __name__ == "__main__":

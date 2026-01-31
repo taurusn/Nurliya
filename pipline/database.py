@@ -1,9 +1,17 @@
+"""
+Database models and session management for Nurliya Pipeline.
+"""
+
 import uuid
 from datetime import datetime
 from sqlalchemy import create_engine, Column, String, Integer, Text, Boolean, DECIMAL, TIMESTAMP, ForeignKey, ARRAY
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+
+from logging_config import get_logger
 from config import DATABASE_URL
+
+logger = get_logger(__name__, service="database")
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
@@ -101,13 +109,39 @@ class ScrapeJob(Base):
     email_sent_at = Column(TIMESTAMP)  # Prevents duplicate email sends
 
 
+class ActivityLog(Base):
+    """
+    Activity logs for tracking system events.
+    Combines activity logs (jobs, analyses) and system logs (errors, processing).
+    """
+    __tablename__ = "activity_logs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    timestamp = Column(TIMESTAMP, default=datetime.utcnow, index=True)
+    level = Column(String(20), default="info")  # info, warning, error, success
+    category = Column(String(50), index=True)  # job, analysis, email, scraper, worker, system
+    action = Column(String(100))  # job_created, review_analyzed, email_sent, etc.
+    message = Column(Text)
+    details = Column(JSONB)  # Additional structured data
+
+    # Optional references
+    job_id = Column(UUID(as_uuid=True), ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True)
+    scrape_job_id = Column(UUID(as_uuid=True), ForeignKey("scrape_jobs.id", ondelete="SET NULL"), nullable=True)
+    place_id = Column(UUID(as_uuid=True), ForeignKey("places.id", ondelete="SET NULL"), nullable=True)
+
+
 def get_session():
     return SessionLocal()
 
 
 def create_tables():
-    Base.metadata.create_all(engine)
-    print("Tables created successfully")
+    """Create all database tables."""
+    try:
+        Base.metadata.create_all(engine)
+        logger.info("Database tables created/verified successfully")
+    except Exception as e:
+        logger.error("Failed to create database tables", exc_info=True)
+        raise
 
 
 if __name__ == "__main__":

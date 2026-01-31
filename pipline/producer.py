@@ -1,8 +1,17 @@
+"""
+Producer for queuing reviews for analysis.
+Parses CSV files and publishes review messages to RabbitMQ.
+"""
+
 import argparse
 from datetime import datetime
+
+from logging_config import get_logger
 from csv_parser import parse_csv, save_place_and_reviews
 from rabbitmq import get_producer_channel, publish_message
 from database import Job, get_session
+
+logger = get_logger(__name__, service="producer")
 
 
 def create_job(place_id: str, total_reviews: int) -> Job:
@@ -17,6 +26,7 @@ def create_job(place_id: str, total_reviews: int) -> Job:
         session.add(job)
         session.commit()
         session.refresh(job)
+        logger.debug("Created job", extra={"extra_data": {"job_id": str(job.id), "place_id": place_id, "total_reviews": total_reviews}})
         return job
     finally:
         session.close()
@@ -32,17 +42,18 @@ def update_job_status(job_id: str, status: str):
             if status == "completed":
                 job.completed_at = datetime.utcnow()
             session.commit()
+            logger.debug("Updated job status", extra={"extra_data": {"job_id": job_id, "status": status}})
     finally:
         session.close()
 
 
 def run_producer(csv_path: str):
     """Parse CSV, save to DB, and queue reviews for analysis."""
-    print(f"Parsing CSV: {csv_path}")
+    logger.info("Starting producer", extra={"extra_data": {"csv_path": csv_path}})
 
     # Parse CSV
     places = parse_csv(csv_path)
-    print(f"Found {len(places)} places")
+    logger.info("CSV parsed", extra={"extra_data": {"places_count": len(places)}})
 
     # Connect to RabbitMQ
     connection, channel = get_producer_channel()
@@ -50,19 +61,17 @@ def run_producer(csv_path: str):
     total_queued = 0
 
     for place_data in places:
-        print(f"\nProcessing: {place_data['name']}")
+        logger.info("Processing place", extra={"extra_data": {"name": place_data['name']}})
 
         # Save place and reviews to DB (returns IDs)
         place_id, review_ids = save_place_and_reviews(place_data)
-        print(f"  Saved {len(review_ids)} reviews to DB")
 
         if not review_ids:
-            print("  No reviews to process")
+            logger.debug("No reviews to process", extra={"extra_data": {"place_name": place_data['name']}})
             continue
 
         # Create job
         job = create_job(place_id=place_id, total_reviews=len(review_ids))
-        print(f"  Created job: {job.id}")
 
         # Update reviews with job_id and queue them
         session = get_session()
@@ -87,10 +96,13 @@ def run_producer(csv_path: str):
 
         # Update job status
         update_job_status(str(job.id), "queued")
-        print(f"  Queued {len(review_ids)} reviews")
+        logger.info(
+            "Queued reviews for place",
+            extra={"extra_data": {"place_name": place_data['name'], "job_id": str(job.id), "reviews_queued": len(review_ids)}}
+        )
 
     connection.close()
-    print(f"\nDone! Total reviews queued: {total_queued}")
+    logger.info("Producer complete", extra={"extra_data": {"total_queued": total_queued}})
 
 
 if __name__ == "__main__":

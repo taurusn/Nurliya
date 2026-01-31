@@ -6,7 +6,11 @@ Handles job creation, status polling, and CSV download.
 import asyncio
 import httpx
 from typing import Optional
+
+from logging_config import get_logger
 from config import SCRAPER_API_URL, SCRAPER_POLL_INTERVAL
+
+logger = get_logger(__name__, service="scraper_client")
 
 
 class ScraperClient:
@@ -41,6 +45,7 @@ class ScraperClient:
         Returns:
             Job ID from the scraper
         """
+        logger.info("Creating scraper job", extra={"extra_data": {"query": query, "depth": depth, "max_time": max_time}})
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.post(
                 f"{self.base_url}/api/v1/jobs",
@@ -57,7 +62,9 @@ class ScraperClient:
             )
             response.raise_for_status()
             data = response.json()
-            return data["id"]
+            job_id = data["id"]
+            logger.info("Scraper job created", extra={"extra_data": {"job_id": job_id, "query": query}})
+            return job_id
 
     async def get_job_status(self, job_id: str) -> dict:
         """
@@ -83,6 +90,7 @@ class ScraperClient:
         Returns:
             Path to the saved CSV file
         """
+        logger.info("Downloading scraper CSV", extra={"extra_data": {"job_id": job_id, "output_path": output_path}})
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.get(
                 f"{self.base_url}/api/v1/jobs/{job_id}/download"
@@ -92,6 +100,7 @@ class ScraperClient:
             with open(output_path, "wb") as f:
                 f.write(response.content)
 
+            logger.info("CSV downloaded", extra={"extra_data": {"job_id": job_id, "size_bytes": len(response.content)}})
             return output_path
 
     async def wait_for_completion(
@@ -118,19 +127,25 @@ class ScraperClient:
         poll_interval = poll_interval or SCRAPER_POLL_INTERVAL
         elapsed = 0
 
+        logger.info("Waiting for scraper job completion", extra={"extra_data": {"job_id": job_id, "timeout": timeout}})
+
         while elapsed < timeout:
             status = await self.get_job_status(job_id)
             # Note: Go scraper returns "Status" with capital S
             job_status = status.get("Status") or status.get("status", "unknown")
 
             if job_status == "ok":
+                logger.info("Scraper job completed", extra={"extra_data": {"job_id": job_id, "elapsed_seconds": elapsed}})
                 return status
             elif job_status == "failed":
+                logger.error("Scraper job failed", extra={"extra_data": {"job_id": job_id, "status": status}})
                 raise RuntimeError(f"Scraper job failed: {status}")
 
+            logger.debug("Scraper job still running", extra={"extra_data": {"job_id": job_id, "status": job_status, "elapsed": elapsed}})
             await asyncio.sleep(poll_interval)
             elapsed += poll_interval
 
+        logger.error("Scraper job timed out", extra={"extra_data": {"job_id": job_id, "timeout": timeout}})
         raise TimeoutError(f"Scraper job {job_id} timed out after {timeout}s")
 
     async def health_check(self) -> bool:
@@ -173,7 +188,7 @@ if __name__ == "__main__":
     client = ScraperClientSync()
 
     if client.health_check():
-        print(f"Scraper API is reachable at {SCRAPER_API_URL}")
+        logger.info("Scraper API health check passed", extra={"extra_data": {"url": SCRAPER_API_URL}})
     else:
-        print(f"Scraper API is NOT reachable at {SCRAPER_API_URL}")
+        logger.error("Scraper API health check failed", extra={"extra_data": {"url": SCRAPER_API_URL}})
         sys.exit(1)

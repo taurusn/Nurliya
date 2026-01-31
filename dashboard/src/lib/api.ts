@@ -34,7 +34,7 @@ export async function startScrape(query: string, email?: string) {
   const res = await fetch(`${API_URL}/api/scrape`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ 
+    body: JSON.stringify({
       query,
       notification_email: email || undefined,
       depth: 10,
@@ -43,5 +43,43 @@ export async function startScrape(query: string, email?: string) {
     }),
   })
   if (!res.ok) throw new Error('Failed to start scrape')
+  return res.json()
+}
+
+export interface LogEntry {
+  id: string
+  timestamp: string | null
+  level: string
+  category: string
+  action: string
+  message: string
+  details: Record<string, any>
+  job_id: string | null
+  scrape_job_id: string | null
+  place_id: string | null
+}
+
+export interface LogsResponse {
+  logs: LogEntry[]
+  pagination: {
+    page: number
+    limit: number
+    total: number
+    total_pages: number
+    has_next: boolean
+    has_prev: boolean
+  }
+}
+
+export async function fetchLogs(page = 1, limit = 10, category?: string, level?: string): Promise<LogsResponse> {
+  const params = new URLSearchParams({
+    page: page.toString(),
+    limit: limit.toString(),
+  })
+  if (category) params.set('category', category)
+  if (level) params.set('level', level)
+
+  const res = await fetch(`${API_URL}/api/logs?${params}`)
+  if (!res.ok) throw new Error('Failed to fetch logs')
   return res.json()
 }

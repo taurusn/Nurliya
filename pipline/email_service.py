@@ -14,7 +14,11 @@ from collections import Counter
 
 from jinja2 import Environment, FileSystemLoader
 
+from logging_config import get_logger
 from config import SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, SMTP_FROM_EMAIL
+from activity_logger import log_email_sent, log_email_failed
+
+logger = get_logger(__name__, service="email")
 
 # Thread pool for non-blocking email sends
 _executor = ThreadPoolExecutor(max_workers=2)
@@ -32,18 +36,22 @@ def send_completion_report(to_email: str, report_data: Dict[str, Any]) -> None:
         to_email: Recipient email address
         report_data: Full report data from gather_scrape_job_stats()
     """
-    _executor.submit(_send_email_sync, to_email, report_data)
+    logger.info("Queueing email report", extra={"extra_data": {"to": to_email, "query": report_data.get("query")}})
+    scrape_job_id = report_data.get("scrape_job_id")
+    _executor.submit(_send_email_sync, to_email, report_data, scrape_job_id)
 
 
-def _send_email_sync(to_email: str, report_data: Dict[str, Any]) -> bool:
+def _send_email_sync(to_email: str, report_data: Dict[str, Any], scrape_job_id: str = None) -> bool:
     """
     Synchronous email sending via SMTP.
 
     Returns:
         True if email sent successfully, False otherwise
     """
+    query = report_data.get("query", "")
+
     if not SMTP_USER or not SMTP_PASSWORD:
-        print(f"[Email] SMTP credentials not configured, skipping email to {to_email}")
+        logger.warning("SMTP credentials not configured, skipping email", extra={"extra_data": {"to": to_email}})
         return False
 
     try:
@@ -53,7 +61,7 @@ def _send_email_sync(to_email: str, report_data: Dict[str, Any]) -> bool:
 
         # Create message
         msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"Nurliya Report: {report_data['query']}"
+        msg["Subject"] = f"Nurliya Report: {query}"
         msg["From"] = SMTP_FROM_EMAIL or SMTP_USER
         msg["To"] = to_email
 
@@ -68,11 +76,32 @@ def _send_email_sync(to_email: str, report_data: Dict[str, Any]) -> bool:
             server.login(SMTP_USER, SMTP_PASSWORD)
             server.sendmail(msg["From"], [to_email], msg.as_string())
 
-        print(f"[Email] Sent completion report to {to_email} for query: {report_data['query']}")
+        logger.info(
+            "Email sent successfully",
+            extra={"extra_data": {
+                "to": to_email,
+                "query": query,
+                "total_reviews": report_data.get("total_reviews", 0)
+            }}
+        )
+
+        # Log activity
+        if scrape_job_id:
+            log_email_sent(scrape_job_id, to_email, query)
+
         return True
 
     except Exception as e:
-        print(f"[Email] Failed to send email to {to_email}: {e}")
+        logger.error(
+            "Failed to send email",
+            extra={"extra_data": {"to": to_email, "error": str(e)}},
+            exc_info=True
+        )
+
+        # Log activity
+        if scrape_job_id:
+            log_email_failed(scrape_job_id, to_email, str(e))
+
         return False
 
 
@@ -194,6 +223,7 @@ def gather_scrape_job_stats(scrape_job_id: str) -> Optional[Dict[str, Any]]:
     try:
         scrape_job = session.query(ScrapeJob).filter_by(id=scrape_job_id).first()
         if not scrape_job:
+            logger.warning("Scrape job not found", extra={"extra_data": {"scrape_job_id": scrape_job_id}})
             return None
 
         places_stats = []
@@ -291,6 +321,15 @@ def gather_scrape_job_stats(scrape_job_id: str) -> Optional[Dict[str, Any]]:
 
         # Generate action items
         actions = _generate_actions(places_stats, total_urgent)
+
+        logger.info(
+            "Gathered scrape job stats",
+            extra={"extra_data": {
+                "scrape_job_id": scrape_job_id,
+                "places_count": len(places_stats),
+                "total_reviews": total_reviews
+            }}
+        )
 
         return {
             "query": scrape_job.query,

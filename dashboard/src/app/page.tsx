@@ -12,6 +12,7 @@ import { JobProgress } from '@/components/JobProgress'
 import { ActivityFeed } from '@/components/ActivityFeed'
 import { ScrapeForm } from '@/components/ScrapeForm'
 import { ConnectionStatus } from '@/components/ConnectionStatus'
+import { LogsTable } from '@/components/LogsTable'
 import { Database, Server, Cpu, MessageSquare, Layers } from 'lucide-react'
 
 export default function Dashboard() {
@@ -177,6 +178,11 @@ export default function Dashboard() {
         {/* Activity Feed */}
         <Card title="Recent Activity" className="md:col-span-2">
           <ActivityFeed analyses={analyses} />
+        </Card>
+
+        {/* System Logs */}
+        <Card title="System Logs">
+          <LogsTable />
         </Card>
 
         {/* New Scrape Form */}

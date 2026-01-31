@@ -1,6 +1,6 @@
 """
 Pipeline orchestrator for running the full scrape-to-analysis flow.
-Handles: Scraper job → CSV download → Producer → Status updates
+Handles: Scraper job -> CSV download -> Producer -> Status updates
 """
 
 import os
@@ -9,12 +9,16 @@ import asyncio
 from datetime import datetime
 from typing import Optional
 
+from logging_config import get_logger
 from scraper_client import ScraperClient
 from csv_parser import parse_csv, save_place_and_reviews
 from producer import create_job, update_job_status
 from rabbitmq import get_producer_channel, publish_message
 from database import ScrapeJob, get_session
 from config import RESULTS_DIR
+from activity_logger import log_scrape_started, log_scrape_completed, log_scrape_failed
+
+logger = get_logger(__name__, service="orchestrator")
 
 
 async def update_scrape_job(job_id: str, **kwargs):
@@ -27,6 +31,7 @@ async def update_scrape_job(job_id: str, **kwargs):
                 if hasattr(job, key):
                     setattr(job, key, value)
             session.commit()
+            logger.debug("Updated scrape job", extra={"extra_data": {"job_id": job_id, "updates": list(kwargs.keys())}})
     finally:
         session.close()
 
@@ -57,6 +62,11 @@ async def run_scrape_pipeline(
     Returns:
         Dict with pipeline results
     """
+    logger.info(
+        "Starting scrape pipeline",
+        extra={"extra_data": {"query": query, "scrape_job_id": scrape_job_id, "depth": depth}}
+    )
+
     client = ScraperClient()
     result = {
         "scrape_job_id": scrape_job_id,
@@ -70,6 +80,8 @@ async def run_scrape_pipeline(
     try:
         # Step 1: Create scraper job
         await update_scrape_job(scrape_job_id, status="scraping")
+        log_scrape_started(scrape_job_id, query)
+
         scraper_id = await client.create_job(
             query=query,
             depth=depth,
@@ -77,6 +89,7 @@ async def run_scrape_pipeline(
             max_time=max_time,
         )
         await update_scrape_job(scrape_job_id, scraper_job_id=scraper_id)
+        logger.info("Scraper job started", extra={"extra_data": {"scraper_id": scraper_id}})
 
         # Step 2: Wait for scraper to complete
         scraper_status = await client.wait_for_completion(
@@ -109,6 +122,16 @@ async def run_scrape_pipeline(
             completed_at=datetime.utcnow(),
         )
 
+        logger.info(
+            "Scrape pipeline completed",
+            extra={"extra_data": {
+                "scrape_job_id": scrape_job_id,
+                "places_found": result["places_found"],
+                "reviews_total": result["reviews_total"]
+            }}
+        )
+        log_scrape_completed(scrape_job_id, query, result["places_found"], result["reviews_total"])
+
     except Exception as e:
         result["status"] = "failed"
         result["error"] = str(e)
@@ -117,6 +140,12 @@ async def run_scrape_pipeline(
             status="failed",
             error_message=str(e),
         )
+        logger.error(
+            "Scrape pipeline failed",
+            extra={"extra_data": {"scrape_job_id": scrape_job_id, "error": str(e)}},
+            exc_info=True
+        )
+        log_scrape_failed(scrape_job_id, query, str(e))
 
     return result
 
@@ -139,6 +168,8 @@ def run_producer_sync(csv_path: str) -> dict:
         Dict with places_count, reviews_total, job_ids
     """
     from database import Review
+
+    logger.info("Running producer", extra={"extra_data": {"csv_path": csv_path}})
 
     # Parse CSV
     places = parse_csv(csv_path)
@@ -186,6 +217,11 @@ def run_producer_sync(csv_path: str) -> dict:
         update_job_status(str(job.id), "queued")
 
     connection.close()
+
+    logger.info(
+        "Producer complete",
+        extra={"extra_data": {"places_count": result["places_count"], "reviews_total": result["reviews_total"]}}
+    )
     return result
 
 
@@ -201,6 +237,10 @@ def create_scrape_job(query: str, notification_email: str = None) -> ScrapeJob:
         session.add(job)
         session.commit()
         session.refresh(job)
+        logger.info(
+            "Created scrape job",
+            extra={"extra_data": {"job_id": str(job.id), "query": query, "notification_email": notification_email}}
+        )
         return job
     finally:
         session.close()

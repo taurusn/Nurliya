@@ -1,8 +1,17 @@
+"""
+LLM client for review analysis using OpenAI-compatible APIs.
+Supports vLLM, Gemini, OpenAI, and other compatible providers.
+"""
+
 import json
 from openai import OpenAI
+
+from logging_config import get_logger
 from config import VLLM_BASE_URL, VLLM_API_KEY, VLLM_MODEL
 
-# Configure OpenAI client to point to vLLM
+logger = get_logger(__name__, service="llm_client")
+
+# Configure OpenAI client to point to LLM provider
 client = OpenAI(
     base_url=VLLM_BASE_URL,
     api_key=VLLM_API_KEY
@@ -66,7 +75,9 @@ def analyze_review(review_text: str, rating: int = None) -> dict:
         prompt += f" (rating: {rating}/5)"
     prompt += f":\n\n{review_text}\n\nReturn ONLY the JSON analysis, nothing else."
 
-    # Call vLLM via OpenAI-compatible API
+    logger.debug("Calling LLM API", extra={"extra_data": {"model": VLLM_MODEL, "text_length": len(review_text)}})
+
+    # Call LLM via OpenAI-compatible API
     response = client.chat.completions.create(
         model=VLLM_MODEL,
         messages=[
@@ -96,6 +107,7 @@ def analyze_review(review_text: str, rating: int = None) -> dict:
         if start >= 0 and end > start:
             result = json.loads(content[start:end])
         else:
+            logger.error("Failed to parse LLM response", extra={"extra_data": {"content": content[:200]}})
             raise ValueError(f"Could not parse JSON from response: {content}") from e
 
     # Validate required fields
@@ -105,13 +117,18 @@ def analyze_review(review_text: str, rating: int = None) -> dict:
         if field not in result:
             result[field] = [] if "topics" in field else ("" if "summary" in field or "reply" in field else False)
 
+    logger.debug(
+        "LLM analysis complete",
+        extra={"extra_data": {"sentiment": result.get("sentiment"), "score": result.get("score")}}
+    )
+
     return result
 
 
 if __name__ == "__main__":
     # Test with sample review
     test_review = "القهوة ممتازة والمكان هادي بس الخدمة بطيئة شوي"
-    print(f"Testing with: {test_review}\n")
+    logger.info(f"Testing with review: {test_review}")
 
     result = analyze_review(test_review, rating=4)
     print(json.dumps(result, ensure_ascii=False, indent=2))

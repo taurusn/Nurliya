@@ -1,7 +1,16 @@
+"""
+CSV parser for Google Maps Scraper output.
+Parses place data and reviews from scraper CSV files.
+"""
+
 import json
 import math
 import pandas as pd
+
+from logging_config import get_logger
 from database import Place, Review, get_session
+
+logger = get_logger(__name__, service="csv_parser")
 
 
 def clean_value(value):
@@ -34,6 +43,7 @@ def parse_json_field(value):
 
 def parse_csv(csv_path: str) -> list[dict]:
     """Parse scraper CSV and return list of place data with reviews."""
+    logger.info("Parsing CSV file", extra={"extra_data": {"path": csv_path}})
     df = pd.read_csv(csv_path)
     places = []
 
@@ -77,6 +87,14 @@ def parse_csv(csv_path: str) -> list[dict]:
         place_data["reviews"] = reviews
         places.append(place_data)
 
+    logger.info(
+        "CSV parsing complete",
+        extra={"extra_data": {
+            "path": csv_path,
+            "places_count": len(places),
+            "total_reviews": sum(len(p["reviews"]) for p in places)
+        }}
+    )
     return places
 
 
@@ -99,6 +117,7 @@ def save_place_and_reviews(place_data: dict, job_id: str = None) -> tuple:
             )
             session.add(place)
             session.flush()
+            logger.debug("Created new place", extra={"extra_data": {"name": place_data["name"], "place_id": place_data["place_id"]}})
 
         place_id = str(place.id)
 
@@ -120,9 +139,14 @@ def save_place_and_reviews(place_data: dict, job_id: str = None) -> tuple:
             review_ids.append(str(review.id))
 
         session.commit()
+        logger.info(
+            "Saved place and reviews",
+            extra={"extra_data": {"place_name": place_data["name"], "reviews_count": len(review_ids)}}
+        )
         return place_id, review_ids
     except Exception as e:
         session.rollback()
+        logger.error("Failed to save place and reviews", extra={"extra_data": {"place_name": place_data.get("name")}}, exc_info=True)
         raise e
     finally:
         session.close()
@@ -131,6 +155,5 @@ def save_place_and_reviews(place_data: dict, job_id: str = None) -> tuple:
 if __name__ == "__main__":
     # Test parsing
     places = parse_csv("../results/results.csv")
-    print(f"Parsed {len(places)} places")
     for p in places:
-        print(f"  - {p['name']}: {len(p['reviews'])} reviews")
+        logger.info(f"Parsed: {p['name']}", extra={"extra_data": {"reviews_count": len(p['reviews'])}})

@@ -1,6 +1,14 @@
+"""
+RabbitMQ connection and queue management for Nurliya Pipeline.
+"""
+
 import json
 import pika
+
+from logging_config import get_logger
 from config import RABBITMQ_URL, QUEUE_NAME, DLQ_NAME, PREFETCH_COUNT
+
+logger = get_logger(__name__, service="rabbitmq")
 
 
 def get_connection():
@@ -27,6 +35,7 @@ def setup_queues(channel):
             "x-dead-letter-routing-key": QUEUE_NAME,
         }
     )
+    logger.debug("Queues configured", extra={"extra_data": {"queue": QUEUE_NAME, "dlq": DLQ_NAME}})
 
 
 def publish_message(channel, message: dict):
@@ -44,24 +53,27 @@ def publish_message(channel, message: dict):
 
 def get_consumer_channel():
     """Get channel configured for consuming."""
+    logger.info("Connecting to RabbitMQ (consumer)...")
     connection = get_connection()
     channel = connection.channel()
     setup_queues(channel)
     channel.basic_qos(prefetch_count=PREFETCH_COUNT)
+    logger.info("RabbitMQ consumer connected", extra={"extra_data": {"queue": QUEUE_NAME, "prefetch": PREFETCH_COUNT}})
     return connection, channel
 
 
 def get_producer_channel():
     """Get channel configured for producing."""
+    logger.debug("Connecting to RabbitMQ (producer)...")
     connection = get_connection()
     channel = connection.channel()
     setup_queues(channel)
+    logger.debug("RabbitMQ producer connected")
     return connection, channel
 
 
 if __name__ == "__main__":
     # Test connection
     connection, channel = get_producer_channel()
-    print("RabbitMQ connection successful")
-    print(f"Queue '{QUEUE_NAME}' ready")
+    logger.info("RabbitMQ connection test successful", extra={"extra_data": {"queue": QUEUE_NAME}})
     connection.close()
