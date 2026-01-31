@@ -85,6 +85,7 @@ services:
       RABBITMQ_URL: amqp://nurliya:${RABBITMQ_PASSWORD:-nurliya123}@rabbitmq:5672/
       VLLM_BASE_URL: ${VLLM_BASE_URL:-http://host.docker.internal:8080/v1}
       VLLM_API_KEY: ${VLLM_API_KEY:-token-sadnxai}
+      VLLM_MODEL: ${VLLM_MODEL:-meta-llama/Llama-3.1-8B-Instruct}
       SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_USER: ${SMTP_USER:-}
