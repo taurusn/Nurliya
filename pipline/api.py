@@ -26,6 +26,7 @@ class ConnectionManager:
     def __init__(self):
         self.active_connections: Set[WebSocket] = set()
         self.last_analysis_id: Optional[str] = None
+        self.last_log_id: Optional[str] = None
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
@@ -131,6 +132,40 @@ async def poll_database():
                             ]
                         }
                     })
+
+                    # Broadcast new activity logs
+                    latest_log = (
+                        session.query(ActivityLog)
+                        .order_by(ActivityLog.timestamp.desc())
+                        .first()
+                    )
+
+                    if latest_log and str(latest_log.id) != manager.last_log_id:
+                        manager.last_log_id = str(latest_log.id)
+
+                        # Get recent logs (last 5 new ones)
+                        recent_logs = (
+                            session.query(ActivityLog)
+                            .order_by(ActivityLog.timestamp.desc())
+                            .limit(5)
+                            .all()
+                        )
+
+                        await manager.broadcast({
+                            "type": "logs",
+                            "data": [
+                                {
+                                    "id": str(log.id),
+                                    "timestamp": log.timestamp.isoformat() if log.timestamp else None,
+                                    "level": log.level,
+                                    "category": log.category,
+                                    "action": log.action,
+                                    "message": log.message,
+                                    "details": log.details,
+                                }
+                                for log in recent_logs
+                            ]
+                        })
                 finally:
                     session.close()
         except Exception as e:

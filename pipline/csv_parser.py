@@ -19,8 +19,13 @@ def clean_value(value):
         return None
     if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
         return None
-    if pd.isna(value):
-        return None
+    # Handle scalar pd.isna check (avoid array ambiguity)
+    try:
+        if pd.isna(value):
+            return None
+    except ValueError:
+        # Value is an array - return as-is
+        pass
     return value
 
 
@@ -33,7 +38,11 @@ def clean_dict(d):
 
 def parse_json_field(value):
     """Parse JSON string field, return None if invalid."""
-    if pd.isna(value) or value == "":
+    try:
+        if pd.isna(value) or value == "":
+            return None
+    except ValueError:
+        # Value is an array - not a JSON field
         return None
     try:
         return json.loads(value)

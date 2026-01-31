@@ -1,9 +1,10 @@
 'use client'
 
 import { useEffect, useRef, useState, useCallback } from 'react'
+import { LogEntry } from './api'
 
 type WSMessage = {
-  type: 'analysis' | 'stats' | 'job_update'
+  type: 'analysis' | 'stats' | 'job_update' | 'logs'
   data: any
 }
 
@@ -12,6 +13,7 @@ type UseWebSocketReturn = {
   lastMessage: WSMessage | null
   stats: any | null
   recentAnalysis: any | null
+  recentLogs: LogEntry[]
 }
 
 export function useWebSocket(): UseWebSocketReturn {
@@ -19,12 +21,13 @@ export function useWebSocket(): UseWebSocketReturn {
   const [lastMessage, setLastMessage] = useState<WSMessage | null>(null)
   const [stats, setStats] = useState<any>(null)
   const [recentAnalysis, setRecentAnalysis] = useState<any>(null)
+  const [recentLogs, setRecentLogs] = useState<LogEntry[]>([])
   const wsRef = useRef<WebSocket | null>(null)
   const reconnectTimeoutRef = useRef<NodeJS.Timeout>()
 
   const connect = useCallback(() => {
     const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000/ws'
-    
+
     try {
       const ws = new WebSocket(wsUrl)
       wsRef.current = ws
@@ -52,6 +55,8 @@ export function useWebSocket(): UseWebSocketReturn {
             setStats(message.data)
           } else if (message.type === 'analysis') {
             setRecentAnalysis(message.data)
+          } else if (message.type === 'logs') {
+            setRecentLogs(message.data)
           }
         } catch (e) {
           console.error('Failed to parse message:', e)
@@ -76,5 +81,5 @@ export function useWebSocket(): UseWebSocketReturn {
     }
   }, [connect])
 
-  return { isConnected, lastMessage, stats, recentAnalysis }
+  return { isConnected, lastMessage, stats, recentAnalysis, recentLogs }
 }

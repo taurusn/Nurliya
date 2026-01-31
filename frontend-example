@@ -1,0 +1,699 @@
+import React, { useState } from 'react';
+
+const NurliyaDashboard = () => {
+  const [activeTab, setActiveTab] = useState('overview');
+  const [selectedProduct, setSelectedProduct] = useState(null);
+  const [selectedOpsCard, setSelectedOpsCard] = useState(null);
+
+  const tabs = [
+    { id: 'overview', label: 'Overview', icon: '📊' },
+    { id: 'products', label: 'Products', icon: '☕' },
+    { id: 'operations', label: 'Operations', icon: '⚙️' },
+    { id: 'timing', label: 'Timing', icon: '⏰' },
+    { id: 'competitors', label: 'Competitors', icon: '🏆' },
+  ];
+
+  const products = [
+    { name: 'Spanish Latte', emoji: '☕', mentions: 34, sentiment: 94, trend: '+12', complaint: 'too sweet', status: 'green' },
+    { name: 'Croissant', emoji: '🥐', mentions: 28, sentiment: 89, trend: '+3', complaint: 'small portion', status: 'green' },
+    { name: 'Chicken Sandwich', emoji: '🥪', mentions: 19, sentiment: 62, trend: '-8', complaint: 'dry bread', status: 'red' },
+    { name: 'Matcha Latte', emoji: '🍵', mentions: 15, sentiment: 78, trend: '0', complaint: 'bitter', status: 'yellow' },
+    { name: 'Waffle', emoji: '🧇', mentions: 12, sentiment: 85, trend: '+2', complaint: 'needs toppings', status: 'green' },
+    { name: 'Flat White', emoji: '⚪', mentions: 0, sentiment: null, trend: null, complaint: 'No mentions', status: 'gray' },
+  ];
+
+  const opsCards = [
+    { id: 'speed', label: 'Service Speed', icon: '⏱️', value: '23', unit: 'complaints', trend: '↑ 8', status: 'red' },
+    { id: 'staff', label: 'Staff', icon: '👥', value: '89%', unit: 'positive', trend: '↑ 3%', status: 'green' },
+    { id: 'clean', label: 'Cleanliness', icon: '🧹', value: '76%', unit: 'positive', trend: '→', status: 'yellow' },
+    { id: 'parking', label: 'Parking', icon: '🅿️', value: '12', unit: 'complaints', trend: '↑ 5', status: 'red' },
+    { id: 'pricing', label: 'Pricing', icon: '💰', value: '68%', unit: 'worth it', trend: '→', status: 'yellow' },
+    { id: 'ambiance', label: 'Ambiance', icon: '🎨', value: '91%', unit: 'positive', trend: '↑ 5%', status: 'green' },
+    { id: 'accuracy', label: 'Accuracy', icon: '✅', value: '72%', unit: 'correct', trend: '↓ 3%', status: 'yellow' },
+    { id: 'temp', label: 'Temperature', icon: '🌡️', value: '85%', unit: 'just right', trend: '→', status: 'green' },
+  ];
+
+  const competitors = [
+    { name: 'You (Nurliya)', rating: 4.3, sentiment: 78, reviews: 342, vs: '—', isYou: true },
+    { name: 'Dose Cafe', rating: 4.5, sentiment: 82, reviews: 521, vs: 'Behind' },
+    { name: '%Arabica', rating: 4.6, sentiment: 85, reviews: 892, vs: 'Behind' },
+    { name: "Barn's", rating: 4.1, sentiment: 71, reviews: 234, vs: 'Ahead' },
+    { name: 'Camel Step', rating: 4.2, sentiment: 75, reviews: 189, vs: 'Ahead' },
+  ];
+
+  const getStatusColor = (status) => {
+    switch (status) {
+      case 'green': return 'bg-emerald-500';
+      case 'yellow': return 'bg-amber-500';
+      case 'red': return 'bg-red-500';
+      default: return 'bg-gray-400';
+    }
+  };
+
+  const getStatusBg = (status) => {
+    switch (status) {
+      case 'green': return 'bg-emerald-50 border-emerald-200';
+      case 'yellow': return 'bg-amber-50 border-amber-200';
+      case 'red': return 'bg-red-50 border-red-200';
+      default: return 'bg-gray-50 border-gray-200';
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      {/* Top Navigation */}
+      <nav className="bg-white border-b border-gray-200 px-6 py-3 flex items-center justify-between sticky top-0 z-50">
+        <div className="flex items-center gap-4">
+          <div className="flex items-center gap-2">
+            <span className="text-2xl">☕</span>
+            <span className="text-xl font-bold text-gray-900">NURLIYA</span>
+          </div>
+          <div className="flex items-center gap-2 bg-gray-100 px-3 py-1.5 rounded-lg">
+            <span className="text-sm text-gray-700">My Coffee Shop</span>
+            <span className="text-gray-400">▼</span>
+          </div>
+        </div>
+        <div className="flex items-center gap-4">
+          <div className="flex items-center bg-gray-100 px-3 py-1.5 rounded-lg">
+            <span className="text-gray-400 mr-2">🔍</span>
+            <input type="text" placeholder="Search reviews..." className="bg-transparent text-sm outline-none w-40" />
+          </div>
+          <button className="p-2 hover:bg-gray-100 rounded-lg">⚙️</button>
+          <button className="p-2 hover:bg-gray-100 rounded-lg">👤</button>
+        </div>
+      </nav>
+
+      {/* Hero Section */}
+      <div className="bg-white border-b border-gray-200 px-6 py-6">
+        <div className="max-w-7xl mx-auto">
+          {/* Metrics Row */}
+          <div className="grid grid-cols-5 gap-4 mb-6">
+            <div className="text-center">
+              <div className="text-3xl font-bold text-gray-900">4.3 <span className="text-yellow-500">★</span></div>
+              <div className="text-sm text-gray-500">Rating</div>
+              <div className="text-xs text-emerald-600 font-medium">↑ 0.1</div>
+            </div>
+            <div className="text-center">
+              <div className="text-3xl font-bold text-emerald-600">78%</div>
+              <div className="text-sm text-gray-500">Positive</div>
+              <div className="text-xs text-emerald-600 font-medium">↑ 5%</div>
+            </div>
+            <div className="text-center">
+              <div className="text-3xl font-bold text-gray-900">+23</div>
+              <div className="text-sm text-gray-500">Reviews</div>
+              <div className="text-xs text-gray-500">this week</div>
+            </div>
+            <div className="text-center">
+              <div className="text-3xl font-bold text-red-500">12</div>
+              <div className="text-sm text-gray-500">Alerts</div>
+              <div className="text-xs text-red-500 font-medium">pending</div>
+            </div>
+            <div className="text-center">
+              <div className="text-3xl font-bold text-blue-600">3</div>
+              <div className="text-sm text-gray-500">Actions</div>
+              <div className="text-xs text-blue-600 font-medium">suggested</div>
+            </div>
+          </div>
+
+          {/* AI Summary Box */}
+          <div className="bg-gradient-to-r from-blue-50 to-indigo-50 border border-blue-200 rounded-xl p-4">
+            <div className="flex items-start gap-3">
+              <div className="text-2xl">🤖</div>
+              <div className="flex-1">
+                <p className="text-gray-800">
+                  <span className="font-semibold">Great week</span> — Spanish Latte mentioned 34 times with 94% positive sentiment. 
+                  <span className="text-red-600 font-medium"> Watch out:</span> Friday lunch service got 8 complaints. 
+                  Your Chicken Sandwich is trending down — check portion size.
+                </p>
+                <button className="text-blue-600 text-sm font-medium mt-2 hover:underline">See more ↓</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Tab Navigation */}
+      <div className="bg-white border-b border-gray-200 px-6 py-3 sticky top-14 z-40">
+        <div className="max-w-7xl mx-auto flex items-center justify-between">
+          <div className="flex gap-1">
+            {tabs.map((tab) => (
+              <button
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id)}
+                className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${
+                  activeTab === tab.id
+                    ? 'bg-blue-600 text-white'
+                    : 'text-gray-600 hover:bg-gray-100'
+                }`}
+              >
+                <span className="mr-2">{tab.icon}</span>
+                {tab.label}
+              </button>
+            ))}
+          </div>
+          <div className="flex gap-2">
+            <select className="bg-gray-100 border-0 rounded-lg px-3 py-1.5 text-sm">
+              <option>Last 7 days</option>
+              <option>Last 30 days</option>
+              <option>Last 90 days</option>
+            </select>
+            <select className="bg-gray-100 border-0 rounded-lg px-3 py-1.5 text-sm">
+              <option>All Sentiment</option>
+              <option>Positive</option>
+              <option>Negative</option>
+            </select>
+            <select className="bg-gray-100 border-0 rounded-lg px-3 py-1.5 text-sm">
+              <option>Arabic + English</option>
+              <option>Arabic only</option>
+              <option>English only</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      {/* Main Content */}
+      <div className="max-w-7xl mx-auto px-6 py-6">
+        
+        {/* Overview Tab */}
+        {activeTab === 'overview' && (
+          <div className="space-y-6">
+            {/* Charts Row */}
+            <div className="grid grid-cols-2 gap-6">
+              <div className="bg-white rounded-xl border border-gray-200 p-5">
+                <h3 className="font-semibold text-gray-900 mb-4">📈 Sentiment Trend</h3>
+                <div className="h-40 flex items-end justify-between gap-2 px-4">
+                  {[65, 72, 68, 75, 71, 78, 82].map((val, i) => (
+                    <div key={i} className="flex-1 flex flex-col items-center">
+                      <div 
+                        className="w-full bg-gradient-to-t from-blue-500 to-blue-400 rounded-t-lg" 
+                        style={{ height: `${val}%` }}
+                      />
+                      <span className="text-xs text-gray-500 mt-2">{['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'][i]}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="bg-white rounded-xl border border-gray-200 p-5">
+                <h3 className="font-semibold text-gray-900 mb-4">⭐ Rating Distribution</h3>
+                <div className="space-y-3">
+                  {[
+                    { stars: 5, pct: 68 },
+                    { stars: 4, pct: 22 },
+                    { stars: 3, pct: 7 },
+                    { stars: 2, pct: 2 },
+                    { stars: 1, pct: 1 },
+                  ].map((row) => (
+                    <div key={row.stars} className="flex items-center gap-3">
+                      <span className="text-sm w-16">{'★'.repeat(row.stars)}{'☆'.repeat(5 - row.stars)}</span>
+                      <div className="flex-1 h-4 bg-gray-100 rounded-full overflow-hidden">
+                        <div className="h-full bg-yellow-400 rounded-full" style={{ width: `${row.pct}%` }} />
+                      </div>
+                      <span className="text-sm text-gray-600 w-10">{row.pct}%</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {/* Hot / Cold Row */}
+            <div className="grid grid-cols-2 gap-6">
+              <div className="bg-white rounded-xl border border-gray-200 p-5">
+                <h3 className="font-semibold text-gray-900 mb-4">🔥 What's Hot</h3>
+                <div className="space-y-3">
+                  {[
+                    { item: 'Spanish Latte', score: '94%', trend: '↑12' },
+                    { item: 'Croissant', score: '89%', trend: '↑3' },
+                    { item: 'Staff Friendliness', score: '87%', trend: '↑5' },
+                  ].map((row, i) => (
+                    <div key={i} className="flex items-center justify-between p-3 bg-emerald-50 rounded-lg">
+                      <span className="font-medium text-gray-800">{row.item}</span>
+                      <div className="flex items-center gap-2">
+                        <span className="text-emerald-600 font-bold">{row.score}</span>
+                        <span className="text-emerald-500 text-sm">{row.trend}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="bg-white rounded-xl border border-gray-200 p-5">
+                <h3 className="font-semibold text-gray-900 mb-4">❄️ What's Not</h3>
+                <div className="space-y-3">
+                  {[
+                    { item: 'Chicken Sandwich', score: '62%', trend: '↓8' },
+                    { item: 'Wait Times', score: '-23%', trend: 'declining' },
+                    { item: 'Parking', score: '12', trend: 'complaints' },
+                  ].map((row, i) => (
+                    <div key={i} className="flex items-center justify-between p-3 bg-red-50 rounded-lg">
+                      <span className="font-medium text-gray-800">{row.item}</span>
+                      <div className="flex items-center gap-2">
+                        <span className="text-red-600 font-bold">{row.score}</span>
+                        <span className="text-red-500 text-sm">{row.trend}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {/* Alerts */}
+            <div className="bg-white rounded-xl border border-gray-200 p-5">
+              <h3 className="font-semibold text-gray-900 mb-4">🚨 Needs Attention</h3>
+              <div className="space-y-2">
+                {[
+                  { icon: '⚠️', text: 'Chicken Sandwich sentiment dropped 23% this week', urgent: true },
+                  { icon: '⚠️', text: '8 complaints about Friday lunch wait times', urgent: true },
+                  { icon: '💬', text: '14 reviews awaiting response', urgent: false },
+                  { icon: '📉', text: '3-star reviews increased by 40%', urgent: false },
+                ].map((alert, i) => (
+                  <div key={i} className={`flex items-center gap-3 p-3 rounded-lg ${alert.urgent ? 'bg-red-50' : 'bg-amber-50'}`}>
+                    <span>{alert.icon}</span>
+                    <span className="text-gray-800">{alert.text}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Products Tab */}
+        {activeTab === 'products' && (
+          <div className="space-y-6">
+            {/* Filters */}
+            <div className="flex items-center gap-3">
+              <button className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium">All Products</button>
+              <button className="px-4 py-2 bg-gray-100 text-gray-700 rounded-lg text-sm font-medium hover:bg-gray-200">Drinks</button>
+              <button className="px-4 py-2 bg-gray-100 text-gray-700 rounded-lg text-sm font-medium hover:bg-gray-200">Food</button>
+              <button className="px-4 py-2 bg-white border-2 border-dashed border-gray-300 text-gray-500 rounded-lg text-sm font-medium hover:border-blue-400 hover:text-blue-600">+ Add Product</button>
+            </div>
+
+            {/* Product Matrix */}
+            <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+              <table className="w-full">
+                <thead className="bg-gray-50 border-b border-gray-200">
+                  <tr>
+                    <th className="text-left px-5 py-3 text-sm font-semibold text-gray-600">Product</th>
+                    <th className="text-center px-5 py-3 text-sm font-semibold text-gray-600">Mentions</th>
+                    <th className="text-center px-5 py-3 text-sm font-semibold text-gray-600">Sentiment</th>
+                    <th className="text-center px-5 py-3 text-sm font-semibold text-gray-600">Trend</th>
+                    <th className="text-left px-5 py-3 text-sm font-semibold text-gray-600">Top Complaint</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {products.map((product, i) => (
+                    <tr 
+                      key={i} 
+                      className={`border-b border-gray-100 hover:bg-gray-50 cursor-pointer transition-colors ${selectedProduct === i ? 'bg-blue-50' : ''}`}
+                      onClick={() => setSelectedProduct(selectedProduct === i ? null : i)}
+                    >
+                      <td className="px-5 py-4">
+                        <span className="mr-2">{product.emoji}</span>
+                        <span className="font-medium text-gray-900">{product.name}</span>
+                      </td>
+                      <td className="text-center px-5 py-4 text-gray-700">{product.mentions}</td>
+                      <td className="text-center px-5 py-4">
+                        {product.sentiment ? (
+                          <span className={`inline-flex items-center gap-1 px-2 py-1 rounded-full text-sm font-medium ${
+                            product.status === 'green' ? 'bg-emerald-100 text-emerald-700' :
+                            product.status === 'yellow' ? 'bg-amber-100 text-amber-700' :
+                            product.status === 'red' ? 'bg-red-100 text-red-700' : 'bg-gray-100 text-gray-500'
+                          }`}>
+                            <span className={`w-2 h-2 rounded-full ${getStatusColor(product.status)}`}></span>
+                            {product.sentiment}%
+                          </span>
+                        ) : (
+                          <span className="text-gray-400">—</span>
+                        )}
+                      </td>
+                      <td className="text-center px-5 py-4">
+                        {product.trend ? (
+                          <span className={`font-medium ${
+                            product.trend.startsWith('+') ? 'text-emerald-600' :
+                            product.trend.startsWith('-') ? 'text-red-600' : 'text-gray-500'
+                          }`}>
+                            {product.trend.startsWith('+') ? '↑' : product.trend.startsWith('-') ? '↓' : '→'} {product.trend.replace(/[+-]/, '')}
+                          </span>
+                        ) : (
+                          <span className="text-gray-400">—</span>
+                        )}
+                      </td>
+                      <td className="px-5 py-4 text-gray-600 text-sm">{product.complaint}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Product Detail Panel */}
+            {selectedProduct !== null && (
+              <div className="bg-white rounded-xl border border-gray-200 p-6">
+                <div className="flex items-center justify-between mb-6">
+                  <div className="flex items-center gap-3">
+                    <span className="text-3xl">{products[selectedProduct].emoji}</span>
+                    <h3 className="text-xl font-bold text-gray-900">{products[selectedProduct].name}</h3>
+                  </div>
+                  <button onClick={() => setSelectedProduct(null)} className="text-gray-400 hover:text-gray-600">✕</button>
+                </div>
+                
+                <div className="grid grid-cols-3 gap-4 mb-6">
+                  <div className="bg-gray-50 rounded-lg p-4 text-center">
+                    <div className="text-2xl font-bold text-gray-900">{products[selectedProduct].sentiment || '—'}%</div>
+                    <div className="text-sm text-gray-500">Sentiment</div>
+                  </div>
+                  <div className="bg-gray-50 rounded-lg p-4 text-center">
+                    <div className="text-2xl font-bold text-gray-900">{products[selectedProduct].mentions}</div>
+                    <div className="text-sm text-gray-500">Mentions</div>
+                  </div>
+                  <div className="bg-gray-50 rounded-lg p-4 text-center">
+                    <div className="text-2xl font-bold text-emerald-600">{products[selectedProduct].trend || '—'}</div>
+                    <div className="text-sm text-gray-500">vs last week</div>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-6 mb-6">
+                  <div>
+                    <h4 className="font-semibold text-gray-900 mb-3">💚 What people love</h4>
+                    <div className="space-y-2">
+                      <div className="flex justify-between text-sm"><span>Taste</span><span className="text-gray-500">18 mentions</span></div>
+                      <div className="flex justify-between text-sm"><span>Presentation</span><span className="text-gray-500">7 mentions</span></div>
+                      <div className="flex justify-between text-sm"><span>Temperature</span><span className="text-gray-500">5 mentions</span></div>
+                    </div>
+                  </div>
+                  <div>
+                    <h4 className="font-semibold text-gray-900 mb-3">💔 What people complain about</h4>
+                    <div className="space-y-2">
+                      <div className="flex justify-between text-sm"><span>Too sweet</span><span className="text-gray-500">4 mentions</span></div>
+                      <div className="flex justify-between text-sm"><span>Price</span><span className="text-gray-500">2 mentions</span></div>
+                    </div>
+                  </div>
+                </div>
+
+                <div>
+                  <h4 className="font-semibold text-gray-900 mb-3">💬 Sample Reviews</h4>
+                  <div className="space-y-2">
+                    <div className="bg-gray-50 rounded-lg p-3 flex justify-between items-center">
+                      <span className="text-sm">"السبانش لاتيه عندهم أفضل شي جربته 😍"</span>
+                      <span className="text-yellow-500">★★★★★</span>
+                    </div>
+                    <div className="bg-gray-50 rounded-lg p-3 flex justify-between items-center">
+                      <span className="text-sm">"Spanish latte was perfect, best in Dammam"</span>
+                      <span className="text-yellow-500">★★★★★</span>
+                    </div>
+                    <div className="bg-gray-50 rounded-lg p-3 flex justify-between items-center">
+                      <span className="text-sm">"Good but a bit too sweet for my taste"</span>
+                      <span className="text-yellow-500">★★★★☆</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Operations Tab */}
+        {activeTab === 'operations' && (
+          <div className="space-y-6">
+            <h2 className="text-lg font-semibold text-gray-900">Operational Health</h2>
+            
+            {/* Cards Grid */}
+            <div className="grid grid-cols-4 gap-4">
+              {opsCards.map((card) => (
+                <div
+                  key={card.id}
+                  onClick={() => setSelectedOpsCard(selectedOpsCard === card.id ? null : card.id)}
+                  className={`p-5 rounded-xl border-2 cursor-pointer transition-all hover:shadow-md ${
+                    selectedOpsCard === card.id ? 'border-blue-500 bg-blue-50' : getStatusBg(card.status)
+                  }`}
+                >
+                  <div className="text-2xl mb-2">{card.icon}</div>
+                  <div className="text-sm text-gray-600 mb-1">{card.label}</div>
+                  <div className="flex items-baseline gap-2">
+                    <span className={`text-2xl font-bold ${
+                      card.status === 'green' ? 'text-emerald-600' :
+                      card.status === 'yellow' ? 'text-amber-600' :
+                      card.status === 'red' ? 'text-red-600' : 'text-gray-600'
+                    }`}>{card.value}</span>
+                    <span className="text-sm text-gray-500">{card.unit}</span>
+                  </div>
+                  <div className={`text-sm mt-1 ${
+                    card.trend.includes('↑') && card.status === 'red' ? 'text-red-500' :
+                    card.trend.includes('↑') ? 'text-emerald-500' :
+                    card.trend.includes('↓') ? 'text-red-500' : 'text-gray-500'
+                  }`}>{card.trend}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Detail Panel */}
+            {selectedOpsCard && (
+              <div className="bg-white rounded-xl border border-gray-200 p-6">
+                <div className="flex items-center justify-between mb-6">
+                  <div className="flex items-center gap-3">
+                    <span className="text-3xl">{opsCards.find(c => c.id === selectedOpsCard)?.icon}</span>
+                    <h3 className="text-xl font-bold text-gray-900">{opsCards.find(c => c.id === selectedOpsCard)?.label}</h3>
+                  </div>
+                  <button onClick={() => setSelectedOpsCard(null)} className="text-gray-400 hover:text-gray-600">✕</button>
+                </div>
+
+                <div className="grid grid-cols-3 gap-4 mb-6">
+                  <div className="bg-gray-50 rounded-lg p-4 text-center">
+                    <div className="text-2xl font-bold text-gray-900">31</div>
+                    <div className="text-sm text-gray-500">Total Mentions</div>
+                  </div>
+                  <div className="bg-red-50 rounded-lg p-4 text-center">
+                    <div className="text-2xl font-bold text-red-600">23 (74%)</div>
+                    <div className="text-sm text-gray-500">Negative</div>
+                  </div>
+                  <div className="bg-emerald-50 rounded-lg p-4 text-center">
+                    <div className="text-2xl font-bold text-emerald-600">8 (26%)</div>
+                    <div className="text-sm text-gray-500">Positive</div>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-6 mb-6">
+                  <div>
+                    <h4 className="font-semibold text-gray-900 mb-3">Common Phrases</h4>
+                    <div className="space-y-2 text-sm">
+                      <div className="flex justify-between"><span>"took too long"</span><span className="text-gray-500">9 mentions</span></div>
+                      <div className="flex justify-between"><span>"slow service"</span><span className="text-gray-500">7 mentions</span></div>
+                      <div className="flex justify-between"><span>"waited forever"</span><span className="text-gray-500">4 mentions</span></div>
+                      <div className="flex justify-between"><span>"fast"</span><span className="text-gray-500">5 mentions</span></div>
+                    </div>
+                  </div>
+                  <div>
+                    <h4 className="font-semibold text-gray-900 mb-3">When does this happen?</h4>
+                    <div className="space-y-2 text-sm">
+                      <div className="flex justify-between"><span>Friday</span><span className="text-red-600 font-medium">12 complaints (52%)</span></div>
+                      <div className="flex justify-between"><span>Saturday</span><span className="text-gray-500">6 complaints (26%)</span></div>
+                      <div className="flex justify-between"><span>Lunch (12-3pm)</span><span className="text-red-600 font-medium">18 complaints (78%)</span></div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+                  <div className="flex items-start gap-3">
+                    <span className="text-xl">💡</span>
+                    <div>
+                      <h4 className="font-semibold text-gray-900 mb-1">AI Suggestion</h4>
+                      <p className="text-gray-700 text-sm">Add 1 staff member during Friday lunch rush (12-3pm). 78% of speed complaints occur during this window.</p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Timing Tab */}
+        {activeTab === 'timing' && (
+          <div className="space-y-6">
+            {/* Day of Week */}
+            <div className="bg-white rounded-xl border border-gray-200 p-5">
+              <h3 className="font-semibold text-gray-900 mb-4">📅 By Day of Week</h3>
+              <div className="flex items-end justify-between gap-4 h-40 mb-4">
+                {[
+                  { day: 'Sun', reviews: 8, sentiment: 92 },
+                  { day: 'Mon', reviews: 12, sentiment: 89 },
+                  { day: 'Tue', reviews: 15, sentiment: 85 },
+                  { day: 'Wed', reviews: 18, sentiment: 78 },
+                  { day: 'Thu', reviews: 25, sentiment: 71 },
+                  { day: 'Fri', reviews: 22, sentiment: 71 },
+                  { day: 'Sat', reviews: 16, sentiment: 88 },
+                ].map((d, i) => (
+                  <div key={i} className="flex-1 flex flex-col items-center">
+                    <div className="w-full flex flex-col items-center">
+                      <span className={`text-xs font-medium mb-1 ${d.sentiment < 75 ? 'text-red-600' : 'text-emerald-600'}`}>{d.sentiment}%</span>
+                      <div 
+                        className={`w-full rounded-t-lg ${d.sentiment < 75 ? 'bg-red-400' : d.sentiment < 85 ? 'bg-amber-400' : 'bg-emerald-400'}`}
+                        style={{ height: `${d.reviews * 4}px` }}
+                      />
+                    </div>
+                    <span className="text-xs text-gray-500 mt-2">{d.day}</span>
+                  </div>
+                ))}
+              </div>
+              <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-700">
+                🔴 Thursday & Friday have lowest sentiment — investigate lunch rush issues
+              </div>
+            </div>
+
+            {/* Time of Day */}
+            <div className="bg-white rounded-xl border border-gray-200 p-5">
+              <h3 className="font-semibold text-gray-900 mb-4">⏰ By Time of Day</h3>
+              <div className="space-y-3">
+                {[
+                  { time: 'Morning (6-11am)', sentiment: 85, color: 'emerald' },
+                  { time: 'Lunch (11am-3pm)', sentiment: 68, color: 'red' },
+                  { time: 'Afternoon (3-6pm)', sentiment: 82, color: 'emerald' },
+                  { time: 'Evening (6-11pm)', sentiment: 88, color: 'emerald' },
+                ].map((t, i) => (
+                  <div key={i} className="flex items-center gap-4">
+                    <span className="w-36 text-sm text-gray-700">{t.time}</span>
+                    <div className="flex-1 h-6 bg-gray-100 rounded-full overflow-hidden">
+                      <div 
+                        className={`h-full rounded-full ${t.color === 'red' ? 'bg-red-400' : 'bg-emerald-400'}`}
+                        style={{ width: `${t.sentiment}%` }}
+                      />
+                    </div>
+                    <span className={`text-sm font-medium w-20 ${t.color === 'red' ? 'text-red-600' : 'text-emerald-600'}`}>
+                      {t.sentiment}% {t.color === 'red' && '⚠️'}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Customer Segments */}
+            <div className="bg-white rounded-xl border border-gray-200 p-5">
+              <h3 className="font-semibold text-gray-900 mb-4">👥 Customer Type Patterns</h3>
+              <div className="grid grid-cols-5 gap-4">
+                {[
+                  { icon: '👨‍👩‍👧‍👦', type: 'Families', mentions: 23, sentiment: 78 },
+                  { icon: '💼', type: 'Business', mentions: 15, sentiment: 92 },
+                  { icon: '👤', type: 'Solo', mentions: 31, sentiment: 85 },
+                  { icon: '💑', type: 'Couples', mentions: 8, sentiment: 89 },
+                  { icon: '🎓', type: 'Students', mentions: 12, sentiment: 71 },
+                ].map((c, i) => (
+                  <div key={i} className={`p-4 rounded-xl border ${c.sentiment < 75 ? 'bg-amber-50 border-amber-200' : 'bg-gray-50 border-gray-200'}`}>
+                    <div className="text-2xl mb-2">{c.icon}</div>
+                    <div className="font-medium text-gray-900">{c.type}</div>
+                    <div className="text-sm text-gray-500">{c.mentions} mentions</div>
+                    <div className={`text-lg font-bold ${c.sentiment < 75 ? 'text-amber-600' : 'text-emerald-600'}`}>{c.sentiment}%</div>
+                  </div>
+                ))}
+              </div>
+              <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-sm text-amber-700 mt-4">
+                💡 Students find you expensive — consider student discount?
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Competitors Tab */}
+        {activeTab === 'competitors' && (
+          <div className="space-y-6">
+            <div className="flex items-center justify-between">
+              <h2 className="text-lg font-semibold text-gray-900">Competitor Tracking</h2>
+              <button className="px-4 py-2 bg-white border-2 border-dashed border-gray-300 text-gray-500 rounded-lg text-sm font-medium hover:border-blue-400 hover:text-blue-600">+ Add Competitor</button>
+            </div>
+
+            {/* Competitor Table */}
+            <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+              <table className="w-full">
+                <thead className="bg-gray-50 border-b border-gray-200">
+                  <tr>
+                    <th className="text-left px-5 py-3 text-sm font-semibold text-gray-600">Business</th>
+                    <th className="text-center px-5 py-3 text-sm font-semibold text-gray-600">Rating</th>
+                    <th className="text-center px-5 py-3 text-sm font-semibold text-gray-600">Sentiment</th>
+                    <th className="text-center px-5 py-3 text-sm font-semibold text-gray-600">Reviews</th>
+                    <th className="text-center px-5 py-3 text-sm font-semibold text-gray-600">vs You</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {competitors.map((comp, i) => (
+                    <tr key={i} className={`border-b border-gray-100 ${comp.isYou ? 'bg-blue-50' : 'hover:bg-gray-50'}`}>
+                      <td className="px-5 py-4">
+                        <span className="mr-2">☕</span>
+                        <span className={`font-medium ${comp.isYou ? 'text-blue-600' : 'text-gray-900'}`}>{comp.name}</span>
+                      </td>
+                      <td className="text-center px-5 py-4">
+                        <span className="text-yellow-500">★</span> {comp.rating}
+                      </td>
+                      <td className="text-center px-5 py-4">
+                        <span className={comp.sentiment >= 80 ? 'text-emerald-600' : comp.sentiment >= 70 ? 'text-amber-600' : 'text-red-600'}>
+                          {comp.sentiment}%
+                        </span>
+                      </td>
+                      <td className="text-center px-5 py-4 text-gray-600">{comp.reviews}</td>
+                      <td className="text-center px-5 py-4">
+                        {comp.vs === '—' ? (
+                          <span className="text-gray-400">—</span>
+                        ) : comp.vs === 'Ahead' ? (
+                          <span className="text-emerald-600 font-medium">✓ Ahead</span>
+                        ) : (
+                          <span className="text-red-600 font-medium">Behind</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Competitive Analysis */}
+            <div className="grid grid-cols-2 gap-6">
+              <div className="bg-white rounded-xl border border-gray-200 p-5">
+                <h3 className="font-semibold text-gray-900 mb-4">📈 What They Do Better</h3>
+                <div className="space-y-2">
+                  <div className="p-3 bg-red-50 rounded-lg text-sm">
+                    <span className="font-medium">Dose:</span> Faster service
+                  </div>
+                  <div className="p-3 bg-red-50 rounded-lg text-sm">
+                    <span className="font-medium">%Arabica:</span> Ambiance & aesthetics
+                  </div>
+                  <div className="p-3 bg-red-50 rounded-lg text-sm">
+                    <span className="font-medium">Dose:</span> Parking availability
+                  </div>
+                </div>
+              </div>
+              <div className="bg-white rounded-xl border border-gray-200 p-5">
+                <h3 className="font-semibold text-gray-900 mb-4">🏆 What You Do Better</h3>
+                <div className="space-y-2">
+                  <div className="p-3 bg-emerald-50 rounded-lg text-sm">
+                    Your <span className="font-medium">Spanish Latte</span> beats all competitors
+                  </div>
+                  <div className="p-3 bg-emerald-50 rounded-lg text-sm">
+                    <span className="font-medium">Staff friendliness</span> #1 in area
+                  </div>
+                  <div className="p-3 bg-emerald-50 rounded-lg text-sm">
+                    <span className="font-medium">Food quality</span> better than Barn's
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Opportunities */}
+            <div className="bg-gradient-to-r from-blue-50 to-indigo-50 border border-blue-200 rounded-xl p-5">
+              <h3 className="font-semibold text-gray-900 mb-3">💡 Your Opportunities</h3>
+              <div className="grid grid-cols-3 gap-4">
+                <div className="bg-white rounded-lg p-3 text-sm">None offer <span className="font-medium">student discount</span></div>
+                <div className="bg-white rounded-lg p-3 text-sm">Competitors <span className="font-medium">weak on breakfast</span></div>
+                <div className="bg-white rounded-lg p-3 text-sm">No one praised for <span className="font-medium">healthy options</span></div>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Floating Action Button */}
+      <div className="fixed bottom-6 right-6">
+        <button className="w-14 h-14 bg-blue-600 text-white rounded-full shadow-lg hover:bg-blue-700 transition-all hover:scale-105 flex items-center justify-center text-2xl">
+          +
+        </button>
+      </div>
+    </div>
+  );
+};
+
+export default NurliyaDashboard;
+
+

@@ -4,6 +4,7 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { cn } from '@/lib/cn'
 import { fetchLogs, LogEntry } from '@/lib/api'
+import { useWebSocket } from '@/lib/useWebSocket'
 import {
   Activity,
   AlertCircle,
@@ -15,6 +16,8 @@ import {
   Server,
   Loader2,
   Filter,
+  Wifi,
+  WifiOff,
 } from 'lucide-react'
 
 interface LogsTableProps {
@@ -38,6 +41,7 @@ const CATEGORY_CONFIG = {
 }
 
 export function LogsTable({ className }: LogsTableProps) {
+  const { isConnected, recentLogs } = useWebSocket()
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [page, setPage] = useState(1)
   const [hasMore, setHasMore] = useState(true)
@@ -50,6 +54,7 @@ export function LogsTable({ className }: LogsTableProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const observerRef = useRef<IntersectionObserver | null>(null)
   const loadMoreRef = useRef<HTMLDivElement>(null)
+  const seenIdsRef = useRef<Set<string>>(new Set())
 
   const loadLogs = useCallback(async (pageNum: number, reset = false) => {
     if (isLoading) return
@@ -65,7 +70,16 @@ export function LogsTable({ className }: LogsTableProps) {
         levelFilter || undefined
       )
 
-      setLogs(prev => reset ? response.logs : [...prev, ...response.logs])
+      if (reset) {
+        seenIdsRef.current = new Set(response.logs.map(l => l.id))
+        setLogs(response.logs)
+      } else {
+        setLogs(prev => {
+          const newLogs = response.logs.filter(l => !seenIdsRef.current.has(l.id))
+          newLogs.forEach(l => seenIdsRef.current.add(l.id))
+          return [...prev, ...newLogs]
+        })
+      }
       setHasMore(response.pagination.has_next)
       setPage(pageNum)
     } catch (err) {
@@ -83,8 +97,22 @@ export function LogsTable({ className }: LogsTableProps) {
     setLogs([])
     setHasMore(true)
     setIsInitialLoad(true)
+    seenIdsRef.current = new Set()
     loadLogs(1, true)
   }, [categoryFilter, levelFilter])
+
+  // Merge WebSocket logs in real-time (prepend new logs)
+  useEffect(() => {
+    if (recentLogs.length > 0 && !categoryFilter && !levelFilter) {
+      setLogs(prev => {
+        const newLogs = recentLogs.filter(l => !seenIdsRef.current.has(l.id))
+        if (newLogs.length === 0) return prev
+
+        newLogs.forEach(l => seenIdsRef.current.add(l.id))
+        return [...newLogs, ...prev]
+      })
+    }
+  }, [recentLogs, categoryFilter, levelFilter])
 
   // Infinite scroll observer
   useEffect(() => {
@@ -142,50 +170,61 @@ export function LogsTable({ className }: LogsTableProps) {
 
   return (
     <div className={cn('flex flex-col', className)}>
-      {/* Filters */}
-      <div className="flex items-center gap-3 mb-4 flex-wrap">
-        <div className="flex items-center gap-2 text-xs text-muted">
-          <Filter size={14} />
-          <span>Filter:</span>
+      {/* Header with filters and connection status */}
+      <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
+        <div className="flex items-center gap-3 flex-wrap">
+          <div className="flex items-center gap-2 text-xs text-muted">
+            <Filter size={14} />
+            <span>Filter:</span>
+          </div>
+
+          <select
+            value={categoryFilter}
+            onChange={(e) => setCategoryFilter(e.target.value)}
+            className="text-xs bg-card border border-border rounded px-2 py-1 text-foreground focus:outline-none focus:ring-1 focus:ring-border"
+          >
+            <option value="">All Categories</option>
+            <option value="scraper">Scraper</option>
+            <option value="analysis">Analysis</option>
+            <option value="job">Job</option>
+            <option value="email">Email</option>
+            <option value="worker">Worker</option>
+            <option value="system">System</option>
+          </select>
+
+          <select
+            value={levelFilter}
+            onChange={(e) => setLevelFilter(e.target.value)}
+            className="text-xs bg-card border border-border rounded px-2 py-1 text-foreground focus:outline-none focus:ring-1 focus:ring-border"
+          >
+            <option value="">All Levels</option>
+            <option value="info">Info</option>
+            <option value="success">Success</option>
+            <option value="warning">Warning</option>
+            <option value="error">Error</option>
+          </select>
+
+          {(categoryFilter || levelFilter) && (
+            <button
+              onClick={() => {
+                setCategoryFilter('')
+                setLevelFilter('')
+              }}
+              className="text-xs text-muted hover:text-foreground transition-colors"
+            >
+              Clear
+            </button>
+          )}
         </div>
 
-        <select
-          value={categoryFilter}
-          onChange={(e) => setCategoryFilter(e.target.value)}
-          className="text-xs bg-card border border-border rounded px-2 py-1 text-foreground focus:outline-none focus:ring-1 focus:ring-border"
-        >
-          <option value="">All Categories</option>
-          <option value="scraper">Scraper</option>
-          <option value="analysis">Analysis</option>
-          <option value="job">Job</option>
-          <option value="email">Email</option>
-          <option value="worker">Worker</option>
-          <option value="system">System</option>
-        </select>
-
-        <select
-          value={levelFilter}
-          onChange={(e) => setLevelFilter(e.target.value)}
-          className="text-xs bg-card border border-border rounded px-2 py-1 text-foreground focus:outline-none focus:ring-1 focus:ring-border"
-        >
-          <option value="">All Levels</option>
-          <option value="info">Info</option>
-          <option value="success">Success</option>
-          <option value="warning">Warning</option>
-          <option value="error">Error</option>
-        </select>
-
-        {(categoryFilter || levelFilter) && (
-          <button
-            onClick={() => {
-              setCategoryFilter('')
-              setLevelFilter('')
-            }}
-            className="text-xs text-muted hover:text-foreground transition-colors"
-          >
-            Clear filters
-          </button>
-        )}
+        {/* Live indicator */}
+        <div className={cn(
+          'flex items-center gap-1.5 text-xs px-2 py-1 rounded',
+          isConnected ? 'text-success bg-success/10' : 'text-muted bg-card'
+        )}>
+          {isConnected ? <Wifi size={12} /> : <WifiOff size={12} />}
+          <span>{isConnected ? 'Live' : 'Offline'}</span>
+        </div>
       </div>
 
       {/* Logs container */}
