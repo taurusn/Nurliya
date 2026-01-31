@@ -3,24 +3,164 @@ FastAPI application for Nurliya Pipeline.
 Provides REST API for scraping, job tracking, and review analysis.
 """
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+import asyncio
+import json
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
-from typing import Optional, List
+from typing import Optional, List, Set
 from uuid import UUID
+from sqlalchemy import func, text
 
 from database import Place, Review, ReviewAnalysis, Job, ScrapeJob, get_session, create_tables
+from config import RABBITMQ_URL, QUEUE_NAME
+from scraper_client import ScraperClient
+
+
+# WebSocket connection manager
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Set[WebSocket] = set()
+        self.last_analysis_id: Optional[str] = None
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.add(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.discard(websocket)
+
+    async def broadcast(self, message: dict):
+        disconnected = set()
+        for connection in self.active_connections:
+            try:
+                await connection.send_json(message)
+            except Exception:
+                disconnected.add(connection)
+        for conn in disconnected:
+            self.active_connections.discard(conn)
+
+
+manager = ConnectionManager()
+
+
+# Background task for polling new analyses
+async def poll_database():
+    """Poll database for new analyses and broadcast to WebSocket clients."""
+    while True:
+        try:
+            if manager.active_connections:
+                session = get_session()
+                try:
+                    # Get latest analysis
+                    latest = (
+                        session.query(ReviewAnalysis)
+                        .order_by(ReviewAnalysis.analyzed_at.desc())
+                        .first()
+                    )
+
+                    if latest and str(latest.id) != manager.last_analysis_id:
+                        manager.last_analysis_id = str(latest.id)
+
+                        # Get place name through review
+                        place_name = None
+                        if latest.review and latest.review.place:
+                            place_name = latest.review.place.name
+
+                        # Broadcast new analysis
+                        await manager.broadcast({
+                            "type": "analysis",
+                            "data": {
+                                "review_id": str(latest.review_id),
+                                "place_name": place_name,
+                                "sentiment": latest.sentiment,
+                                "score": float(latest.score) if latest.score else None,
+                                "summary_en": latest.summary_en,
+                                "analyzed_at": latest.analyzed_at.isoformat() if latest.analyzed_at else None,
+                            }
+                        })
+
+                    # Broadcast stats update
+                    places_count = session.query(Place).count()
+                    reviews_count = session.query(Review).count()
+                    analyses_count = session.query(ReviewAnalysis).count()
+
+                    # Get job status counts
+                    job_statuses = (
+                        session.query(ScrapeJob.status, func.count(ScrapeJob.id))
+                        .group_by(ScrapeJob.status)
+                        .all()
+                    )
+                    scrape_jobs = {status: count for status, count in job_statuses}
+
+                    # Get active jobs
+                    active_jobs = (
+                        session.query(ScrapeJob)
+                        .filter(ScrapeJob.status.in_(["pending", "scraping", "processing"]))
+                        .all()
+                    )
+
+                    await manager.broadcast({
+                        "type": "stats",
+                        "data": {
+                            "places_count": places_count,
+                            "reviews_count": reviews_count,
+                            "analyses_count": analyses_count,
+                            "pending_analyses": reviews_count - analyses_count,
+                            "scrape_jobs": {
+                                "pending": scrape_jobs.get("pending", 0),
+                                "scraping": scrape_jobs.get("scraping", 0),
+                                "processing": scrape_jobs.get("processing", 0),
+                                "completed": scrape_jobs.get("completed", 0),
+                                "failed": scrape_jobs.get("failed", 0),
+                            },
+                            "active_jobs": [
+                                {
+                                    "id": str(job.id),
+                                    "query": job.query,
+                                    "status": job.status,
+                                    "places_found": job.places_found or 0,
+                                    "reviews_total": job.reviews_total or 0,
+                                    "reviews_processed": job.reviews_processed or 0,
+                                }
+                                for job in active_jobs
+                            ]
+                        }
+                    })
+                finally:
+                    session.close()
+        except Exception as e:
+            print(f"Poll error: {e}")
+
+        await asyncio.sleep(2)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup and shutdown events."""
+    create_tables()
+    # Start background polling task
+    poll_task = asyncio.create_task(poll_database())
+    yield
+    poll_task.cancel()
+    try:
+        await poll_task
+    except asyncio.CancelledError:
+        pass
+
+
 from orchestrator import (
     create_scrape_job,
     get_scrape_job_progress,
     run_scrape_pipeline,
 )
-from scraper_client import ScraperClient
 
 app = FastAPI(
     title="Nurliya API",
     description="AI-powered sentiment analysis for Saudi business reviews",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 # CORS middleware
@@ -111,13 +251,6 @@ class PlaceReviewsResponse(BaseModel):
     place: PlaceDetailResponse
     reviews: List[ReviewWithAnalysis]
     total: int
-
-
-# Startup event
-@app.on_event("startup")
-async def startup_event():
-    """Initialize database tables on startup."""
-    create_tables()
 
 
 # Health check
@@ -398,6 +531,171 @@ async def get_place_stats(place_id: str):
         }
     finally:
         session.close()
+
+
+# Dashboard API endpoints
+@app.get("/api/stats")
+async def get_stats():
+    """Get system-wide statistics for the dashboard."""
+    session = get_session()
+    try:
+        places_count = session.query(Place).count()
+        reviews_count = session.query(Review).count()
+        analyses_count = session.query(ReviewAnalysis).count()
+
+        # Job status counts
+        job_statuses = (
+            session.query(ScrapeJob.status, func.count(ScrapeJob.id))
+            .group_by(ScrapeJob.status)
+            .all()
+        )
+        scrape_jobs = {status: count for status, count in job_statuses}
+
+        return {
+            "places_count": places_count,
+            "reviews_count": reviews_count,
+            "analyses_count": analyses_count,
+            "pending_analyses": reviews_count - analyses_count,
+            "scrape_jobs": {
+                "pending": scrape_jobs.get("pending", 0),
+                "scraping": scrape_jobs.get("scraping", 0),
+                "processing": scrape_jobs.get("processing", 0),
+                "completed": scrape_jobs.get("completed", 0),
+                "failed": scrape_jobs.get("failed", 0),
+            }
+        }
+    finally:
+        session.close()
+
+
+@app.get("/api/queue-status")
+async def get_queue_status():
+    """Get RabbitMQ queue status."""
+    try:
+        import pika
+        params = pika.URLParameters(RABBITMQ_URL)
+        connection = pika.BlockingConnection(params)
+        channel = connection.channel()
+
+        # Declare queue to get its status (won't create if exists)
+        queue = channel.queue_declare(queue=QUEUE_NAME, passive=True)
+        message_count = queue.method.message_count
+        consumer_count = queue.method.consumer_count
+
+        connection.close()
+
+        return {
+            "queue_name": QUEUE_NAME,
+            "messages_ready": message_count,
+            "consumers": consumer_count,
+            "status": "connected"
+        }
+    except Exception as e:
+        return {
+            "queue_name": QUEUE_NAME,
+            "messages_ready": 0,
+            "consumers": 0,
+            "status": "disconnected",
+            "error": str(e)
+        }
+
+
+@app.get("/api/recent-analyses")
+async def get_recent_analyses(limit: int = 10):
+    """Get the most recent review analyses."""
+    session = get_session()
+    try:
+        analyses = (
+            session.query(ReviewAnalysis)
+            .order_by(ReviewAnalysis.analyzed_at.desc())
+            .limit(limit)
+            .all()
+        )
+
+        result = []
+        for analysis in analyses:
+            place_name = None
+            review_text = None
+            if analysis.review:
+                review_text = analysis.review.text
+                if analysis.review.place:
+                    place_name = analysis.review.place.name
+
+            result.append({
+                "review_id": str(analysis.review_id),
+                "place_name": place_name,
+                "sentiment": analysis.sentiment,
+                "score": float(analysis.score) if analysis.score else None,
+                "summary_en": analysis.summary_en,
+                "review_text": review_text[:100] if review_text else None,
+                "analyzed_at": analysis.analyzed_at.isoformat() if analysis.analyzed_at else None,
+            })
+
+        return {"analyses": result}
+    finally:
+        session.close()
+
+
+@app.get("/api/system-health")
+async def get_system_health():
+    """Get health status of all system components."""
+    # Check scraper
+    client = ScraperClient()
+    scraper_ok = await client.health_check()
+
+    # Check database
+    db_ok = False
+    try:
+        session = get_session()
+        session.execute(text("SELECT 1"))
+        session.close()
+        db_ok = True
+    except Exception:
+        pass
+
+    # Check RabbitMQ
+    rabbit_ok = False
+    try:
+        import pika
+        params = pika.URLParameters(RABBITMQ_URL)
+        connection = pika.BlockingConnection(params)
+        connection.close()
+        rabbit_ok = True
+    except Exception:
+        pass
+
+    # Check vLLM (via config)
+    vllm_ok = False
+    try:
+        import httpx
+        from config import VLLM_BASE_URL, VLLM_API_KEY
+        headers = {"Authorization": f"Bearer {VLLM_API_KEY}"}
+        async with httpx.AsyncClient(timeout=5.0) as http_client:
+            resp = await http_client.get(f"{VLLM_BASE_URL}/models", headers=headers)
+            vllm_ok = resp.status_code == 200
+    except Exception:
+        pass
+
+    return {
+        "api": True,
+        "scraper": scraper_ok,
+        "database": db_ok,
+        "rabbitmq": rabbit_ok,
+        "vllm": vllm_ok,
+    }
+
+
+# WebSocket endpoint for real-time updates
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            # Keep connection alive, receive any client messages
+            data = await websocket.receive_text()
+            # Could handle client commands here if needed
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
 
 
 if __name__ == "__main__":

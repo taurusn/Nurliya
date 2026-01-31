@@ -120,7 +120,8 @@ class ScraperClient:
 
         while elapsed < timeout:
             status = await self.get_job_status(job_id)
-            job_status = status.get("status", "unknown")
+            # Note: Go scraper returns "Status" with capital S
+            job_status = status.get("Status") or status.get("status", "unknown")
 
             if job_status == "ok":
                 return status

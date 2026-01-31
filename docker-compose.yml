@@ -104,11 +104,42 @@ services:
       mode: replicated
       replicas: 2
 
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+      args:
+        - NEXT_PUBLIC_API_URL=${DASHBOARD_API_URL:-http://localhost:8000}
+        - NEXT_PUBLIC_WS_URL=${DASHBOARD_WS_URL:-ws://localhost:8000/ws}
+    container_name: nurliya-dashboard
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: nurliya-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@nurliya.com
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-nurliya123}
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   rabbitmq_data:
   scraper_data:
   results_data:
+  pgadmin_data:
 
 # For Linux hosts, add this to access host's vLLM:
 # extra_hosts:
