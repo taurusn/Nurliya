@@ -3,21 +3,21 @@
 ## Architecture
 
 ```
-                    Cloudflare Edge (SSL)
-                           │
-    ┌──────────────────────┼──────────────────────┐
-    │                      │                      │
-    ▼                      ▼                      ▼
-api.nurliya.com  dashboard.nurliya.com  admin.nurliya.com
-    │                      │                      │
-    └──────────────────────┼──────────────────────┘
-                           │
-                    Cloudflare Tunnel
-                           │
-              ┌────────────┼────────────┐
-              ▼            ▼            ▼
-         localhost:8000  :3000        :5050
-            (API)     (Dashboard)   (pgAdmin)
+                         Cloudflare Edge (SSL)
+                                │
+    ┌───────────────┬───────────┼───────────┬───────────────┐
+    │               │           │           │               │
+    ▼               ▼           ▼           ▼               ▼
+api.nurliya.com  app.nurliya.com  dashboard.nurliya.com  admin.nurliya.com
+    │               │           │           │               │
+    └───────────────┴───────────┼───────────┴───────────────┘
+                                │
+                         Cloudflare Tunnel
+                                │
+              ┌─────────┬───────┼───────┬─────────┐
+              ▼         ▼       ▼       ▼         ▼
+         localhost:8000  :3002  :3000  :5050
+            (API)    (Client) (Dashboard) (pgAdmin)
 ```
 
 ## Services
@@ -25,12 +25,13 @@ api.nurliya.com  dashboard.nurliya.com  admin.nurliya.com
 | Service | Port | Domain | Description |
 |---------|------|--------|-------------|
 | API | 8000 | api.nurliya.com | FastAPI backend |
-| Dashboard | 3000 | dashboard.nurliya.com | Next.js frontend |
+| Client Portal | 3002 | app.nurliya.com | Next.js client-facing app |
+| Dashboard | 3000 | dashboard.nurliya.com | Next.js admin dashboard |
 | pgAdmin | 5050 | admin.nurliya.com | Database admin UI |
 | PostgreSQL | 5432 | - | Database (internal) |
 | RabbitMQ | 5672 | - | Message queue (internal) |
 | Scraper | 8080 | - | Google Maps scraper (internal) |
-| Worker | - | - | Review analysis workers |
+| Worker | - | - | Review analysis workers (x2) |
 
 ## Environment Variables
 
@@ -189,6 +190,8 @@ credentials-file: /root/.cloudflared/<tunnel-id>.json
 ingress:
   - hostname: api.nurliya.com
     service: http://localhost:8000
+  - hostname: app.nurliya.com
+    service: http://localhost:3002
   - hostname: dashboard.nurliya.com
     service: http://localhost:3000
   - hostname: admin.nurliya.com
@@ -200,6 +203,7 @@ ingress:
 
 ```bash
 cloudflared tunnel route dns nurliya api.nurliya.com
+cloudflared tunnel route dns nurliya app.nurliya.com
 cloudflared tunnel route dns nurliya dashboard.nurliya.com
 cloudflared tunnel route dns nurliya admin.nurliya.com
 ```

@@ -17,11 +17,13 @@
 - [x] Cloudflared installed on VM
 
 ### Remaining Steps
-- [ ] Clone repository
-- [ ] Create .env.production on VM
-- [ ] Set up Cloudflare Tunnel
-- [ ] Run docker compose
-- [ ] Verify deployment
+- [x] Clone repository
+- [x] Create .env.production on VM
+- [x] Set up Cloudflare Tunnel (ID: fac36667-1596-4f79-ba66-cdf69081459f)
+- [x] Run docker compose
+- [x] Verify deployment
+
+**Deployment completed: 2026-02-01**
 
 ---
 
@@ -55,29 +57,29 @@ Create `/home/42group/nurliya/.env.production` with:
 
 ```env
 # GCP Secret Manager
-GCP_PROJECT_ID=top-script-426108-s4
+GCP_PROJECT_ID=<your-gcp-project-id>
 USE_SECRET_MANAGER=true
 
 # Database
-DB_PASSWORD=Pzj7EAx1h3MeKB7pZd7JOaQtfJdKpa1E
+DB_PASSWORD=<strong-random-password>
 
 # RabbitMQ
-RABBITMQ_PASSWORD=Rq9kW2mNvL5xYp8tCf4hDjAs3bEu6zXi
+RABBITMQ_PASSWORD=<strong-random-password>
 
 # LLM (Gemini API)
 VLLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
-VLLM_API_KEY=AIzaSyBEr-r6bLSb3oHw13xBmz4CPERX7GlBnis
+VLLM_API_KEY=<your-gemini-api-key>
 VLLM_MODEL=gemini-2.0-flash
 
 # Email
 SMTP_HOST=smtp.gmail.com
 SMTP_PORT=587
-SMTP_USER=business@nurliya.com
-SMTP_PASSWORD=qhyn gpay ufxx lcea
-SMTP_FROM_EMAIL=business@nurliya.com
+SMTP_USER=<your-email>
+SMTP_PASSWORD=<your-app-password>
+SMTP_FROM_EMAIL=<your-email>
 
 # Auth
-JWT_SECRET=10b4498eace08e50eb472af15a7194f44dc27877091712757917601f91df30e2
+JWT_SECRET=<random-64-char-hex-string>
 
 # Frontend URLs (build-time)
 DASHBOARD_API_URL=https://api.nurliya.com
@@ -85,8 +87,10 @@ DASHBOARD_WS_URL=wss://api.nurliya.com/ws
 CLIENT_PORTAL_API_URL=https://api.nurliya.com
 
 # pgAdmin
-PGADMIN_PASSWORD=Pg4dm1n_Nurl1ya_2025!
+PGADMIN_PASSWORD=<strong-password>
 ```
+
+**Note:** Generate secure passwords with: `openssl rand -hex 32`
 
 ### 3. Set Up Cloudflare Tunnel
 
@@ -117,10 +121,18 @@ ingress:
 EOF
 
 # Route DNS (run for each domain)
-cloudflared tunnel route dns nurliya api.nurliya.com
-cloudflared tunnel route dns nurliya app.nurliya.com
-cloudflared tunnel route dns nurliya dashboard.nurliya.com
-cloudflared tunnel route dns nurliya admin.nurliya.com
+# Use --overwrite-dns if records already exist
+cloudflared tunnel route dns --overwrite-dns nurliya api.nurliya.com
+cloudflared tunnel route dns --overwrite-dns nurliya app.nurliya.com
+cloudflared tunnel route dns --overwrite-dns nurliya dashboard.nurliya.com
+cloudflared tunnel route dns --overwrite-dns nurliya admin.nurliya.com
+
+# Copy config to system directory for service
+sudo mkdir -p /etc/cloudflared
+sudo cp ~/.cloudflared/config.yml /etc/cloudflared/
+sudo cp ~/.cloudflared/*.json /etc/cloudflared/
+# Update path in config
+sudo sed -i 's|/home/42group/.cloudflared/|/etc/cloudflared/|g' /etc/cloudflared/config.yml
 
 # Install as system service
 sudo cloudflared service install
