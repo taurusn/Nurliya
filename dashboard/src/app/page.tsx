@@ -13,6 +13,7 @@ import { ActivityFeed } from '@/components/ActivityFeed'
 import { ScrapeForm } from '@/components/ScrapeForm'
 import { ConnectionStatus } from '@/components/ConnectionStatus'
 import { LogsTable } from '@/components/LogsTable'
+import { Overview } from '@/components/Overview'
 import { Database, Server, Cpu, MessageSquare, Layers } from 'lucide-react'
 
 export default function Dashboard() {
@@ -174,6 +175,12 @@ export default function Dashboard() {
             </div>
           </Card>
         </div>
+
+        {/* Analytics Overview */}
+        <section>
+          <h2 className="text-xs font-medium text-muted uppercase tracking-wider mb-3">Analytics Overview</h2>
+          <Overview />
+        </section>
 
         {/* Activity Feed */}
         <Card title="Recent Activity" className="md:col-span-2">

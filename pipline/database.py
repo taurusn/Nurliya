@@ -8,6 +8,8 @@ from sqlalchemy import create_engine, Column, String, Integer, Text, Boolean, DE
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
+import bcrypt
+
 from logging_config import get_logger
 from config import DATABASE_URL
 
@@ -16,6 +18,28 @@ logger = get_logger(__name__, service="database")
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
+
+
+class User(Base):
+    """User model for authentication."""
+    __tablename__ = "users"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    email = Column(String(255), unique=True, nullable=False, index=True)
+    password_hash = Column(String(255), nullable=False)
+    name = Column(String(255), nullable=False)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(TIMESTAMP, default=datetime.utcnow)
+    updated_at = Column(TIMESTAMP, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    scrape_jobs = relationship("ScrapeJob", back_populates="user")
+
+    def verify_password(self, password: str) -> bool:
+        return bcrypt.checkpw(password.encode('utf-8'), self.password_hash.encode('utf-8'))
+
+    @staticmethod
+    def hash_password(password: str) -> str:
+        return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
 
 class Place(Base):
@@ -95,6 +119,7 @@ class ScrapeJob(Base):
     __tablename__ = "scrape_jobs"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
     query = Column(String(500))
     status = Column(String(50), default="pending")  # pending, scraping, processing, completed, failed
     scraper_job_id = Column(String(100))  # ID from Go scraper
@@ -107,6 +132,8 @@ class ScrapeJob(Base):
     completed_at = Column(TIMESTAMP)
     notification_email = Column(String(255))  # User's email for completion report
     email_sent_at = Column(TIMESTAMP)  # Prevents duplicate email sends
+
+    user = relationship("User", back_populates="scrape_jobs")
 
 
 class ActivityLog(Base):

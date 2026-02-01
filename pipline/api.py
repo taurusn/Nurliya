@@ -6,7 +6,7 @@ Provides REST API for scraping, job tracking, and review analysis.
 import asyncio
 import json
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
 from typing import Optional, List, Set
@@ -14,9 +14,14 @@ from uuid import UUID
 from sqlalchemy import func, text
 
 from logging_config import get_logger
-from database import Place, Review, ReviewAnalysis, Job, ScrapeJob, ActivityLog, get_session, create_tables
+from database import Place, Review, ReviewAnalysis, Job, ScrapeJob, ActivityLog, User, get_session, create_tables
 from config import RABBITMQ_URL, QUEUE_NAME
 from scraper_client import ScraperClient
+from auth import (
+    UserCreate, UserLogin, UserResponse, TokenResponse,
+    register_user, authenticate_user, create_access_token,
+    get_current_user, get_optional_user
+)
 
 logger = get_logger(__name__, service="api")
 
@@ -309,19 +314,76 @@ async def health_check():
     }
 
 
+# Auth endpoints
+@app.post("/api/auth/register", response_model=TokenResponse)
+async def api_register(data: UserCreate):
+    """Register a new user account."""
+    user = register_user(data)
+    token = create_access_token(user)
+    return TokenResponse(
+        access_token=token,
+        user=UserResponse(
+            id=str(user.id),
+            email=user.email,
+            name=user.name,
+            created_at=user.created_at.isoformat() if user.created_at else None,
+        )
+    )
+
+
+@app.post("/api/auth/login", response_model=TokenResponse)
+async def api_login(data: UserLogin):
+    """Login and get access token."""
+    user = authenticate_user(data.email, data.password)
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password",
+        )
+    token = create_access_token(user)
+    return TokenResponse(
+        access_token=token,
+        user=UserResponse(
+            id=str(user.id),
+            email=user.email,
+            name=user.name,
+            created_at=user.created_at.isoformat() if user.created_at else None,
+        )
+    )
+
+
+@app.get("/api/auth/me", response_model=UserResponse)
+async def api_me(current_user: User = Depends(get_current_user)):
+    """Get current user profile."""
+    return UserResponse(
+        id=str(current_user.id),
+        email=current_user.email,
+        name=current_user.name,
+        created_at=current_user.created_at.isoformat() if current_user.created_at else None,
+    )
+
+
 # Scrape endpoints
 @app.post("/api/scrape", response_model=ScrapeResponse)
-async def start_scrape(request: ScrapeRequest, background_tasks: BackgroundTasks):
+async def start_scrape(
+    request: ScrapeRequest,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user)
+):
     """
-    Start a new scrape job.
+    Start a new scrape job for the authenticated user.
 
     This will:
     1. Create a scrape job record
     2. Start the Google Maps scraper in the background
     3. Automatically process results when scraping completes
     """
-    # Create job record
-    job = create_scrape_job(request.query, notification_email=request.notification_email)
+    # Create job record with user_id
+    job = create_scrape_job(
+        request.query,
+        notification_email=request.notification_email,
+        user_id=str(current_user.id)
+    )
 
     # Start background task
     background_tasks.add_task(
@@ -350,18 +412,23 @@ async def get_job_status(job_id: str):
 
 
 @app.get("/api/jobs")
-async def list_jobs(limit: int = 20, offset: int = 0):
-    """List recent scrape jobs."""
+async def list_jobs(
+    limit: int = 20,
+    offset: int = 0,
+    current_user: User = Depends(get_current_user)
+):
+    """List scrape jobs for the authenticated user."""
     session = get_session()
     try:
+        query = session.query(ScrapeJob).filter(ScrapeJob.user_id == current_user.id)
         jobs = (
-            session.query(ScrapeJob)
+            query
             .order_by(ScrapeJob.created_at.desc())
             .offset(offset)
             .limit(limit)
             .all()
         )
-        total = session.query(ScrapeJob).count()
+        total = query.count()
 
         return {
             "jobs": [
@@ -604,6 +671,202 @@ async def get_stats():
                 "processing": scrape_jobs.get("processing", 0),
                 "completed": scrape_jobs.get("completed", 0),
                 "failed": scrape_jobs.get("failed", 0),
+            }
+        }
+    finally:
+        session.close()
+
+
+@app.get("/api/overview")
+async def get_overview(current_user: User = Depends(get_current_user)):
+    """
+    Get comprehensive overview data for the client portal.
+    Returns all metrics, charts, and insights for the authenticated user.
+    """
+    from datetime import datetime, timedelta
+    from collections import defaultdict
+
+    session = get_session()
+    try:
+        # Get user's scrape jobs
+        user_jobs = session.query(ScrapeJob).filter(ScrapeJob.user_id == current_user.id).all()
+        user_job_ids = [job.id for job in user_jobs]
+
+        # Get places from user's jobs (through pipeline_job_ids)
+        user_place_ids = []
+        for job in user_jobs:
+            if job.pipeline_job_ids:
+                # Get places from pipeline jobs
+                pipeline_jobs = session.query(Job).filter(Job.id.in_(job.pipeline_job_ids)).all()
+                user_place_ids.extend([pj.place_id for pj in pipeline_jobs if pj.place_id])
+
+        user_place_ids = list(set(user_place_ids))  # Remove duplicates
+
+        # If user has no places yet, return empty data
+        if not user_place_ids:
+            return {
+                "metrics": {
+                    "average_rating": None,
+                    "positive_percentage": 0,
+                    "reviews_count": 0,
+                    "urgent_count": 0,
+                    "pending_analyses": 0,
+                },
+                "sentiment_trend": [],
+                "rating_distribution": {"5": 0, "4": 0, "3": 0, "2": 0, "1": 0},
+                "top_positive_topics": [],
+                "top_negative_topics": [],
+                "whats_hot": [],
+                "whats_not": [],
+                "alerts": [],
+                "places_count": 0,
+            }
+
+        # Get all reviews for user's places
+        reviews = session.query(Review).filter(Review.place_id.in_(user_place_ids)).all()
+        review_ids = [r.id for r in reviews]
+        reviews_count = len(reviews)
+
+        # Get all analyses for user's reviews
+        analyses = []
+        if review_ids:
+            analyses = session.query(ReviewAnalysis).filter(ReviewAnalysis.review_id.in_(review_ids)).all()
+        analyses_count = len(analyses)
+
+        # Calculate metrics
+        # 1. Average rating
+        ratings = [r.rating for r in reviews if r.rating is not None]
+        average_rating = round(sum(ratings) / len(ratings), 1) if ratings else None
+
+        # 2. Positive percentage
+        sentiment_counts = {"positive": 0, "neutral": 0, "negative": 0}
+        urgent_count = 0
+        positive_topics = defaultdict(int)
+        negative_topics = defaultdict(int)
+
+        for analysis in analyses:
+            if analysis.sentiment in sentiment_counts:
+                sentiment_counts[analysis.sentiment] += 1
+            if analysis.urgent:
+                urgent_count += 1
+            for topic in (analysis.topics_positive or []):
+                positive_topics[topic] += 1
+            for topic in (analysis.topics_negative or []):
+                negative_topics[topic] += 1
+
+        total_sentiment = sum(sentiment_counts.values())
+        positive_percentage = round(sentiment_counts["positive"] / total_sentiment * 100) if total_sentiment > 0 else 0
+
+        # 3. Rating distribution
+        rating_dist = {str(i): 0 for i in range(1, 6)}
+        for r in reviews:
+            if r.rating and 1 <= r.rating <= 5:
+                rating_dist[str(r.rating)] += 1
+
+        # Convert to percentages
+        rating_distribution = {}
+        total_ratings = sum(rating_dist.values())
+        for star, count in rating_dist.items():
+            rating_distribution[star] = round(count / total_ratings * 100) if total_ratings > 0 else 0
+
+        # 4. Sentiment trend (last 7 days)
+        today = datetime.utcnow().date()
+        sentiment_trend = []
+        for i in range(6, -1, -1):
+            day = today - timedelta(days=i)
+            day_start = datetime.combine(day, datetime.min.time())
+            day_end = datetime.combine(day, datetime.max.time())
+
+            day_analyses = [
+                a for a in analyses
+                if a.analyzed_at and day_start <= a.analyzed_at <= day_end
+            ]
+
+            day_positive = sum(1 for a in day_analyses if a.sentiment == "positive")
+            day_total = len(day_analyses)
+
+            sentiment_trend.append({
+                "date": day.isoformat(),
+                "day": day.strftime("%a"),
+                "positive": round(day_positive / day_total * 100) if day_total > 0 else 0,
+                "count": day_total,
+            })
+
+        # 5. Top topics
+        top_positive = sorted(positive_topics.items(), key=lambda x: -x[1])[:5]
+        top_negative = sorted(negative_topics.items(), key=lambda x: -x[1])[:5]
+
+        # Calculate percentages for topics
+        whats_hot = []
+        for topic, count in top_positive:
+            pct = round(count / total_sentiment * 100) if total_sentiment > 0 else 0
+            whats_hot.append({"item": topic, "score": f"{pct}%", "mentions": count})
+
+        whats_not = []
+        for topic, count in top_negative:
+            pct = round(count / total_sentiment * 100) if total_sentiment > 0 else 0
+            whats_not.append({"item": topic, "score": f"{pct}%", "mentions": count})
+
+        # 6. Alerts
+        alerts = []
+        if urgent_count > 0:
+            alerts.append({
+                "type": "urgent",
+                "icon": "⚠️",
+                "message": f"{urgent_count} urgent reviews need immediate attention",
+                "count": urgent_count,
+            })
+
+        pending_analyses = reviews_count - analyses_count
+        if pending_analyses > 0:
+            alerts.append({
+                "type": "pending",
+                "icon": "💬",
+                "message": f"{pending_analyses} reviews awaiting analysis",
+                "count": pending_analyses,
+            })
+
+        active_jobs = [j for j in user_jobs if j.status in ("scraping", "processing")]
+        if active_jobs:
+            alerts.append({
+                "type": "processing",
+                "icon": "⏳",
+                "message": f"{len(active_jobs)} jobs currently processing",
+                "count": len(active_jobs),
+            })
+
+        # Negative sentiment trend alert
+        if sentiment_counts["negative"] > sentiment_counts["positive"] * 0.5:
+            alerts.append({
+                "type": "warning",
+                "icon": "📉",
+                "message": f"High negative sentiment: {sentiment_counts['negative']} negative reviews",
+                "count": sentiment_counts["negative"],
+            })
+
+        return {
+            "metrics": {
+                "average_rating": average_rating,
+                "positive_percentage": positive_percentage,
+                "reviews_count": reviews_count,
+                "urgent_count": urgent_count,
+                "pending_analyses": pending_analyses,
+            },
+            "sentiment_trend": sentiment_trend,
+            "rating_distribution": rating_distribution,
+            "top_positive_topics": [{"topic": t, "count": c} for t, c in top_positive],
+            "top_negative_topics": [{"topic": t, "count": c} for t, c in top_negative],
+            "whats_hot": whats_hot,
+            "whats_not": whats_not,
+            "alerts": alerts,
+            "places_count": len(user_place_ids),
+            "sentiment_counts": sentiment_counts,
+            "scrape_jobs": {
+                "pending": len([j for j in user_jobs if j.status == "pending"]),
+                "scraping": len([j for j in user_jobs if j.status == "scraping"]),
+                "processing": len([j for j in user_jobs if j.status == "processing"]),
+                "completed": len([j for j in user_jobs if j.status == "completed"]),
+                "failed": len([j for j in user_jobs if j.status == "failed"]),
             }
         }
     finally:
