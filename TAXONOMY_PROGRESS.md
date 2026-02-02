@@ -1,9 +1,9 @@
 # Dynamic Taxonomy System - Progress Tracker
 
-## Status: Phase 1A - Infrastructure
+## Status: Phase 1B Complete - Ready for Phase 2
 
 **Started**: 2026-02-02
-**Target**: Weeks 1-2
+**Target**: Weeks 3-4
 
 ---
 
@@ -24,10 +24,10 @@
 
 | Task | Status | Notes |
 |------|--------|-------|
-| Add extract_mentions() to llm_client.py | ⬜ Pending | |
-| Modify worker.py for dual-write | ⬜ Pending | Keep topics_positive/negative + add raw_mentions |
-| Entity resolution via Qdrant | ⬜ Pending | 0.85 cosine threshold |
-| **GATE: Arabic embedding quality test** | ⬜ Pending | Must pass before Phase 2 |
+| Add extract_mentions() to llm_client.py | ✅ Completed | Separate LLM call with dedicated prompt for products/aspects |
+| Modify worker.py for dual-write | ✅ Completed | Non-blocking process_mentions() after save_analysis() |
+| Entity resolution via Qdrant | ✅ Completed | 0.85 cosine threshold, batch embeddings per review |
+| **GATE: Arabic embedding quality test** | ✅ Completed | PASS: avg similarity 0.655 > 0.5 threshold |
 
 ---
 
@@ -172,3 +172,67 @@ _Add implementation notes, blockers, and decisions here as work progresses._
 **Design decisions confirmed:**
 - `TaxonomyCategory.parent_id` ON DELETE SET NULL is safer - prevents accidental cascade deletion of entire category trees
 - TCP-based health check is more portable across different Qdrant image versions
+
+### 2026-02-02 - Phase 1B Worker Integration
+
+**llm_client.py - extract_mentions():**
+- New `MENTION_EXTRACTION_PROMPT` - extracts products and aspects with sentiment
+- Separate LLM call from analyze_review() for isolation
+- Returns `{"products": [...], "aspects": [...]}` with text/sentiment per item
+- Max 10 mentions per review, handles Arabic/English/mixed
+- Graceful fallback: returns empty arrays on error
+
+**worker.py - process_mentions():**
+- Non-blocking dual-write: extraction failure doesn't affect analysis
+- Batch embedding generation via `embedding_client.generate_embeddings()`
+- Entity resolution flow:
+  1. Generate embedding for mention text
+  2. Search Qdrant for similar in same place (0.85 threshold)
+  3. If found: use existing canonical_id
+  4. If not found: create new canonical, upsert to Qdrant
+- Fallback: if Qdrant unavailable, queue for retry, save RawMention with NULL qdrant_point_id
+- Saves to RawMention table (resolved_product_id/resolved_category_id remain NULL until Phase 3)
+
+**worker.py - process_message() changes:**
+- Now captures place_id when fetching review
+- Calls process_mentions() after save_analysis() (non-blocking)
+
+**Design decisions:**
+- Separate LLM calls: can iterate on extraction prompt independently
+- Batch embeddings per review: sentence-transformers handles efficiently
+- Non-blocking extraction: graceful degradation, analysis always succeeds
+- Deduplication: skip if RawMention already exists for review_id (handles requeue)
+
+**Known limitations (to address in Phase 2):**
+- If Qdrant upsert fails and queues for retry, RawMention is saved with NULL qdrant_point_id. Retry succeeds but doesn't backfill the RawMention record. Reconciliation job needed.
+- No rate limit retry for extract_mentions() - fails silently (by design)
+
+### 2026-02-02 - GATE Test Passed
+
+**Arabic Embedding Quality Test Results:**
+
+| Test | Result |
+|------|--------|
+| Model | paraphrase-multilingual-MiniLM-L12-v2 |
+| Dimension | 384 |
+| Cross-lingual pairs tested | 12 |
+| Pairs with similarity > 0.5 | 7/12 (58%) |
+| **Average similarity** | **0.655** |
+| GATE threshold | > 0.5 |
+| **Status** | **PASS** |
+
+**Sample cross-lingual similarities:**
+- "قهوة" ↔ "coffee": 0.776
+- "لاتيه" ↔ "latte": 0.867
+- "كابتشينو" ↔ "cappuccino": 0.858
+- "خدمة" ↔ "service": 0.564
+
+**Conclusion:** The multilingual embedding model provides sufficient cross-lingual similarity for entity resolution. No need to upgrade to CAMeL-BERT.
+
+**Phase 1B Complete. Ready to proceed to Phase 2: Discovery.**
+
+**Next Steps (Phase 2):**
+1. Create clustering_job.py with HDBSCAN
+2. Implement LLM labeling for clusters
+3. Build taxonomy hierarchy (Main → Sub → Products)
+4. Trigger on scrape complete or 50+ new mentions

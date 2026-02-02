@@ -7,20 +7,185 @@ import json
 import time
 import signal
 import sys
+import uuid as uuid_module
 from datetime import datetime
 from sqlalchemy import text
 
 from logging_config import get_logger
 from rabbitmq import get_consumer_channel, QUEUE_NAME, ANOMALY_QUEUE_NAME
-from llm_client import analyze_review, generate_anomaly_insight
-from database import Review, ReviewAnalysis, Job, ScrapeJob, Place, AnomalyInsight, get_session
+from llm_client import analyze_review, generate_anomaly_insight, extract_mentions
+from database import Review, ReviewAnalysis, Job, ScrapeJob, Place, AnomalyInsight, RawMention, get_session
 from email_service import send_completion_report, gather_scrape_job_stats
 from activity_logger import (
     log_review_analyzed, log_job_completed, log_worker_started,
     log_worker_stopped, log_rate_limited, log_system_error
 )
+import embedding_client
+import vector_store
+from vector_store import VectorPayload, MENTIONS_COLLECTION
 
 logger = get_logger(__name__, service="worker")
+
+# Entity resolution threshold for Qdrant similarity
+ENTITY_RESOLUTION_THRESHOLD = 0.85
+
+
+# Valid sentiment values for mentions
+VALID_SENTIMENTS = {"positive", "negative", "neutral"}
+
+
+def process_mentions(review_id: str, place_id, review_text: str, analysis: dict):
+    """
+    Extract mentions from review and save to RawMention table with entity resolution.
+
+    This is non-blocking - failures are logged but don't affect review analysis.
+
+    Args:
+        review_id: UUID of the review
+        place_id: UUID of the place
+        review_text: Original review text
+        analysis: Analysis result (reserved for future use - e.g., sentiment fallback)
+    """
+    try:
+        # Check if mentions already extracted for this review (avoid duplicates on requeue)
+        session = get_session()
+        try:
+            existing_count = session.query(RawMention).filter_by(review_id=review_id).count()
+            if existing_count > 0:
+                logger.debug("Mentions already exist for review, skipping",
+                           extra={"extra_data": {"review_id": review_id, "count": existing_count}})
+                return
+        finally:
+            session.close()
+
+        # Extract mentions via LLM
+        mentions_result = extract_mentions(review_text)
+
+        products = mentions_result.get("products", [])
+        aspects = mentions_result.get("aspects", [])
+
+        if not products and not aspects:
+            logger.debug("No mentions extracted", extra={"extra_data": {"review_id": review_id}})
+            return
+
+        # Combine all mentions for batch embedding
+        all_mentions = []
+        for p in products:
+            sentiment = p["sentiment"] if p["sentiment"] in VALID_SENTIMENTS else "neutral"
+            all_mentions.append({"text": p["text"], "sentiment": sentiment, "type": "product"})
+        for a in aspects:
+            sentiment = a["sentiment"] if a["sentiment"] in VALID_SENTIMENTS else "neutral"
+            all_mentions.append({"text": a["text"], "sentiment": sentiment, "type": "aspect"})
+
+        # Batch generate embeddings
+        texts = [m["text"] for m in all_mentions]
+        embeddings = embedding_client.generate_embeddings(texts, normalize=True)
+
+        if embeddings is None:
+            logger.warning("Embedding generation failed, skipping mention processing",
+                         extra={"extra_data": {"review_id": review_id}})
+            return
+
+        # Process each mention: resolve entity, save to DB
+        session = get_session()
+        try:
+            for mention, embedding in zip(all_mentions, embeddings):
+                if embedding is None or all(v == 0.0 for v in embedding):
+                    logger.debug("Skipping mention with zero embedding",
+                               extra={"extra_data": {"text": mention["text"]}})
+                    continue
+
+                qdrant_point_id = None
+                mention_type = mention["type"]
+
+                # Try entity resolution via Qdrant
+                if vector_store.is_available():
+                    # Search for similar existing mention
+                    existing = vector_store.find_similar_mention(
+                        text_embedding=embedding,
+                        place_id=str(place_id),
+                        mention_type=mention_type,
+                        threshold=ENTITY_RESOLUTION_THRESHOLD,
+                    )
+
+                    if existing:
+                        # Found similar - use existing canonical
+                        qdrant_point_id = existing.payload.canonical_id or existing.id
+                        logger.debug("Resolved to existing mention",
+                                   extra={"extra_data": {
+                                       "text": mention["text"],
+                                       "canonical": existing.payload.text,
+                                       "score": existing.score
+                                   }})
+                    else:
+                        # New mention - create canonical in Qdrant
+                        qdrant_point_id = str(uuid_module.uuid4())
+
+                        payload = VectorPayload(
+                            text=mention["text"],
+                            place_id=str(place_id),
+                            mention_type=mention_type,
+                            is_canonical=True,
+                            canonical_id=qdrant_point_id,
+                            sentiment_sum=1.0 if mention["sentiment"] == "positive" else (-1.0 if mention["sentiment"] == "negative" else 0.0),
+                            mention_count=1,
+                        )
+
+                        success = vector_store.upsert_vector(
+                            collection_name=MENTIONS_COLLECTION,
+                            vector_id=qdrant_point_id,
+                            vector=embedding,
+                            payload=payload,
+                        )
+
+                        if not success:
+                            # Queue for retry
+                            vector_store.queue_for_retry(
+                                "upsert",
+                                (MENTIONS_COLLECTION, qdrant_point_id, embedding, payload),
+                                {}
+                            )
+                            qdrant_point_id = None  # Will be set later when retry succeeds
+
+                        logger.debug("Created new canonical mention",
+                                   extra={"extra_data": {"text": mention["text"], "id": qdrant_point_id}})
+                else:
+                    # Qdrant unavailable - save without resolution
+                    logger.debug("Qdrant unavailable, saving mention without resolution",
+                               extra={"extra_data": {"text": mention["text"]}})
+
+                # Save RawMention to database
+                raw_mention = RawMention(
+                    review_id=review_id,
+                    place_id=place_id,
+                    mention_text=mention["text"],
+                    mention_type=mention_type,
+                    sentiment=mention["sentiment"],
+                    qdrant_point_id=qdrant_point_id,
+                    # resolved_product_id and resolved_category_id remain NULL
+                    # until taxonomy is approved in Phase 3
+                )
+                session.add(raw_mention)
+
+            session.commit()
+            logger.info("Mentions processed",
+                       extra={"extra_data": {
+                           "review_id": review_id,
+                           "products": len(products),
+                           "aspects": len(aspects)
+                       }})
+
+        except Exception as e:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    except Exception as e:
+        # Non-blocking - log and continue
+        logger.warning(f"Mention extraction failed for review {review_id}: {e}",
+                      extra={"extra_data": {"review_id": review_id, "error": str(e)}})
+
 
 # Graceful shutdown
 shutdown_requested = False
@@ -399,6 +564,7 @@ def process_message(ch, method, properties, body):
         # Fetch review from DB
         session = get_session()
         place_name = None
+        place_id = None
         try:
             review = session.query(Review).filter_by(id=review_id).first()
             if not review:
@@ -408,6 +574,7 @@ def process_message(ch, method, properties, body):
 
             review_text = review.text
             review_rating = review.rating
+            place_id = review.place_id
 
             # Get place name for activity logging
             if review.place:
@@ -460,6 +627,10 @@ def process_message(ch, method, properties, body):
 
         # Save analysis
         save_analysis(review_id, analysis)
+
+        # Extract and save mentions (non-blocking dual-write)
+        if place_id:
+            process_mentions(review_id, place_id, review_text, analysis)
 
         # Log activity
         sentiment = analysis.get("sentiment")
@@ -578,6 +749,12 @@ def run_worker():
 
     logger.info("Connecting to RabbitMQ...")
     connection, channel = get_consumer_channel()
+
+    # Initialize Qdrant collections for taxonomy system (non-blocking)
+    if vector_store.is_available():
+        vector_store.initialize_collections()
+    else:
+        logger.warning("Qdrant not available at startup, mentions will queue for retry")
 
     logger.info(f"Worker started, listening on queues: '{QUEUE_NAME}', '{ANOMALY_QUEUE_NAME}'")
     log_worker_started()

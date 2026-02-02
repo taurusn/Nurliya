@@ -189,10 +189,131 @@ Return ONLY valid JSON, no markdown or explanation."""
         }
 
 
+MENTION_EXTRACTION_PROMPT = """You are a mention extractor for Saudi business reviews (cafes, restaurants, hotels, retail).
+
+Your job is to extract SPECIFIC product names and service aspects mentioned in reviews.
+
+RULES:
+1. Extract ONLY items explicitly mentioned - never assume or hallucinate
+2. Products = specific items (drinks, food items, dishes by name)
+3. Aspects = service-related topics (speed, staff, cleanliness, atmosphere, parking, delivery, price)
+4. Keep original text as mentioned (Arabic or English)
+5. Determine sentiment for EACH mention based on context
+6. If a product/aspect is mentioned neutrally (just stated, no opinion), use "neutral"
+7. Maximum 10 mentions per review (prioritize most significant)
+
+EXAMPLES:
+- "السبانش لاتيه لذيذ" → product: "السبانش لاتيه", sentiment: positive
+- "the V60 was bitter" → product: "V60", sentiment: negative
+- "الخدمة بطيئة" → aspect: "الخدمة", sentiment: negative
+- "المكان نظيف" → aspect: "النظافة", sentiment: positive
+- "ordered a croissant" → product: "croissant", sentiment: neutral
+
+OUTPUT FORMAT:
+Return ONLY valid JSON (no markdown, no explanation):
+{
+  "products": [
+    {"text": "extracted product name", "sentiment": "positive|negative|neutral"}
+  ],
+  "aspects": [
+    {"text": "extracted aspect", "sentiment": "positive|negative|neutral"}
+  ]
+}
+
+If no products or aspects found, return empty arrays."""
+
+
+def extract_mentions(review_text: str) -> dict:
+    """
+    Extract product and aspect mentions from review text.
+
+    Args:
+        review_text: The review text to analyze
+
+    Returns:
+        Dict with 'products' and 'aspects' lists, each containing
+        {'text': str, 'sentiment': str} items.
+        Returns empty lists on error.
+    """
+    if not review_text or not review_text.strip():
+        return {"products": [], "aspects": []}
+
+    prompt = f"Extract product and aspect mentions from this review:\n\n{review_text}\n\nReturn ONLY the JSON."
+
+    logger.debug("Extracting mentions", extra={"extra_data": {"text_length": len(review_text)}})
+
+    try:
+        response = client.chat.completions.create(
+            model=VLLM_MODEL,
+            messages=[
+                {"role": "system", "content": MENTION_EXTRACTION_PROMPT},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.1,
+            max_tokens=500
+        )
+
+        content = response.choices[0].message.content.strip()
+
+        # Clean up markdown if present
+        if content.startswith("```"):
+            lines = content.split("\n")
+            content = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+
+        # Parse JSON
+        try:
+            result = json.loads(content)
+        except json.JSONDecodeError:
+            # Try to find JSON in response
+            start = content.find("{")
+            end = content.rfind("}") + 1
+            if start >= 0 and end > start:
+                result = json.loads(content[start:end])
+            else:
+                logger.warning("Could not parse mention extraction response",
+                             extra={"extra_data": {"content": content[:200]}})
+                return {"products": [], "aspects": []}
+
+        # Validate and normalize structure
+        products = result.get("products", [])
+        aspects = result.get("aspects", [])
+
+        # Ensure each item has required fields
+        valid_products = []
+        for p in products:
+            if isinstance(p, dict) and p.get("text"):
+                valid_products.append({
+                    "text": str(p["text"]).strip(),
+                    "sentiment": p.get("sentiment", "neutral")
+                })
+
+        valid_aspects = []
+        for a in aspects:
+            if isinstance(a, dict) and a.get("text"):
+                valid_aspects.append({
+                    "text": str(a["text"]).strip(),
+                    "sentiment": a.get("sentiment", "neutral")
+                })
+
+        logger.debug("Mentions extracted",
+                    extra={"extra_data": {"products": len(valid_products), "aspects": len(valid_aspects)}})
+
+        return {"products": valid_products, "aspects": valid_aspects}
+
+    except Exception as e:
+        logger.error(f"Mention extraction failed: {e}", extra={"extra_data": {"error": str(e)}})
+        return {"products": [], "aspects": []}
+
+
 if __name__ == "__main__":
     # Test with sample review
     test_review = "القهوة ممتازة والمكان هادي بس الخدمة بطيئة شوي"
     logger.info(f"Testing with review: {test_review}")
 
     result = analyze_review(test_review, rating=4)
+    print("Analysis:")
     print(json.dumps(result, ensure_ascii=False, indent=2))
+
+    print("\nMentions:")
+    mentions = extract_mentions(test_review)
+    print(json.dumps(mentions, ensure_ascii=False, indent=2))
