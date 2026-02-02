@@ -12,7 +12,7 @@ from datetime import datetime
 from sqlalchemy import text
 
 from logging_config import get_logger
-from rabbitmq import get_consumer_channel, QUEUE_NAME, ANOMALY_QUEUE_NAME
+from rabbitmq import get_consumer_channel, QUEUE_NAME, ANOMALY_QUEUE_NAME, TAXONOMY_CLUSTERING_QUEUE
 from llm_client import analyze_review, generate_anomaly_insight, extract_mentions
 from database import Review, ReviewAnalysis, Job, ScrapeJob, Place, AnomalyInsight, RawMention, get_session
 from email_service import send_completion_report, gather_scrape_job_stats
@@ -421,6 +421,9 @@ def update_job_progress(job_id: str):
     if job_completed:
         detect_and_queue_anomalies(job_id)
         check_and_send_scrape_job_report(job_id)
+        # Trigger taxonomy clustering if conditions are met
+        from clustering_job import trigger_taxonomy_clustering
+        trigger_taxonomy_clustering(job_id)
 
 
 def check_and_send_scrape_job_report(completed_job_id: str):
@@ -756,12 +759,15 @@ def run_worker():
     else:
         logger.warning("Qdrant not available at startup, mentions will queue for retry")
 
-    logger.info(f"Worker started, listening on queues: '{QUEUE_NAME}', '{ANOMALY_QUEUE_NAME}'")
+    logger.info(f"Worker started, listening on queues: '{QUEUE_NAME}', '{ANOMALY_QUEUE_NAME}', '{TAXONOMY_CLUSTERING_QUEUE}'")
     log_worker_started()
 
-    # Set up consumers for both queues
+    # Set up consumers for all queues
     channel.basic_consume(queue=QUEUE_NAME, on_message_callback=process_message)
     channel.basic_consume(queue=ANOMALY_QUEUE_NAME, on_message_callback=process_anomaly_insight)
+    # Taxonomy clustering consumer
+    from clustering_job import process_clustering_message
+    channel.basic_consume(queue=TAXONOMY_CLUSTERING_QUEUE, on_message_callback=process_clustering_message)
 
     try:
         while not shutdown_requested:

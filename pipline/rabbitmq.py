@@ -11,6 +11,7 @@ from config import RABBITMQ_URL, QUEUE_NAME, DLQ_NAME, PREFETCH_COUNT
 logger = get_logger(__name__, service="rabbitmq")
 
 ANOMALY_QUEUE_NAME = "anomaly_insights"
+TAXONOMY_CLUSTERING_QUEUE = "taxonomy_clustering"
 
 
 def get_connection():
@@ -41,7 +42,10 @@ def setup_queues(channel):
     # Anomaly insights queue (for background LLM processing)
     channel.queue_declare(queue=ANOMALY_QUEUE_NAME, durable=True)
 
-    logger.debug("Queues configured", extra={"extra_data": {"queue": QUEUE_NAME, "dlq": DLQ_NAME, "anomaly_queue": ANOMALY_QUEUE_NAME}})
+    # Taxonomy clustering queue (for HDBSCAN discovery jobs)
+    channel.queue_declare(queue=TAXONOMY_CLUSTERING_QUEUE, durable=True)
+
+    logger.debug("Queues configured", extra={"extra_data": {"queue": QUEUE_NAME, "dlq": DLQ_NAME, "anomaly_queue": ANOMALY_QUEUE_NAME, "taxonomy_queue": TAXONOMY_CLUSTERING_QUEUE}})
 
 
 def publish_message(channel, message: dict):

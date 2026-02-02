@@ -1702,7 +1702,7 @@ Secret Loading Priority:
 │   ├── embedding_client.py           # Sentence-transformers + Arabic normalization
 │   ├── vector_store.py               # Qdrant client wrapper + entity resolution
 │   │
-│   ├── database.py                   # SQLAlchemy models (12 tables)
+│   ├── database.py                   # SQLAlchemy models (13 tables)
 │   ├── rabbitmq.py                   # Queue setup
 │   ├── config.py                     # Configuration with GCP Secret Manager + Qdrant
 │   │

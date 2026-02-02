@@ -1,9 +1,9 @@
 # Dynamic Taxonomy System - Progress Tracker
 
-## Status: Phase 1B Complete - Ready for Phase 2
+## Status: Phase 2 Complete - Ready for Phase 3
 
 **Started**: 2026-02-02
-**Target**: Weeks 3-4
+**Phase 2 Completed**: 2026-02-02
 
 ---
 
@@ -35,10 +35,12 @@
 
 | Task | Status | Notes |
 |------|--------|-------|
-| Create clustering_job.py | ⬜ Pending | HDBSCAN + LLM labeling |
-| Trigger on scrape complete | ⬜ Pending | Or 50+ new mentions |
-| Hierarchy builder | ⬜ Pending | Main → Sub → Products |
-| Save draft taxonomy | ⬜ Pending | |
+| Create clustering_job.py | ✅ Completed | HDBSCAN + LLM labeling + hierarchy builder |
+| Trigger on scrape complete | ✅ Completed | Via RabbitMQ queue, also 50+ unresolved threshold |
+| Hierarchy builder | ✅ Completed | Main → Sub → Products with super-category detection |
+| Save draft taxonomy | ✅ Completed | Creates PlaceTaxonomy, TaxonomyCategory, TaxonomyProduct |
+| Add scroll_all_vectors to vector_store.py | ✅ Completed | Batch retrieval for clustering |
+| Add TAXONOMY_CLUSTERING_QUEUE to rabbitmq.py | ✅ Completed | Async clustering via queue |
 
 ---
 
@@ -100,6 +102,9 @@ _Add implementation notes, blockers, and decisions here as work progresses._
 - Database: `pipline/database.py`
 - Worker: `pipline/worker.py`
 - LLM: `pipline/llm_client.py`
+- Clustering: `pipline/clustering_job.py`
+- Vectors: `pipline/vector_store.py`
+- Embeddings: `pipline/embedding_client.py`
 
 ---
 
@@ -236,3 +241,105 @@ _Add implementation notes, blockers, and decisions here as work progresses._
 2. Implement LLM labeling for clusters
 3. Build taxonomy hierarchy (Main → Sub → Products)
 4. Trigger on scrape complete or 50+ new mentions
+
+### 2026-02-02 - Phase 2 Discovery Complete
+
+**New file: clustering_job.py**
+
+Core functions:
+- `trigger_taxonomy_clustering(job_id)` - Evaluates if clustering needed, queues to RabbitMQ
+- `run_clustering_job(place_id)` - Main entry point for clustering pipeline
+- `cluster_mentions(embeddings)` - HDBSCAN clustering with configurable parameters
+- `label_cluster(items)` - LLM-based category naming (English + Arabic)
+- `build_hierarchy()` - Constructs Main → Sub → Products structure
+- `save_draft_taxonomy()` - Persists to PlaceTaxonomy/Category/Product tables
+- `process_clustering_message()` - RabbitMQ consumer callback
+
+HDBSCAN configuration:
+```python
+HDBSCAN_CONFIG = {
+    "min_cluster_size": 3,      # Small clusters allowed (niche products)
+    "min_samples": 2,           # Reduce noise, capture more signals
+    "metric": "euclidean",      # Works with L2-normalized embeddings
+    "cluster_selection_method": "eom",  # Excess of Mass for variable density
+}
+```
+
+Trigger logic:
+- Job completion → check if place needs clustering
+- No taxonomy exists → cluster if >= 10 mentions
+- Draft exists → skip (pending review)
+- Active exists → cluster if >= 50 unresolved mentions (re-discovery)
+
+Hierarchy builder:
+- Products clustered by HDBSCAN
+- Super-categories detected via centroid similarity (0.7 threshold)
+- AgglomerativeClustering groups related sub-categories
+- Aspects become flat main categories (has_products=false)
+
+**Modified files:**
+
+`rabbitmq.py`:
+- Added `TAXONOMY_CLUSTERING_QUEUE = "taxonomy_clustering"`
+- Queue declaration in `setup_queues()`
+
+`vector_store.py`:
+- Added `scroll_all_vectors()` - Batch retrieval using Qdrant scroll API
+- Added `count_vectors()` - Count vectors with filters
+
+`worker.py`:
+- Import TAXONOMY_CLUSTERING_QUEUE
+- Call `trigger_taxonomy_clustering(job_id)` after job completion
+- Add consumer for TAXONOMY_CLUSTERING_QUEUE in `run_worker()`
+
+**Phase 2 Complete. Ready for Phase 3: Onboarding Portal.**
+
+### 2026-02-02 - Code Review Fixes (Phase 2)
+
+**Issues found and fixed:**
+
+| Issue | File | Fix |
+|-------|------|-----|
+| Empty hierarchy not checked | clustering_job.py | Added `total_entities == 0` guard before saving taxonomy |
+| Unused parameter | clustering_job.py | Removed `cluster_labels` from `detect_super_categories()` |
+| Missing dependency | requirements.txt | Added `scikit-learn>=1.3.0` for AgglomerativeClustering |
+
+**Empty hierarchy protection (line 807-817):**
+```python
+total_entities = (
+    len(hierarchy["main_categories"]) +
+    len(hierarchy["sub_categories"]) +
+    len(hierarchy["products"]) +
+    len(hierarchy["aspect_categories"])
+)
+if total_entities == 0:
+    logger.warning("Clustering produced empty hierarchy (all noise), skipping")
+    return None
+```
+
+### 2026-02-02 - Dynamic Business Type
+
+**Issue:** `business_type` was hardcoded as `"cafe"` in 3 places in clustering_job.py
+
+**Fix:** Now fetches dynamically from `Place.category` field in database:
+
+```python
+# run_clustering_job()
+place = session.query(Place).filter_by(id=place_id).first()
+business_type = place.category if place and place.category else "business"
+```
+
+**Changes:**
+- `run_clustering_job()` - Fetches `Place.category` at start
+- `label_cluster()` calls - Now use dynamic `business_type`
+- `build_hierarchy()` - Added `business_type` parameter
+- `_derive_main_category_name()` - Receives dynamic value
+
+**Result:** LLM prompts now use actual business type (e.g., "Coffee shop", "Restaurant", "Salon") for more accurate category naming.
+
+**Next Steps (Phase 3):**
+1. API endpoints: /api/onboarding/* (pending, approve, reject, move, link, publish)
+2. Portal UI: Pending places list
+3. Portal UI: Taxonomy tree editor
+4. Portal UI: Bulk operations
+5. Audit logging

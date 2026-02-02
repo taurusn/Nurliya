@@ -426,6 +426,133 @@ def get_collection_stats(collection_name: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def scroll_all_vectors(
+    collection_name: str,
+    place_id: str,
+    mention_type: Optional[str] = None,
+    is_canonical: bool = True,
+    batch_size: int = 100,
+) -> List[Tuple[str, List[float], VectorPayload]]:
+    """
+    Retrieve all vectors for a place using Qdrant scroll API.
+
+    Args:
+        collection_name: Collection to scroll
+        place_id: Filter by place_id
+        mention_type: Optional filter ('product' or 'aspect')
+        is_canonical: Only retrieve canonical mentions (default: True)
+        batch_size: Points per scroll request
+
+    Returns:
+        List of (vector_id, embedding, payload) tuples
+    """
+    client = _get_client()
+    if client is None:
+        logger.warning("Qdrant unavailable, returning empty results")
+        return []
+
+    try:
+        from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+
+        # Build filter conditions
+        conditions = [
+            FieldCondition(key="place_id", match=MatchValue(value=place_id))
+        ]
+        if mention_type:
+            conditions.append(
+                FieldCondition(key="mention_type", match=MatchValue(value=mention_type))
+            )
+        if is_canonical:
+            conditions.append(
+                FieldCondition(key="is_canonical", match=MatchValue(value=True))
+            )
+
+        scroll_filter = Filter(must=conditions)
+
+        all_points = []
+        offset = None
+
+        while True:
+            points, next_offset = client.scroll(
+                collection_name=collection_name,
+                scroll_filter=scroll_filter,
+                limit=batch_size,
+                with_vectors=True,
+                with_payload=True,
+                offset=offset,
+            )
+
+            for point in points:
+                all_points.append((
+                    str(point.id),
+                    point.vector,
+                    VectorPayload.from_dict(point.payload),
+                ))
+
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        logger.debug(f"Scrolled {len(all_points)} vectors for place {place_id}")
+        return all_points
+
+    except Exception as e:
+        logger.error(f"Failed to scroll vectors for place {place_id}: {e}")
+        return []
+
+
+def count_vectors(
+    collection_name: str,
+    place_id: str,
+    mention_type: Optional[str] = None,
+    is_canonical: bool = True,
+) -> int:
+    """
+    Count vectors matching filter criteria.
+
+    Args:
+        collection_name: Collection to count in
+        place_id: Filter by place_id
+        mention_type: Optional filter ('product' or 'aspect')
+        is_canonical: Only count canonical mentions (default: True)
+
+    Returns:
+        Number of matching vectors
+    """
+    client = _get_client()
+    if client is None:
+        return 0
+
+    try:
+        from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+
+        # Build filter conditions
+        conditions = [
+            FieldCondition(key="place_id", match=MatchValue(value=place_id))
+        ]
+        if mention_type:
+            conditions.append(
+                FieldCondition(key="mention_type", match=MatchValue(value=mention_type))
+            )
+        if is_canonical:
+            conditions.append(
+                FieldCondition(key="is_canonical", match=MatchValue(value=True))
+            )
+
+        count_filter = Filter(must=conditions)
+
+        result = client.count(
+            collection_name=collection_name,
+            count_filter=count_filter,
+        )
+
+        return result.count
+
+    except Exception as e:
+        logger.error(f"Failed to count vectors for place {place_id}: {e}")
+        return 0
+
+
 def initialize_collections() -> bool:
     """
     Initialize all required collections for the taxonomy system.
