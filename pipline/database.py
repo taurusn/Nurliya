@@ -4,7 +4,7 @@ Database models and session management for Nurliya Pipeline.
 
 import uuid
 from datetime import datetime
-from sqlalchemy import create_engine, Column, String, Integer, Text, Boolean, DECIMAL, TIMESTAMP, ForeignKey, ARRAY
+from sqlalchemy import create_engine, Column, String, Integer, Text, Boolean, DECIMAL, TIMESTAMP, ForeignKey, ARRAY, Index
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
@@ -78,6 +78,10 @@ class Job(Base):
 
 class Review(Base):
     __tablename__ = "reviews"
+    __table_args__ = (
+        # Index for duplicate detection (place + author + date)
+        Index('ix_reviews_duplicate_check', 'place_id', 'author', 'review_date'),
+    )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     place_id = Column(UUID(as_uuid=True), ForeignKey("places.id"))
@@ -136,6 +140,32 @@ class ScrapeJob(Base):
     user = relationship("User", back_populates="scrape_jobs")
 
 
+class AnomalyInsight(Base):
+    """
+    Cached LLM insights for sentiment anomalies.
+    Generated in background by worker, not during API requests.
+    """
+    __tablename__ = "anomaly_insights"
+    __table_args__ = (
+        # Unique constraint on place + date + topic combination
+        Index('ix_anomaly_insights_lookup', 'place_id', 'date', 'topic'),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    place_id = Column(UUID(as_uuid=True), ForeignKey("places.id", ondelete="CASCADE"), nullable=True)
+    date = Column(String(20), nullable=False)  # YYYY-MM-DD format
+    topic = Column(String(50), nullable=True)  # null means "all topics"
+    anomaly_type = Column(String(20))  # 'spike' or 'drop'
+    magnitude = Column(DECIMAL(5, 2))  # percentage change
+    reason = Column(Text)  # Statistical reason
+    analysis = Column(Text)  # LLM-generated analysis
+    recommendation = Column(Text)  # LLM-generated recommendation
+    review_ids = Column(ARRAY(UUID(as_uuid=True)))  # Reviews that contributed to this anomaly
+    created_at = Column(TIMESTAMP, default=datetime.utcnow)
+
+    place = relationship("Place")
+
+
 class ActivityLog(Base):
     """
     Activity logs for tracking system events.
@@ -155,6 +185,165 @@ class ActivityLog(Base):
     job_id = Column(UUID(as_uuid=True), ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True)
     scrape_job_id = Column(UUID(as_uuid=True), ForeignKey("scrape_jobs.id", ondelete="SET NULL"), nullable=True)
     place_id = Column(UUID(as_uuid=True), ForeignKey("places.id", ondelete="SET NULL"), nullable=True)
+
+
+# =============================================================================
+# DYNAMIC TAXONOMY SYSTEM TABLES
+# =============================================================================
+
+class PlaceTaxonomy(Base):
+    """
+    Per-place taxonomy container.
+    Each place has its own taxonomy that goes through discovery → review → active lifecycle.
+    """
+    __tablename__ = "place_taxonomies"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    place_id = Column(UUID(as_uuid=True), ForeignKey("places.id", ondelete="CASCADE"), nullable=False, index=True)
+    status = Column(String(20), default="draft")  # draft, review, active
+    discovered_at = Column(TIMESTAMP)
+    reviews_sampled = Column(Integer, default=0)  # Number of reviews used for discovery
+    entities_discovered = Column(Integer, default=0)  # Total categories + products discovered
+    published_at = Column(TIMESTAMP)
+    published_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(TIMESTAMP, default=datetime.utcnow)
+
+    place = relationship("Place")
+    publisher = relationship("User")
+    categories = relationship("TaxonomyCategory", back_populates="taxonomy", cascade="all, delete-orphan")
+    products = relationship("TaxonomyProduct", back_populates="taxonomy", cascade="all, delete-orphan")
+
+
+class TaxonomyCategory(Base):
+    """
+    Hierarchical categories for a place's taxonomy.
+    Supports main categories (parent_id=NULL) and subcategories.
+    """
+    __tablename__ = "taxonomy_categories"
+    __table_args__ = (
+        Index('ix_taxonomy_categories_taxonomy', 'taxonomy_id'),
+        Index('ix_taxonomy_categories_parent', 'parent_id'),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    taxonomy_id = Column(UUID(as_uuid=True), ForeignKey("place_taxonomies.id", ondelete="CASCADE"), nullable=False)
+    parent_id = Column(UUID(as_uuid=True), ForeignKey("taxonomy_categories.id", ondelete="SET NULL"), nullable=True)
+    name = Column(String(100), nullable=False)  # Internal name (lowercase, normalized)
+    display_name_en = Column(String(100))
+    display_name_ar = Column(String(100))
+    has_products = Column(Boolean, default=False)  # Whether this category contains products
+
+    # Approval workflow
+    is_approved = Column(Boolean, default=False)
+    approved_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    approved_at = Column(TIMESTAMP)
+    rejection_reason = Column(Text)
+
+    # Analytics
+    discovered_mention_count = Column(Integer, default=0)  # Frozen at discovery (for audit)
+    mention_count = Column(Integer, default=0)  # Live count, updated continuously
+    avg_sentiment = Column(DECIMAL(3, 2))  # 0.00 to 1.00
+    created_at = Column(TIMESTAMP, default=datetime.utcnow)
+
+    taxonomy = relationship("PlaceTaxonomy", back_populates="categories")
+    parent = relationship("TaxonomyCategory", remote_side=[id], backref="children")
+    approver = relationship("User")
+    products = relationship("TaxonomyProduct", foreign_keys="TaxonomyProduct.assigned_category_id", back_populates="assigned_category")
+
+
+class TaxonomyProduct(Base):
+    """
+    Products discovered from review mentions.
+    Can be assigned to a category or standalone (assigned_category_id=NULL).
+    """
+    __tablename__ = "taxonomy_products"
+    __table_args__ = (
+        Index('ix_taxonomy_products_taxonomy', 'taxonomy_id'),
+        Index('ix_taxonomy_products_category', 'assigned_category_id'),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    taxonomy_id = Column(UUID(as_uuid=True), ForeignKey("place_taxonomies.id", ondelete="CASCADE"), nullable=False)
+    discovered_category_id = Column(UUID(as_uuid=True), ForeignKey("taxonomy_categories.id", ondelete="SET NULL"), nullable=True)  # System suggestion
+    assigned_category_id = Column(UUID(as_uuid=True), ForeignKey("taxonomy_categories.id", ondelete="SET NULL"), nullable=True)  # Human decision
+    canonical_text = Column(String(200), nullable=False)  # Normalized product name
+    display_name = Column(String(200))  # Human-readable name
+    variants = Column(JSONB, default=list)  # Alternative spellings: ["spanish latté", "سبانش لاتيه"]
+    vector_id = Column(String(100))  # Reference to Qdrant point ID
+
+    # Approval workflow
+    is_approved = Column(Boolean, default=False)
+    approved_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    approved_at = Column(TIMESTAMP)
+    rejection_reason = Column(Text)
+
+    # Analytics
+    discovered_mention_count = Column(Integer, default=0)  # Frozen at discovery
+    mention_count = Column(Integer, default=0)  # Live count
+    avg_sentiment = Column(DECIMAL(3, 2))
+    created_at = Column(TIMESTAMP, default=datetime.utcnow)
+
+    taxonomy = relationship("PlaceTaxonomy", back_populates="products")
+    discovered_category = relationship("TaxonomyCategory", foreign_keys=[discovered_category_id])
+    assigned_category = relationship("TaxonomyCategory", foreign_keys=[assigned_category_id], back_populates="products")
+    approver = relationship("User")
+
+
+class RawMention(Base):
+    """
+    Raw mentions extracted from reviews.
+    Links to resolved products/categories once taxonomy is approved.
+    """
+    __tablename__ = "raw_mentions"
+    __table_args__ = (
+        Index('ix_raw_mentions_review', 'review_id'),
+        Index('ix_raw_mentions_place', 'place_id'),
+        Index('ix_raw_mentions_resolved_product', 'resolved_product_id'),
+        Index('ix_raw_mentions_resolved_category', 'resolved_category_id'),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    review_id = Column(UUID(as_uuid=True), ForeignKey("reviews.id", ondelete="CASCADE"), nullable=False)
+    place_id = Column(UUID(as_uuid=True), ForeignKey("places.id", ondelete="CASCADE"), nullable=False)
+    mention_text = Column(Text, nullable=False)  # Original extracted text
+    mention_type = Column(String(20), nullable=False)  # 'product' or 'aspect'
+    sentiment = Column(String(20))  # 'positive', 'negative', 'neutral'
+    qdrant_point_id = Column(String(100))  # Reference to embedding in Qdrant
+
+    # Resolution (populated after taxonomy approval)
+    resolved_product_id = Column(UUID(as_uuid=True), ForeignKey("taxonomy_products.id", ondelete="SET NULL"), nullable=True)
+    resolved_category_id = Column(UUID(as_uuid=True), ForeignKey("taxonomy_categories.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(TIMESTAMP, default=datetime.utcnow)
+
+    review = relationship("Review")
+    place = relationship("Place")
+    resolved_product = relationship("TaxonomyProduct")
+    resolved_category = relationship("TaxonomyCategory")
+
+
+class TaxonomyAuditLog(Base):
+    """
+    Audit log for taxonomy approval workflow.
+    Tracks all changes made during review process.
+    """
+    __tablename__ = "taxonomy_audit_logs"
+    __table_args__ = (
+        Index('ix_taxonomy_audit_logs_taxonomy', 'taxonomy_id'),
+        Index('ix_taxonomy_audit_logs_user', 'user_id'),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    taxonomy_id = Column(UUID(as_uuid=True), ForeignKey("place_taxonomies.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    action = Column(String(50), nullable=False)  # approve, reject, move, rename, merge, create, delete, publish
+    entity_type = Column(String(20), nullable=False)  # 'category', 'product', 'taxonomy'
+    entity_id = Column(UUID(as_uuid=True))  # ID of the affected entity
+    old_value = Column(JSONB)  # Previous state
+    new_value = Column(JSONB)  # New state
+    created_at = Column(TIMESTAMP, default=datetime.utcnow)
+
+    taxonomy = relationship("PlaceTaxonomy")
+    user = relationship("User")
 
 
 def get_session():

@@ -130,6 +130,14 @@ SMTP_USER = get_secret("SMTP_USER", "")
 SMTP_PASSWORD = get_secret("SMTP_PASSWORD", "")
 SMTP_FROM_EMAIL = get_secret("SMTP_FROM_EMAIL", "")
 
+# Qdrant Vector Database
+QDRANT_URL = get_secret("QDRANT_URL", "http://localhost:6333")
+QDRANT_API_KEY = get_secret("QDRANT_API_KEY", "")  # Optional, for Qdrant Cloud
+
+# Embedding model settings
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "paraphrase-multilingual-MiniLM-L12-v2")
+EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "384"))  # MiniLM dimension
+
 # Deprecated - kept for backwards compatibility
 GEMINI_API_KEY = get_secret("GEMINI_API_KEY", "")
 GEMINI_MODEL = "gemini-2.0-flash-lite"
