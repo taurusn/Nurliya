@@ -1,9 +1,12 @@
 # Dynamic Taxonomy System - Progress Tracker
 
-## Status: Phase 2 Complete - Ready for Phase 3
+## Status: Phase 3 Complete
 
 **Started**: 2026-02-02
 **Phase 2 Completed**: 2026-02-02
+**Phase 3 Completed**: 2026-02-02
+
+**Spec File**: `/home/42group/nurliya/PHASE3_SPEC.md`
 
 ---
 
@@ -48,11 +51,13 @@
 
 | Task | Status | Notes |
 |------|--------|-------|
-| API: /api/onboarding/* endpoints | ⬜ Pending | pending, approve, reject, move, link, publish |
-| Portal UI: Pending places list | ⬜ Pending | |
-| Portal UI: Taxonomy tree editor | ⬜ Pending | |
-| Portal UI: Bulk operations | ⬜ Pending | |
-| Audit logging | ⬜ Pending | |
+| API: /api/onboarding/* endpoints | ✅ Completed | 7 endpoints: pending, detail, category PATCH, product PATCH, category POST, product POST, publish |
+| Portal UI: Pending places list | ✅ Completed | src/app/page.tsx with stats, filters, taxonomy cards |
+| Portal UI: Taxonomy tree editor | ✅ Completed | CategoryTree + ProductList components with approve/reject/move actions |
+| Portal UI: Modals | ✅ Completed | RejectModal, MoveModal, AddCategoryModal, AddProductModal |
+| Audit logging | ✅ Completed | log_taxonomy_action() called on all API mutations |
+| Docker compose | ✅ Completed | onboarding-portal service on port 3001 |
+| Domain activation | ✅ Completed | https://onboarding.nurliya.com via Cloudflare Tunnel |
 
 ---
 
@@ -99,12 +104,15 @@ _Add implementation notes, blockers, and decisions here as work progresses._
 ### Key Files
 - Plan: `/home/42group/nurliya/TAXONOMY_PLAN.md`
 - Progress: `/home/42group/nurliya/TAXONOMY_PROGRESS.md`
+- **Phase 3 Spec: `/home/42group/nurliya/PHASE3_SPEC.md`**
 - Database: `pipline/database.py`
 - Worker: `pipline/worker.py`
 - LLM: `pipline/llm_client.py`
 - Clustering: `pipline/clustering_job.py`
 - Vectors: `pipline/vector_store.py`
 - Embeddings: `pipline/embedding_client.py`
+- **Onboarding API: `pipline/api.py` (Phase 3)**
+- **Onboarding Portal: `onboarding-portal/` (Phase 3)**
 
 ---
 
@@ -337,9 +345,69 @@ business_type = place.category if place and place.category else "business"
 
 **Result:** LLM prompts now use actual business type (e.g., "Coffee shop", "Restaurant", "Salon") for more accurate category naming.
 
-**Next Steps (Phase 3):**
-1. API endpoints: /api/onboarding/* (pending, approve, reject, move, link, publish)
-2. Portal UI: Pending places list
-3. Portal UI: Taxonomy tree editor
-4. Portal UI: Bulk operations
-5. Audit logging
+**Phase 3 Complete. Ready for Phase 4: Integration.**
+
+### 2026-02-02 - Phase 3 Onboarding Portal Complete
+
+**Backend API (`pipline/api.py`):**
+7 new endpoints added:
+- `GET /api/onboarding/pending` - List taxonomies pending review (draft/review status)
+- `GET /api/onboarding/taxonomies/{id}` - Full taxonomy detail with categories and products
+- `PATCH /api/onboarding/categories/{id}` - Update category (approve, reject, move, rename)
+- `PATCH /api/onboarding/products/{id}` - Update product (approve, reject, move, add_variant)
+- `POST /api/onboarding/categories` - Create new category manually (auto-approved)
+- `POST /api/onboarding/products` - Create new product manually (auto-approved)
+- `POST /api/onboarding/taxonomies/{id}/publish` - Publish taxonomy (draft → active)
+
+Pydantic models added:
+- Request: CategoryUpdateRequest, ProductUpdateRequest, CategoryCreateRequest, ProductCreateRequest
+- Response: PendingTaxonomyResponse, PendingListResponse, TaxonomyCategoryResponse, TaxonomyProductResponse, TaxonomyDetailResponse, ActionResponse
+
+Audit logging: `log_taxonomy_action()` helper logs all mutations to TaxonomyAuditLog
+
+**Frontend Portal (`onboarding-portal/`):**
+New Next.js 14 application with:
+- Dark theme matching client-portal
+- Auth: login page, AuthGuard, AuthProvider context
+- API client with all onboarding endpoints
+- UI components: Button, Card, Input, Badge, ApprovalBadge
+- Modals: RejectModal, MoveModal, AddCategoryModal, AddProductModal
+- Pages:
+  - `/` - Pending list with stats, filters, taxonomy cards
+  - `/[taxonomyId]` - Taxonomy editor with CategoryTree + ProductList
+
+**Docker:**
+- Added `onboarding-portal` service to docker-compose.yml
+- Port 3001 (internal 3000)
+- Build arg: NEXT_PUBLIC_API_URL
+
+**Next Steps (Phase 4):**
+1. Match mentions to approved taxonomy
+2. Add resolved_products/categories to ReviewAnalysis
+3. Analytics endpoints (/categories, /products, /timeline)
+4. Client portal category breakdown
+
+### 2026-02-02 - Onboarding Portal Deployed
+
+**Domain Activation:**
+- Added `onboarding.nurliya.com` to Cloudflare Tunnel config
+- DNS CNAME routed via `cloudflared tunnel route dns nurliya onboarding.nurliya.com`
+- Updated `/etc/cloudflared/config.yml` with ingress rule for port 3001
+- Restarted cloudflared service
+
+**Verification:**
+```
+curl -sI https://onboarding.nurliya.com
+HTTP/2 200
+x-powered-by: Next.js
+```
+
+**Documentation Updated:**
+- DEPLOYMENT.md - Added onboarding-portal to services table and architecture diagram
+- Updated cloudflared config examples
+
+**Portal is now live at: https://onboarding.nurliya.com**
+
+---
+
+**Phase 3 Complete. Ready for Phase 4: Integration.**

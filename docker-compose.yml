@@ -170,6 +170,19 @@ services:
       - api
     restart: unless-stopped
 
+  onboarding-portal:
+    build:
+      context: ./onboarding-portal
+      dockerfile: Dockerfile
+      args:
+        - NEXT_PUBLIC_API_URL=${ONBOARDING_API_URL:-https://api.nurliya.com}
+    container_name: nurliya-onboarding-portal
+    ports:
+      - "3001:3000"
+    depends_on:
+      - api
+    restart: unless-stopped
+
   pgadmin:
     image: dpage/pgadmin4:latest
     container_name: nurliya-pgadmin

@@ -291,9 +291,9 @@ def search_similar(
 
         query_filter = Filter(must=conditions) if conditions else None
 
-        results = client.search(
+        results = client.query_points(
             collection_name=collection_name,
-            query_vector=query_vector,
+            query=query_vector,
             query_filter=query_filter,
             limit=limit,
             score_threshold=score_threshold,
@@ -305,7 +305,7 @@ def search_similar(
                 score=r.score,
                 payload=VectorPayload.from_dict(r.payload),
             )
-            for r in results
+            for r in results.points
         ]
     except Exception as e:
         logger.error(f"Search failed: {e}")

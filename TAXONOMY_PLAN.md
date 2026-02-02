@@ -257,7 +257,7 @@ Qdrant (vectors)
 | `pipline/embedding_client.py` | Arabic-aware embedding generation |
 | `pipline/vector_store.py` | Qdrant client wrapper |
 | `pipline/clustering_job.py` | HDBSCAN clustering + LLM labeling |
-| `client-portal/src/app/onboarding/*` | Approval portal UI |
+| `onboarding-portal/` | Onboarding Portal (Next.js 14) - **DEPLOYED: https://onboarding.nurliya.com** |
 
 ---
 
@@ -275,28 +275,29 @@ Qdrant (vectors)
 
 ## Implementation Phases
 
-### Phase 1A: Infrastructure (Weeks 1-2)
+### Phase 1A: Infrastructure (Weeks 1-2) ✅ COMPLETE
 - Add Qdrant to docker-compose.yml
 - Add 5 taxonomy tables to database.py
 - Create embedding_client.py with Arabic normalization
 - Create vector_store.py with Qdrant wrapper + fallback
 
-### Phase 1B: Worker Integration (Weeks 3-4)
+### Phase 1B: Worker Integration (Weeks 3-4) ✅ COMPLETE
 - Add `extract_mentions()` to llm_client.py
 - Modify worker.py for dual-write (keep old topics + new mentions)
 - Entity resolution via Qdrant similarity
 - **GATE**: Test Arabic embedding quality before Phase 2
 
-### Phase 2: Discovery (Weeks 5-6)
+### Phase 2: Discovery (Weeks 5-6) ✅ COMPLETE
 - Create clustering_job.py (HDBSCAN + LLM labeling)
 - Trigger after scrape completes or 50+ new mentions
 - Build hierarchy (Main → Sub → Products)
 - Save as draft taxonomy
 
-### Phase 3: Onboarding Portal (Weeks 7-9)
+### Phase 3: Onboarding Portal (Weeks 7-9) ✅ COMPLETE
 - API endpoints for approve/reject/move/link/publish
 - Portal UI: pending list, tree editor, bulk operations
 - Audit logging for all decisions
+- **Live at: https://onboarding.nurliya.com**
 
 ### Phase 4: Integration (Weeks 10-11)
 - Match mentions to approved taxonomy

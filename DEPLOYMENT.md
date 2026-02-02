@@ -5,19 +5,19 @@
 ```
                          Cloudflare Edge (SSL)
                                 │
-    ┌───────────────┬───────────┼───────────┬───────────────┐
-    │               │           │           │               │
-    ▼               ▼           ▼           ▼               ▼
-api.nurliya.com  app.nurliya.com  dashboard.nurliya.com  admin.nurliya.com
-    │               │           │           │               │
-    └───────────────┴───────────┼───────────┴───────────────┘
+    ┌───────────────┬───────────┼───────────┬───────────────┬─────────────────┐
+    │               │           │           │               │                 │
+    ▼               ▼           ▼           ▼               ▼                 ▼
+api.nurliya.com  app.nurliya.com  dashboard.nurliya.com  admin.nurliya.com  onboarding.nurliya.com
+    │               │           │           │               │                 │
+    └───────────────┴───────────┼───────────┴───────────────┴─────────────────┘
                                 │
                          Cloudflare Tunnel
                                 │
-              ┌─────────┬───────┼───────┬─────────┐
-              ▼         ▼       ▼       ▼         ▼
-         localhost:8000  :3002  :3000  :5050
-            (API)    (Client) (Dashboard) (pgAdmin)
+        ┌─────────┬───────┼───────┬─────────┬─────────┐
+        ▼         ▼       ▼       ▼         ▼         ▼
+   localhost:8000  :3002  :3000  :5050    :3001
+      (API)    (Client) (Dashboard) (pgAdmin) (Onboarding)
 ```
 
 ## Services
@@ -28,6 +28,7 @@ api.nurliya.com  app.nurliya.com  dashboard.nurliya.com  admin.nurliya.com
 | Client Portal | 3002 | app.nurliya.com | Next.js client-facing app |
 | Dashboard | 3000 | dashboard.nurliya.com | Next.js admin dashboard |
 | pgAdmin | 5050 | admin.nurliya.com | Database admin UI |
+| Onboarding Portal | 3001 | onboarding.nurliya.com | Internal taxonomy review UI |
 | PostgreSQL | 5432 | - | Database (internal) |
 | RabbitMQ | 5672 | - | Message queue (internal) |
 | Scraper | 8080 | - | Google Maps scraper (internal) |
@@ -196,6 +197,8 @@ ingress:
     service: http://localhost:3000
   - hostname: admin.nurliya.com
     service: http://localhost:5050
+  - hostname: onboarding.nurliya.com
+    service: http://localhost:3001
   - service: http_status:404
 ```
 
@@ -206,6 +209,7 @@ cloudflared tunnel route dns nurliya api.nurliya.com
 cloudflared tunnel route dns nurliya app.nurliya.com
 cloudflared tunnel route dns nurliya dashboard.nurliya.com
 cloudflared tunnel route dns nurliya admin.nurliya.com
+cloudflared tunnel route dns nurliya onboarding.nurliya.com
 ```
 
 ### 6. Run as service
