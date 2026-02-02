@@ -64,22 +64,30 @@
 │    │    │                 │    │                     │    │                  │   │   │
 │    │    │ • Google Maps   │    │  • users            │    │ • review_analysis│   │   │
 │    │    │ • 33+ fields    │    │  • places           │    │ • dlq            │   │   │
-│    │    │ • CSV output    │    │  • reviews          │    │                  │   │   │
-│    │    └─────────────────┘    │  • jobs             │    └────────┬─────────┘   │   │
-│    │                           │  • scrape_jobs      │             │              │   │
+│    │    │ • CSV output    │    │  • reviews, jobs    │    │                  │   │   │
+│    │    └─────────────────┘    │  • scrape_jobs      │    └────────┬─────────┘   │   │
 │    │                           │  • review_analysis  │             │              │   │
 │    │    ┌─────────────────┐    │  • anomaly_insights │             │              │   │
-│    │    │    pgAdmin      │    │  • activity_logs    │             │              │   │
-│    │    │     :5050       │───▶└─────────────────────┘             │              │   │
+│    │    │     Qdrant      │    │  • activity_logs    │             │              │   │
+│    │    │   :6333/:6334   │    │  • place_taxonomies │             │              │   │
+│    │    │                 │    │  • taxonomy_*       │             │              │   │
+│    │    │ • Vector store  │    │  • raw_mentions     │             │              │   │
+│    │    │ • Embeddings    │    └─────────────────────┘             │              │   │
 │    │    └─────────────────┘                                        │              │   │
-│    │                                                    ┌──────────▼──────────┐  │   │
-│    │                                                    │   Worker Pool       │  │   │
-│    │                                                    │   (2+ Replicas)     │  │   │
-│    │                                                    │                     │  │   │
-│    │                                                    │  • Queue Consumer   │  │   │
-│    │                                                    │  • LLM Orchestrator │  │   │
-│    │                                                    │  • Email Trigger    │  │   │
-│    │                                                    └──────────┬──────────┘  │   │
+│    │                           ┌─────────────────────┐             │              │   │
+│    │    ┌─────────────────┐    │    pgAdmin          │  ┌──────────▼──────────┐  │   │
+│    │    │  sentence-      │    │     :5050           │  │   Worker Pool       │  │   │
+│    │    │  transformers   │    └─────────────────────┘  │   (2+ Replicas)     │  │   │
+│    │    │                 │                             │                     │  │   │
+│    │    │ • MiniLM model  │◀────────────────────────────│  • Queue Consumer   │  │   │
+│    │    │ • Arabic embeds │                             │  • LLM Orchestrator │  │   │
+│    │    └────────┬────────┘                             │  • Mention Extract  │  │   │
+│    │             │                                      │  • Email Trigger    │  │   │
+│    │             ▼                                      └──────────┬──────────┘  │   │
+│    │    ┌─────────────────┐                                        │              │   │
+│    │    │     Qdrant      │◀───────────────────────────────────────┘              │   │
+│    │    │  (entity resol) │                                                       │   │
+│    │    └─────────────────┘                                                       │   │
 │    │                                                               │              │   │
 │    └───────────────────────────────────────────────────────────────┼──────────────┘   │
 │                                                                    │                   │
@@ -185,6 +193,16 @@
 │  │   │ • System prompts   │    │ • Per-place insights                      │ │   │
 │  │   │ • JSON parsing     │    │ • SMTP delivery (async)                   │ │   │
 │  │   │ • Anomaly insights │    │ • RTL Arabic support                      │ │   │
+│  │   │ • extract_mentions │    │                                            │ │   │
+│  │   └────────────────────┘    └────────────────────────────────────────────┘ │   │
+│  │                                                                              │   │
+│  │   ┌────────────────────┐    ┌────────────────────────────────────────────┐ │   │
+│  │   │ embedding_client.py│    │           vector_store.py                  │ │   │
+│  │   │                    │    │                                            │ │   │
+│  │   │ • MiniLM model     │    │ • Qdrant client wrapper                   │ │   │
+│  │   │ • Arabic normalize │    │ • Entity resolution                       │ │   │
+│  │   │ • Batch embeddings │    │ • Similarity search                       │ │   │
+│  │   │ • Cosine similarity│    │ • Fallback retry queue                    │ │   │
 │  │   └────────────────────┘    └────────────────────────────────────────────┘ │   │
 │  │                                                                              │   │
 │  │   ┌────────────────────┐    ┌────────────────────────────────────────────┐ │   │
@@ -204,8 +222,8 @@
 │  │   │    database.py     │    │    rabbitmq.py     │    │   config.py     │  │   │
 │  │   │                    │    │                    │    │                 │  │   │
 │  │   │ • SQLAlchemy ORM   │    │ • Queue setup      │    │ • Env vars      │  │   │
-│  │   │ • 7 table models   │    │ • DLQ routing      │    │ • GCP Secrets   │  │   │
-│  │   │ • Session mgmt     │    │ • Message publish  │    │ • Defaults      │  │   │
+│  │   │ • 12 table models  │    │ • DLQ routing      │    │ • GCP Secrets   │  │   │
+│  │   │ • Session mgmt     │    │ • Message publish  │    │ • Qdrant config │  │   │
 │  │   └────────────────────┘    └────────────────────┘    └─────────────────┘  │   │
 │  └─────────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                      │
@@ -561,6 +579,21 @@
  │   │      │ )                                                                    │ │  │
  │   │      └──────────────────────────────────────────────────────────────────────┘ │  │
  │   │                                                                                 │  │
+ │   │   4.5. Extract mentions (non-blocking dual-write)                             │  │
+ │   │      ┌──────────────────────────────────────────────────────────────────────┐ │  │
+ │   │      │ process_mentions(review_id, review_text, place_id)                   │ │  │
+ │   │      │                                                                      │ │  │
+ │   │      │ a. extract_mentions(text) → LLM extracts products/aspects           │ │  │
+ │   │      │ b. For each mention:                                                 │ │  │
+ │   │      │    • Generate embedding (sentence-transformers)                      │ │  │
+ │   │      │    • Search Qdrant for similar (0.85 cosine threshold)              │ │  │
+ │   │      │    • If match: use existing canonical_id                            │ │  │
+ │   │      │    • If new: upsert to Qdrant as canonical                          │ │  │
+ │   │      │ c. Save to raw_mentions table                                        │ │  │
+ │   │      │                                                                      │ │  │
+ │   │      │ Fallback: If Qdrant down, queue for retry, save with NULL point_id  │ │  │
+ │   │      └──────────────────────────────────────────────────────────────────────┘ │  │
+ │   │                                                                                 │  │
  │   │   5. Update job progress                                                       │  │
  │   │      ┌──────────────────────────────────────────────────────────────────────┐ │  │
  │   │      │ UPDATE jobs SET processed_reviews = processed_reviews + 1            │ │  │
@@ -816,6 +849,111 @@ T+301s  ScrapeJob status = "completed"
 │ job_id          UUID        FK NULLABLE│
 │ scrape_job_id   UUID        FK NULLABLE│
 │ place_id        UUID        FK NULLABLE│
+└────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════════════
+                          TAXONOMY TABLES (Dynamic Taxonomy System)
+═══════════════════════════════════════════════════════════════════════════════════
+
+┌────────────────────────────────────────┐
+│          place_taxonomies             │
+├────────────────────────────────────────┤
+│ id              UUID        PK         │
+│ place_id        UUID        FK ───────▶│ places.id
+│ status          VARCHAR(20)            │  (draft|review|active)
+│ discovered_at   TIMESTAMP              │
+│ reviews_sampled INT                    │
+│ entities_discovered INT                │
+│ published_at    TIMESTAMP   NULLABLE   │
+│ published_by    UUID        FK ───────▶│ users.id
+│ created_at      TIMESTAMP              │
+├────────────────────────────────────────┤
+│ One taxonomy per place                 │
+│ Workflow: draft → review → active      │
+└───────────────────┬────────────────────┘
+                    │ 1:N
+                    ▼
+┌────────────────────────────────────────┐
+│         taxonomy_categories           │
+├────────────────────────────────────────┤
+│ id              UUID        PK         │
+│ taxonomy_id     UUID        FK ────────┼──▶ place_taxonomies.id
+│ parent_id       UUID        FK ────────┼──▶ taxonomy_categories.id (self-ref, NULL=main)
+│ name            VARCHAR(100)           │
+│ display_name_en VARCHAR(100)           │
+│ display_name_ar VARCHAR(100)           │
+│ has_products    BOOLEAN                │  (true if contains products)
+│ is_approved     BOOLEAN                │
+│ approved_by     UUID        FK ───────▶│ users.id
+│ approved_at     TIMESTAMP   NULLABLE   │
+│ rejection_reason TEXT       NULLABLE   │
+│ discovered_mention_count INT           │  (frozen at discovery)
+│ mention_count   INT                    │  (live, updated continuously)
+│ avg_sentiment   FLOAT       NULLABLE   │
+│ created_at      TIMESTAMP              │
+├────────────────────────────────────────┤
+│ Hierarchical: Main → Sub categories    │
+│ parent_id ON DELETE SET NULL           │
+└───────────────────┬────────────────────┘
+                    │ 1:N
+                    ▼
+┌────────────────────────────────────────┐
+│          taxonomy_products            │
+├────────────────────────────────────────┤
+│ id              UUID        PK         │
+│ taxonomy_id     UUID        FK ────────┼──▶ place_taxonomies.id
+│ discovered_category_id UUID FK ────────┼──▶ taxonomy_categories.id (system suggestion)
+│ assigned_category_id UUID   FK ────────┼──▶ taxonomy_categories.id (human decision)
+│ canonical_text  VARCHAR(200)           │
+│ display_name    VARCHAR(200)           │
+│ variants        JSONB                  │  (["spanish latté", "سبانش لاتيه"])
+│ vector_id       UUID        NULLABLE   │  (Qdrant point ID)
+│ is_approved     BOOLEAN                │
+│ approved_by     UUID        FK ───────▶│ users.id
+│ approved_at     TIMESTAMP   NULLABLE   │
+│ rejection_reason TEXT       NULLABLE   │
+│ discovered_mention_count INT           │
+│ mention_count   INT                    │
+│ avg_sentiment   FLOAT       NULLABLE   │
+│ created_at      TIMESTAMP              │
+├────────────────────────────────────────┤
+│ Leaf nodes or standalone products      │
+│ assigned_category_id NULL = standalone │
+└────────────────────────────────────────┘
+
+┌────────────────────────────────────────┐
+│            raw_mentions               │
+├────────────────────────────────────────┤
+│ id              UUID        PK         │
+│ review_id       UUID        FK ────────┼──▶ reviews.id
+│ place_id        UUID        FK ────────┼──▶ places.id
+│ mention_text    TEXT                   │
+│ mention_type    VARCHAR(20)            │  ('product' | 'aspect')
+│ sentiment       VARCHAR(20)            │
+│ qdrant_point_id VARCHAR(100) NULLABLE  │  (NULL if Qdrant was down)
+│ resolved_product_id UUID    FK ────────┼──▶ taxonomy_products.id
+│ resolved_category_id UUID   FK ────────┼──▶ taxonomy_categories.id
+│ created_at      TIMESTAMP              │
+├────────────────────────────────────────┤
+│ CHECK: product has resolved_product_id │
+│        aspect has resolved_category_id │
+│        or both NULL (unresolved)       │
+└────────────────────────────────────────┘
+
+┌────────────────────────────────────────┐
+│         taxonomy_audit_log            │
+├────────────────────────────────────────┤
+│ id              UUID        PK         │
+│ taxonomy_id     UUID        FK ────────┼──▶ place_taxonomies.id
+│ user_id         UUID        FK ────────┼──▶ users.id
+│ action          VARCHAR(50)            │  (approve|reject|move|link|publish)
+│ entity_type     VARCHAR(20)            │  (category|product|taxonomy)
+│ entity_id       UUID                   │
+│ old_value       JSONB       NULLABLE   │
+│ new_value       JSONB       NULLABLE   │
+│ created_at      TIMESTAMP              │
+├────────────────────────────────────────┤
+│ Full audit trail for approval workflow │
 └────────────────────────────────────────┘
 ```
 
@@ -1095,6 +1233,51 @@ T+301s  ScrapeJob status = "completed"
     │   │  }                                                                       ││
     │   └─────────────────────────────────────────────────────────────────────────┘│
     └───────────────────────────────────────────────────────────────────────────────┘
+
+    ┌───────────────────────────────────────────────────────────────────────────────┐
+    │                          MENTION EXTRACTION (Phase 1B)                        │
+    │                                                                                │
+    │   Separate LLM call after analyze_review() for taxonomy system:               │
+    │   ┌─────────────────────────────────────────────────────────────────────────┐│
+    │   │  extract_mentions(review_text) → LLM extracts:                          ││
+    │   │  • Products: specific items mentioned ("Spanish latte", "V60")          ││
+    │   │  • Aspects: service qualities ("slow service", "friendly staff")        ││
+    │   │                                                                          ││
+    │   │  Input: "القهوة الاسبانية ممتازة بس الخدمة بطيئة"                        ││
+    │   │                                                                          ││
+    │   │  Output:                                                                 ││
+    │   │  {                                                                       ││
+    │   │    "products": [                                                         ││
+    │   │      {"text": "القهوة الاسبانية", "sentiment": "positive"}              ││
+    │   │    ],                                                                    ││
+    │   │    "aspects": [                                                          ││
+    │   │      {"text": "الخدمة بطيئة", "sentiment": "negative"}                  ││
+    │   │    ]                                                                     ││
+    │   │  }                                                                       ││
+    │   │                                                                          ││
+    │   │  Max 10 mentions per review                                              ││
+    │   │  Handles Arabic, English, and mixed text                                 ││
+    │   │  Non-blocking: failure doesn't affect analyze_review()                   ││
+    │   └─────────────────────────────────────────────────────────────────────────┘│
+    │                                                                                │
+    │   Entity Resolution Flow:                                                      │
+    │   ┌─────────────────────────────────────────────────────────────────────────┐│
+    │   │  1. Generate embedding (sentence-transformers MiniLM)                    ││
+    │   │  2. Search Qdrant for similar mentions in same place                    ││
+    │   │     └── Filter by place_id and mention_type                             ││
+    │   │  3. If similarity > 0.85 cosine threshold:                               ││
+    │   │     └── Use existing canonical_id (entity resolution)                    ││
+    │   │  4. If no match found:                                                   ││
+    │   │     └── Create new canonical, upsert to Qdrant                          ││
+    │   │  5. Save to raw_mentions table                                          ││
+    │   │                                                                          ││
+    │   │  Arabic Normalization:                                                   ││
+    │   │  • Remove diacritics (tashkeel)                                         ││
+    │   │  • Normalize alef variants (أإآا → ا)                                   ││
+    │   │  • Normalize teh marbuta (ة → ه)                                        ││
+    │   │  • Normalize yeh variants (ي ى → ی)                                     ││
+    │   └─────────────────────────────────────────────────────────────────────────┘│
+    └───────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -1289,10 +1472,19 @@ T+301s  ScrapeJob status = "completed"
     │   │   │   └─────────────┘   │ └─────────┘ │   └─────────────────┘   │   │  │
     │   │   │                     └─────────────┘                          │   │  │
     │   │   │                                                               │   │  │
-    │   │   │   ┌─────────────────┐                                        │   │  │
-    │   │   │   │    pgadmin      │                                        │   │  │
-    │   │   │   │     :5050       │  (Database admin UI)                   │   │  │
-    │   │   │   └─────────────────┘                                        │   │  │
+    │   │   │   ┌─────────────┐   ┌─────────────────┐                      │   │  │
+    │   │   │   │   qdrant    │   │    pgadmin      │                      │   │  │
+    │   │   │   │ :6333/:6334 │   │     :5050       │                      │   │  │
+    │   │   │   │             │   │                 │                      │   │  │
+    │   │   │   │ ┌─────────┐ │   │ (Database admin │                      │   │  │
+    │   │   │   │ │ Volume  │ │   │  UI)            │                      │   │  │
+    │   │   │   │ │qdrant   │ │   └─────────────────┘                      │   │  │
+    │   │   │   │ │ _data   │ │                                            │   │  │
+    │   │   │   │ └─────────┘ │   Vector DB for taxonomy:                  │   │  │
+    │   │   │   │             │   • Mention embeddings                     │   │  │
+    │   │   │   │ Entity      │   • 0.85 cosine threshold                  │   │  │
+    │   │   │   │ resolution  │   • Per-place filtering                    │   │  │
+    │   │   │   └─────────────┘                                            │   │  │
     │   │   └──────────────────────────────────────────────────────────────┘   │  │
     │   │                                                                        │  │
     │   │   ┌──────────────────────────────────────────────────────────────┐   │  │
@@ -1349,6 +1541,7 @@ T+301s  ScrapeJob status = "completed"
     │   │   │   │                                                      │   │   │  │
     │   │   │   │   postgres_data    ← Database persistence            │   │   │  │
     │   │   │   │   rabbitmq_data    ← Queue persistence               │   │   │  │
+    │   │   │   │   qdrant_data      ← Vector DB persistence           │   │   │  │
     │   │   │   │   scraper_data     ← Scraper data                    │   │   │  │
     │   │   │   │   results_data     ← CSV downloads                   │   │   │  │
     │   │   │   │   pgadmin_data     ← pgAdmin config                  │   │   │  │
@@ -1403,6 +1596,12 @@ T+301s  ScrapeJob status = "completed"
 ├────────────────────────────────────┼────────────────────────────────────────────────┤
 │  GCP_PROJECT_ID                    │  GCP project for Secret Manager (optional)     │
 │  USE_SECRET_MANAGER                │  Enable GCP Secret Manager (default: false)    │
+├────────────────────────────────────┼────────────────────────────────────────────────┤
+│  QDRANT_URL                        │  Qdrant server URL (default: localhost:6333)   │
+│  QDRANT_API_KEY                    │  Qdrant API key (optional, for Qdrant Cloud)   │
+│  EMBEDDING_MODEL                   │  Sentence transformer model name               │
+│                                    │  (default: paraphrase-multilingual-MiniLM-L12) │
+│  EMBEDDING_DIMENSION               │  Vector dimension (default: 384)               │
 ├────────────────────────────────────┼────────────────────────────────────────────────┤
 │  QUEUE_NAME                        │  RabbitMQ queue (default: review_analysis)     │
 │  DLQ_NAME                          │  Dead letter queue name                         │
@@ -1480,6 +1679,8 @@ Secret Loading Priority:
 ├── DEPLOYMENT.md                     # Production deployment guide
 ├── GCP_DEPLOYMENT_INSTRUCTIONS.md    # GCP-specific setup
 ├── nurliya-prd.md                    # Product requirements document
+├── TAXONOMY_PLAN.md                  # Dynamic taxonomy system implementation plan
+├── TAXONOMY_PROGRESS.md              # Taxonomy system progress tracker
 │
 ├── pipline/                          # Python backend application
 │   ├── Dockerfile                    # Container definition
@@ -1498,9 +1699,12 @@ Secret Loading Priority:
 │   ├── gemini_client.py              # Gemini-specific client (legacy)
 │   ├── email_service.py              # Report generation & SMTP
 │   │
-│   ├── database.py                   # SQLAlchemy models (7 tables)
+│   ├── embedding_client.py           # Sentence-transformers + Arabic normalization
+│   ├── vector_store.py               # Qdrant client wrapper + entity resolution
+│   │
+│   ├── database.py                   # SQLAlchemy models (12 tables)
 │   ├── rabbitmq.py                   # Queue setup
-│   ├── config.py                     # Configuration with GCP Secret Manager
+│   ├── config.py                     # Configuration with GCP Secret Manager + Qdrant
 │   │
 │   ├── activity_logger.py            # Database activity logging
 │   ├── logging_config.py             # Structured logging setup
@@ -1570,5 +1774,6 @@ docker-compose -f docker-compose.yml up -d  # Production stack
 
 ---
 
-*Document generated for Nurliya v2.0*
+*Document generated for Nurliya v2.1 (with Dynamic Taxonomy System)*
 *Last updated: February 2026*
+*Taxonomy Phase 1A+1B complete - see TAXONOMY_PROGRESS.md for status*
