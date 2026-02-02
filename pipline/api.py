@@ -14,7 +14,7 @@ from uuid import UUID
 from sqlalchemy import func, text
 
 from logging_config import get_logger
-from database import Place, Review, ReviewAnalysis, Job, ScrapeJob, ActivityLog, User, get_session, create_tables
+from database import Place, Review, ReviewAnalysis, Job, ScrapeJob, ActivityLog, User, AnomalyInsight, get_session, create_tables
 from config import RABBITMQ_URL, QUEUE_NAME
 from scraper_client import ScraperClient
 from auth import (
@@ -220,10 +220,55 @@ app.add_middleware(
 )
 
 
+# Helper to resolve short URLs
+async def resolve_short_url(url: str) -> str:
+    """Resolve a short URL to its final destination."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
+            resp = await client.head(url)
+            return str(resp.url)
+    except Exception as e:
+        logger.warning("Failed to resolve short URL", extra={"extra_data": {"url": url, "error": str(e)}})
+        return url
+
+
+# Helper to extract place name from Google Maps URL
+def extract_place_from_url(url: str) -> Optional[str]:
+    """Extract place name from Google Maps URL."""
+    import re
+    from urllib.parse import unquote
+
+    # Pattern: google.com/maps/place/PLACE_NAME/...
+    place_match = re.search(r'google\.com/maps/place/([^/@]+)', url)
+    if place_match:
+        place_name = unquote(place_match.group(1).replace('+', ' '))
+        return place_name
+
+    return None
+
+
+def is_google_maps_url(text: str) -> bool:
+    """Check if text is a Google Maps URL."""
+    patterns = [
+        r'google\.com/maps',
+        r'maps\.google\.com',
+        r'goo\.gl/maps',
+        r'maps\.app\.goo\.gl',
+    ]
+    import re
+    return any(re.search(p, text, re.IGNORECASE) for p in patterns)
+
+
+def is_short_url(url: str) -> bool:
+    """Check if URL is a short URL that needs resolving."""
+    return 'goo.gl' in url.lower()
+
+
 # Request/Response Models
 class ScrapeRequest(BaseModel):
-    query: str = Field(..., description="Search query (e.g., 'coffee shops in Riyadh')")
-    depth: int = Field(10, ge=1, le=50, description="Scroll depth for results")
+    query: str = Field(..., description="Search query or Google Maps URL")
+    depth: int = Field(10, ge=1, le=50, description="Scroll depth for results (1 for single place URL)")
     lang: str = Field("en", description="Language code (en, ar)")
     max_time: int = Field(300, ge=60, le=1800, description="Max scrape time in seconds")
     notification_email: Optional[EmailStr] = Field(None, description="Email address for completion report")
@@ -373,14 +418,43 @@ async def start_scrape(
     """
     Start a new scrape job for the authenticated user.
 
+    Accepts either:
+    - A search query (e.g., "coffee shops in Riyadh")
+    - A Google Maps URL (e.g., "https://google.com/maps/place/...")
+
     This will:
     1. Create a scrape job record
     2. Start the Google Maps scraper in the background
     3. Automatically process results when scraping completes
     """
+    query = request.query.strip()
+    depth = request.depth
+
+    # Detect if input is a Google Maps URL
+    if is_google_maps_url(query):
+        original_url = query
+
+        # Resolve short URLs first (goo.gl, maps.app.goo.gl, etc.)
+        if is_short_url(query):
+            logger.info("Resolving short URL", extra={"extra_data": {"url": query}})
+            resolved_url = await resolve_short_url(query)
+            logger.info("Short URL resolved", extra={"extra_data": {"original": query, "resolved": resolved_url}})
+            query = resolved_url
+
+        # Extract place name from URL for better search
+        place_name = extract_place_from_url(query)
+        if place_name:
+            query = place_name
+            depth = 1  # Single place, no need for deep scroll
+            logger.info("Extracted place from URL", extra={"extra_data": {"original": original_url, "extracted": query}})
+        else:
+            # Can't extract name, use the full resolved URL
+            logger.info("Could not extract place name from URL", extra={"extra_data": {"url": query}})
+            depth = 1
+
     # Create job record with user_id
     job = create_scrape_job(
-        request.query,
+        query,
         notification_email=request.notification_email,
         user_id=str(current_user.id)
     )
@@ -388,9 +462,9 @@ async def start_scrape(
     # Start background task
     background_tasks.add_task(
         run_scrape_pipeline,
-        query=request.query,
+        query=query,
         scrape_job_id=str(job.id),
-        depth=request.depth,
+        depth=depth,
         lang=request.lang,
         max_time=request.max_time,
     )
@@ -678,10 +752,14 @@ async def get_stats():
 
 
 @app.get("/api/overview")
-async def get_overview(current_user: User = Depends(get_current_user)):
+async def get_overview(
+    place_id: Optional[str] = None,
+    current_user: User = Depends(get_current_user)
+):
     """
     Get comprehensive overview data for the client portal.
     Returns all metrics, charts, and insights for the authenticated user.
+    Optionally filter by place_id to get data for a specific place.
     """
     from datetime import datetime, timedelta
     from collections import defaultdict
@@ -701,6 +779,12 @@ async def get_overview(current_user: User = Depends(get_current_user)):
                 user_place_ids.extend([pj.place_id for pj in pipeline_jobs if pj.place_id])
 
         user_place_ids = list(set(user_place_ids))  # Remove duplicates
+
+        # If place_id is specified, filter to just that place (must be in user's places)
+        if place_id:
+            if place_id not in [str(pid) for pid in user_place_ids]:
+                raise HTTPException(status_code=404, detail="Place not found or not accessible")
+            user_place_ids = [place_id]
 
         # If user has no places yet, return empty data
         if not user_place_ids:
@@ -726,6 +810,10 @@ async def get_overview(current_user: User = Depends(get_current_user)):
         reviews = session.query(Review).filter(Review.place_id.in_(user_place_ids)).all()
         review_ids = [r.id for r in reviews]
         reviews_count = len(reviews)
+
+        # Count reviews with text (only these need analysis)
+        reviews_with_text = [r for r in reviews if r.text and r.text.strip()]
+        analyzable_count = len(reviews_with_text)
 
         # Get all analyses for user's reviews
         analyses = []
@@ -792,20 +880,61 @@ async def get_overview(current_user: User = Depends(get_current_user)):
                 "count": day_total,
             })
 
-        # 5. Top topics
-        top_positive = sorted(positive_topics.items(), key=lambda x: -x[1])[:5]
-        top_negative = sorted(negative_topics.items(), key=lambda x: -x[1])[:5]
+        # 5. Top topics - Calculate net sentiment per topic
+        # Combine all topics and calculate their positive vs negative ratio
+        all_topics = set(positive_topics.keys()) | set(negative_topics.keys())
 
-        # Calculate percentages for topics
+        topic_stats = []
+        for topic in all_topics:
+            pos_count = positive_topics.get(topic, 0)
+            neg_count = negative_topics.get(topic, 0)
+            total_mentions = pos_count + neg_count
+            if total_mentions == 0:
+                continue
+
+            # Net sentiment: positive ratio (0-100%)
+            positive_ratio = round(pos_count / total_mentions * 100)
+            net_score = pos_count - neg_count  # For sorting
+
+            topic_stats.append({
+                "topic": topic,
+                "positive": pos_count,
+                "negative": neg_count,
+                "total": total_mentions,
+                "ratio": positive_ratio,
+                "net": net_score,
+            })
+
+        # What's Hot: Topics with more positive than negative mentions (ratio > 50%)
+        # Sorted by total mentions (most discussed first)
+        hot_topics = [t for t in topic_stats if t["ratio"] > 50]
+        hot_topics.sort(key=lambda x: -x["total"])
+
         whats_hot = []
-        for topic, count in top_positive:
-            pct = round(count / total_sentiment * 100) if total_sentiment > 0 else 0
-            whats_hot.append({"item": topic, "score": f"{pct}%", "mentions": count})
+        for t in hot_topics[:5]:
+            whats_hot.append({
+                "item": t["topic"],
+                "score": f"{t['ratio']}% positive",
+                "mentions": t["total"],
+            })
+
+        # What's Not: Topics with more negative than positive mentions (ratio <= 50%)
+        # Sorted by total mentions (most discussed first)
+        cold_topics = [t for t in topic_stats if t["ratio"] <= 50]
+        cold_topics.sort(key=lambda x: -x["total"])
 
         whats_not = []
-        for topic, count in top_negative:
-            pct = round(count / total_sentiment * 100) if total_sentiment > 0 else 0
-            whats_not.append({"item": topic, "score": f"{pct}%", "mentions": count})
+        for t in cold_topics[:5]:
+            negative_ratio = 100 - t["ratio"]
+            whats_not.append({
+                "item": t["topic"],
+                "score": f"{negative_ratio}% negative",
+                "mentions": t["total"],
+            })
+
+        # Legacy format for backwards compatibility
+        top_positive = sorted(positive_topics.items(), key=lambda x: -x[1])[:5]
+        top_negative = sorted(negative_topics.items(), key=lambda x: -x[1])[:5]
 
         # 6. Alerts
         alerts = []
@@ -817,7 +946,8 @@ async def get_overview(current_user: User = Depends(get_current_user)):
                 "count": urgent_count,
             })
 
-        pending_analyses = reviews_count - analyses_count
+        # Only count reviews with text as pending (rating-only reviews don't need analysis)
+        pending_analyses = max(0, analyzable_count - analyses_count)
         if pending_analyses > 0:
             alerts.append({
                 "type": "pending",
@@ -867,6 +997,547 @@ async def get_overview(current_user: User = Depends(get_current_user)):
                 "processing": len([j for j in user_jobs if j.status == "processing"]),
                 "completed": len([j for j in user_jobs if j.status == "completed"]),
                 "failed": len([j for j in user_jobs if j.status == "failed"]),
+            }
+        }
+    finally:
+        session.close()
+
+
+@app.get("/api/sentiment-trend")
+async def get_sentiment_trend(
+    period: str = "7d",
+    zoom: str = "day",
+    place_id: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    topic: Optional[str] = None,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Get sentiment trend data with anomaly detection.
+
+    Parameters:
+    - period: 7d, 30d, 90d, 1y, all, or 'custom' (requires start_date/end_date)
+    - zoom: Aggregation level - 'day', 'week', 'month', 'year'
+    - place_id: Filter to specific place
+    - start_date: Custom range start (YYYY-MM-DD)
+    - end_date: Custom range end (YYYY-MM-DD)
+    - topic: Filter by topic (service, food, drinks, etc.)
+    """
+    from datetime import datetime, timedelta
+    from collections import defaultdict
+    import statistics
+
+    session = get_session()
+    try:
+        # Get user's places
+        user_jobs = session.query(ScrapeJob).filter(ScrapeJob.user_id == current_user.id).all()
+        user_place_ids = []
+        for job in user_jobs:
+            if job.pipeline_job_ids:
+                pipeline_jobs = session.query(Job).filter(Job.id.in_(job.pipeline_job_ids)).all()
+                user_place_ids.extend([pj.place_id for pj in pipeline_jobs if pj.place_id])
+        user_place_ids = list(set(user_place_ids))
+
+        # If place_id is specified, filter to just that place
+        if place_id:
+            if place_id not in [str(pid) for pid in user_place_ids]:
+                raise HTTPException(status_code=404, detail="Place not found or not accessible")
+            user_place_ids = [place_id]
+
+        empty_response = {
+            "data": [],
+            "anomalies": [],
+            "topics_in_period": [],
+            "baseline": {"avg_positive_pct": 0, "avg_daily_reviews": 0}
+        }
+
+        if not user_place_ids:
+            return empty_response
+
+        # Get reviews with their analyses
+        reviews = session.query(Review).filter(Review.place_id.in_(user_place_ids)).all()
+        review_ids = [r.id for r in reviews]
+
+        if not review_ids:
+            return empty_response
+
+        # Create maps
+        analyses = session.query(ReviewAnalysis).filter(ReviewAnalysis.review_id.in_(review_ids)).all()
+        analysis_map = {a.review_id: a for a in analyses}
+        review_obj_map = {r.id: r for r in reviews}
+
+        # Parse review dates
+        def parse_review_date(date_str):
+            if not date_str:
+                return None
+            try:
+                parts = date_str.split('-')
+                if len(parts) == 3:
+                    return datetime(int(parts[0]), int(parts[1]), int(parts[2])).date()
+            except:
+                pass
+            return None
+
+        # Build review data with parsed dates and topics
+        review_data = []
+        all_topics = set()
+
+        for r in reviews:
+            review_date = parse_review_date(r.review_date)
+            analysis = analysis_map.get(r.id)
+            if review_date and analysis:
+                topics_pos = analysis.topics_positive or []
+                topics_neg = analysis.topics_negative or []
+                all_review_topics = set(topics_pos + topics_neg)
+                all_topics.update(all_review_topics)
+
+                # Filter by topic if specified
+                if topic and topic not in all_review_topics:
+                    continue
+
+                review_data.append({
+                    "id": str(r.id),
+                    "date": review_date,
+                    "sentiment": analysis.sentiment,
+                    "topics_positive": topics_pos,
+                    "topics_negative": topics_neg,
+                    "text": r.text[:200] if r.text else "",
+                    "rating": r.rating,
+                })
+
+        if not review_data:
+            return empty_response
+
+        # Determine date range
+        today = datetime.utcnow().date()
+
+        if period == "custom" and start_date and end_date:
+            try:
+                range_start = datetime.strptime(start_date, "%Y-%m-%d").date()
+                range_end = datetime.strptime(end_date, "%Y-%m-%d").date()
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+        elif period == "all":
+            # No date restrictions - use all data
+            all_dates = [rd["date"] for rd in review_data]
+            if all_dates:
+                range_start = min(all_dates)
+                range_end = max(all_dates)
+            else:
+                range_start = today
+                range_end = today
+        else:
+            # Preset periods
+            period_days = {
+                "7d": 7,
+                "30d": 30,
+                "90d": 90,
+                "1y": 365,
+                "2y": 730,
+                "5y": 1825,
+            }
+            days = period_days.get(period, 7)
+            range_start = today - timedelta(days=days - 1)
+            range_end = today
+
+        trend_data = []
+        reviews_by_date = defaultdict(list)
+
+        # Group reviews by date
+        for rd in review_data:
+            if range_start <= rd["date"] <= range_end:
+                reviews_by_date[rd["date"]].append(rd)
+
+        # Collect topics in period
+        topics_in_period = set()
+        for date_reviews in reviews_by_date.values():
+            for rd in date_reviews:
+                topics_in_period.update(rd["topics_positive"])
+                topics_in_period.update(rd["topics_negative"])
+
+        # Aggregation based on zoom level
+        def get_bucket_key(date, zoom_level):
+            if zoom_level == "year":
+                return date.strftime("%Y")
+            elif zoom_level == "month":
+                return date.strftime("%Y-%m")
+            elif zoom_level == "week":
+                # ISO week format
+                return f"{date.year}-W{date.isocalendar()[1]:02d}"
+            else:  # day
+                return date.isoformat()
+
+        def get_bucket_label(key, zoom_level):
+            if zoom_level == "year":
+                return key  # "2026"
+            elif zoom_level == "month":
+                return datetime.strptime(key, "%Y-%m").strftime("%b %Y")  # "Jan 2026"
+            elif zoom_level == "week":
+                return key  # "2026-W05"
+            else:  # day
+                try:
+                    return datetime.strptime(key, "%Y-%m-%d").strftime("%b %d")  # "Jan 26"
+                except:
+                    return key
+
+        # Aggregate by zoom level
+        buckets = defaultdict(lambda: {"positive": 0, "negative": 0, "neutral": 0, "total": 0, "reviews": []})
+
+        for rd in review_data:
+            if range_start <= rd["date"] <= range_end:
+                bucket_key = get_bucket_key(rd["date"], zoom)
+                buckets[bucket_key]["total"] += 1
+                buckets[bucket_key]["reviews"].append(rd)
+                if rd["sentiment"] == "positive":
+                    buckets[bucket_key]["positive"] += 1
+                elif rd["sentiment"] == "negative":
+                    buckets[bucket_key]["negative"] += 1
+                else:
+                    buckets[bucket_key]["neutral"] += 1
+
+        # Sort buckets chronologically
+        sorted_keys = sorted(buckets.keys())
+
+        for key in sorted_keys:
+            data = buckets[key]
+            total = data["total"]
+            trend_data.append({
+                "date": key,
+                "label": get_bucket_label(key, zoom),
+                "positive": data["positive"],
+                "negative": data["negative"],
+                "neutral": data["neutral"],
+                "total": total,
+                "positive_pct": round(data["positive"] / total * 100) if total > 0 else 0,
+                "reviews": data["reviews"],
+            })
+
+        # Calculate baseline
+        total_reviews = sum(p["total"] for p in trend_data)
+        positive_reviews = sum(p["positive"] for p in trend_data)
+        days_with_data = sum(1 for p in trend_data if p["total"] > 0)
+
+        baseline = {
+            "avg_positive_pct": round(positive_reviews / total_reviews * 100) if total_reviews > 0 else 0,
+            "avg_daily_reviews": round(total_reviews / max(days_with_data, 1), 1)
+        }
+
+        # Anomaly detection using statistical approach (2σ)
+        anomalies = []
+        positive_pcts = [p["positive_pct"] for p in trend_data if p["total"] > 0]
+
+        if len(positive_pcts) >= 3:
+            mean_pct = statistics.mean(positive_pcts)
+            try:
+                std_pct = statistics.stdev(positive_pcts)
+            except statistics.StatisticsError:
+                std_pct = 0
+
+            if std_pct > 0:
+                for point in trend_data:
+                    if point["total"] == 0:
+                        continue
+
+                    z_score = (point["positive_pct"] - mean_pct) / std_pct
+
+                    if abs(z_score) > 2:
+                        point["is_anomaly"] = True
+                        point["anomaly_type"] = "spike" if z_score > 0 else "drop"
+                        magnitude = round((point["positive_pct"] - mean_pct), 1)
+
+                        # Generate statistical reason
+                        day_reviews = point.get("reviews", [])
+                        topic_counts = defaultdict(lambda: {"positive": 0, "negative": 0})
+
+                        for rd in day_reviews:
+                            for t in rd.get("topics_positive", []):
+                                topic_counts[t]["positive"] += 1
+                            for t in rd.get("topics_negative", []):
+                                topic_counts[t]["negative"] += 1
+
+                        # Find most changed topic
+                        reason_parts = []
+                        if point["anomaly_type"] == "drop":
+                            neg_topics = sorted(topic_counts.items(), key=lambda x: -x[1]["negative"])
+                            if neg_topics and neg_topics[0][1]["negative"] > 0:
+                                reason_parts.append(f"'{neg_topics[0][0]}' complaints: {neg_topics[0][1]['negative']}")
+                        else:
+                            pos_topics = sorted(topic_counts.items(), key=lambda x: -x[1]["positive"])
+                            if pos_topics and pos_topics[0][1]["positive"] > 0:
+                                reason_parts.append(f"'{pos_topics[0][0]}' praised: {pos_topics[0][1]['positive']}x")
+
+                        reason = f"Sentiment {'dropped' if point['anomaly_type'] == 'drop' else 'spiked'} {abs(magnitude):.0f}%"
+                        if reason_parts:
+                            reason += f" - {', '.join(reason_parts)}"
+
+                        point["anomaly_reason"] = reason
+
+                        # Check for cached LLM insight
+                        llm_insight = None
+                        review_id_list = [rd["id"] for rd in day_reviews]
+
+                        # Determine place_id for cache lookup (use first place if multiple)
+                        cache_place_id = user_place_ids[0] if len(user_place_ids) == 1 else None
+
+                        # Build date filter based on zoom level
+                        # Insights are stored by day, but we may be viewing by month/week/year
+                        date_filter = None
+                        if zoom == "day":
+                            date_filter = AnomalyInsight.date == point["date"]
+                        elif zoom == "month":
+                            # Match any day in this month (2025-12 matches 2025-12-*)
+                            date_filter = AnomalyInsight.date.like(f"{point['date']}%")
+                        elif zoom == "week":
+                            # For week, we need to find days in this ISO week
+                            # point["date"] is like "2025-W52", find all matching days
+                            week_dates = [rd["date"].isoformat() for rd in day_reviews]
+                            if week_dates:
+                                date_filter = AnomalyInsight.date.in_(week_dates)
+                            else:
+                                date_filter = AnomalyInsight.date == point["date"]
+                        elif zoom == "year":
+                            # Match any day in this year
+                            date_filter = AnomalyInsight.date.like(f"{point['date']}%")
+                        else:
+                            date_filter = AnomalyInsight.date == point["date"]
+
+                        # Query for cached insight
+                        query = session.query(AnomalyInsight).filter(date_filter)
+                        if cache_place_id:
+                            query = query.filter(AnomalyInsight.place_id == cache_place_id)
+                        if topic:
+                            query = query.filter(AnomalyInsight.topic == topic)
+                        else:
+                            query = query.filter(AnomalyInsight.topic.is_(None))
+
+                        cached = query.first()
+
+                        if cached:
+                            llm_insight = {
+                                "analysis": cached.analysis,
+                                "recommendation": cached.recommendation
+                            }
+                        # Note: If not cached, insight was generated when job completed
+                        # No queueing here - anomaly detection runs automatically on job completion
+
+                        anomalies.append({
+                            "date": point["date"],
+                            "type": point["anomaly_type"],
+                            "magnitude": magnitude,
+                            "reason": reason,
+                            "llm_insight": llm_insight,  # Will be null if not yet generated
+                            "review_ids": review_id_list
+                        })
+
+        # Remove reviews from response (too large) and prepare final data
+        final_data = []
+        for point in trend_data:
+            final_data.append({
+                "date": point["date"],
+                "label": point["label"],
+                "positive": point["positive"],
+                "negative": point["negative"],
+                "neutral": point["neutral"],
+                "total": point["total"],
+                "positive_pct": point["positive_pct"],
+                "is_anomaly": point.get("is_anomaly", False),
+                "anomaly_type": point.get("anomaly_type"),
+                "anomaly_reason": point.get("anomaly_reason"),
+            })
+
+        return {
+            "data": final_data,
+            "anomalies": anomalies,
+            "topics_in_period": sorted(list(topics_in_period)),
+            "baseline": baseline
+        }
+    finally:
+        session.close()
+
+
+@app.get("/api/sentiment-trend/{date}/reviews")
+async def get_date_reviews(
+    date: str,
+    topic: Optional[str] = None,
+    sentiment: Optional[str] = None,
+    place_id: Optional[str] = None,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Get reviews for a specific date/period with optional filters.
+
+    Parameters:
+    - date: Date in various formats:
+        - YYYY-MM-DD for specific day
+        - YYYY-MM for month
+        - YYYY-Wxx for week
+        - YYYY for year
+    - topic: Filter by topic
+    - sentiment: Filter by sentiment (positive, negative, neutral)
+    - place_id: Filter by place
+    """
+    from datetime import datetime, timedelta
+
+    session = get_session()
+    try:
+        # Parse the date - support multiple formats based on zoom level
+        date_filter_type = None
+        target_year = None
+        target_month = None
+        target_week = None
+        target_date = None
+
+        if len(date) == 10 and date[4] == '-' and date[7] == '-':
+            # YYYY-MM-DD format (day zoom)
+            try:
+                target_date = datetime.strptime(date, "%Y-%m-%d").date()
+                date_filter_type = "day"
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid date format")
+        elif len(date) == 7 and date[4] == '-':
+            # YYYY-MM format (month zoom)
+            try:
+                target_year = int(date[:4])
+                target_month = int(date[5:7])
+                date_filter_type = "month"
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid month format. Use YYYY-MM")
+        elif 'W' in date.upper():
+            # YYYY-Wxx format (week zoom)
+            try:
+                parts = date.upper().split('-W')
+                target_year = int(parts[0])
+                target_week = int(parts[1])
+                date_filter_type = "week"
+            except (ValueError, IndexError):
+                raise HTTPException(status_code=400, detail="Invalid week format. Use YYYY-Wxx")
+        elif len(date) == 4:
+            # YYYY format (year zoom)
+            try:
+                target_year = int(date)
+                date_filter_type = "year"
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid year format. Use YYYY")
+        else:
+            raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD, YYYY-MM, YYYY-Wxx, or YYYY")
+
+        # Get user's places
+        user_jobs = session.query(ScrapeJob).filter(ScrapeJob.user_id == current_user.id).all()
+        user_place_ids = []
+        for job in user_jobs:
+            if job.pipeline_job_ids:
+                pipeline_jobs = session.query(Job).filter(Job.id.in_(job.pipeline_job_ids)).all()
+                user_place_ids.extend([pj.place_id for pj in pipeline_jobs if pj.place_id])
+        user_place_ids = list(set(user_place_ids))
+
+        if place_id:
+            if place_id not in [str(pid) for pid in user_place_ids]:
+                raise HTTPException(status_code=404, detail="Place not found or not accessible")
+            user_place_ids = [place_id]
+
+        if not user_place_ids:
+            return {"reviews": [], "total": 0}
+
+        # Get reviews
+        reviews = session.query(Review).filter(Review.place_id.in_(user_place_ids)).all()
+        review_ids = [r.id for r in reviews]
+
+        if not review_ids:
+            return {"reviews": [], "total": 0}
+
+        # Get analyses
+        analyses = session.query(ReviewAnalysis).filter(ReviewAnalysis.review_id.in_(review_ids)).all()
+        analysis_map = {a.review_id: a for a in analyses}
+
+        # Parse date helper
+        def parse_review_date(date_str):
+            if not date_str:
+                return None
+            try:
+                parts = date_str.split('-')
+                if len(parts) == 3:
+                    return datetime(int(parts[0]), int(parts[1]), int(parts[2])).date()
+            except:
+                pass
+            return None
+
+        # Date matching helper based on filter type
+        def matches_date_filter(review_date):
+            if review_date is None:
+                return False
+            if date_filter_type == "day":
+                return review_date == target_date
+            elif date_filter_type == "month":
+                return review_date.year == target_year and review_date.month == target_month
+            elif date_filter_type == "week":
+                review_iso = review_date.isocalendar()
+                return review_iso[0] == target_year and review_iso[1] == target_week
+            elif date_filter_type == "year":
+                return review_date.year == target_year
+            return False
+
+        # Filter and build response
+        result_reviews = []
+        for r in reviews:
+            review_date = parse_review_date(r.review_date)
+            if not matches_date_filter(review_date):
+                continue
+
+            analysis = analysis_map.get(r.id)
+            if not analysis:
+                continue
+
+            # Filter by sentiment
+            if sentiment and analysis.sentiment != sentiment:
+                continue
+
+            # Filter by topic
+            topics_pos = analysis.topics_positive or []
+            topics_neg = analysis.topics_negative or []
+            all_topics = set(topics_pos + topics_neg)
+
+            if topic and topic not in all_topics:
+                continue
+
+            # Get place name
+            place = session.query(Place).filter(Place.id == r.place_id).first()
+            place_name = place.name if place else "Unknown"
+
+            result_reviews.append({
+                "id": str(r.id),
+                "text": r.text,
+                "rating": r.rating,
+                "author": r.author,
+                "date": r.review_date,
+                "place_name": place_name,
+                "sentiment": analysis.sentiment,
+                "score": float(analysis.score) if analysis.score else None,
+                "topics_positive": topics_pos,
+                "topics_negative": topics_neg,
+                "summary_en": analysis.summary_en,
+                "summary_ar": analysis.summary_ar,
+                "suggested_reply_ar": analysis.suggested_reply_ar,
+                "urgent": analysis.urgent,
+            })
+
+        # Sort by date (newest first), then by rating
+        result_reviews.sort(key=lambda x: (x.get("date") or "", -(x.get("rating") or 0)), reverse=True)
+
+        # Limit results to prevent huge responses (keep first 100)
+        total_count = len(result_reviews)
+        result_reviews = result_reviews[:100]
+
+        return {
+            "reviews": result_reviews,
+            "total": total_count,
+            "returned": len(result_reviews),
+            "date": date,
+            "date_type": date_filter_type,
+            "filters": {
+                "topic": topic,
+                "sentiment": sentiment,
+                "place_id": place_id
             }
         }
     finally:

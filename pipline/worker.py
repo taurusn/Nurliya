@@ -11,9 +11,9 @@ from datetime import datetime
 from sqlalchemy import text
 
 from logging_config import get_logger
-from rabbitmq import get_consumer_channel, QUEUE_NAME
-from llm_client import analyze_review
-from database import Review, ReviewAnalysis, Job, ScrapeJob, Place, get_session
+from rabbitmq import get_consumer_channel, QUEUE_NAME, ANOMALY_QUEUE_NAME
+from llm_client import analyze_review, generate_anomaly_insight
+from database import Review, ReviewAnalysis, Job, ScrapeJob, Place, AnomalyInsight, get_session
 from email_service import send_completion_report, gather_scrape_job_stats
 from activity_logger import (
     log_review_analyzed, log_job_completed, log_worker_started,
@@ -34,6 +34,187 @@ def signal_handler(signum, frame):
 
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
+
+
+def detect_and_queue_anomalies(job_id: str):
+    """
+    Detect sentiment anomalies for a completed job's place and queue LLM insight generation.
+    Called automatically when a job completes.
+    """
+    import statistics
+    from collections import defaultdict
+    from rabbitmq import get_channel
+
+    session = get_session()
+    try:
+        # Get the job and place
+        job = session.query(Job).filter_by(id=job_id).first()
+        if not job or not job.place_id:
+            return
+
+        place_id = job.place_id
+
+        # Get all reviews for this place with analyses
+        reviews = session.query(Review).filter_by(place_id=place_id).all()
+        if not reviews:
+            return
+
+        review_ids = [r.id for r in reviews]
+        analyses = session.query(ReviewAnalysis).filter(ReviewAnalysis.review_id.in_(review_ids)).all()
+        analysis_map = {a.review_id: a for a in analyses}
+
+        # Parse review dates
+        def parse_review_date(date_str):
+            if not date_str:
+                return None
+            try:
+                parts = date_str.split('-')
+                if len(parts) == 3:
+                    return datetime(int(parts[0]), int(parts[1]), int(parts[2])).date()
+            except:
+                pass
+            return None
+
+        # Build daily aggregation for ALL historical data
+        daily_data = defaultdict(lambda: {"positive": 0, "negative": 0, "neutral": 0, "total": 0, "reviews": []})
+
+        for r in reviews:
+            review_date = parse_review_date(r.review_date)
+            analysis = analysis_map.get(r.id)
+            if not review_date or not analysis:
+                continue
+
+            date_key = review_date.isoformat()
+            daily_data[date_key]["total"] += 1
+            daily_data[date_key]["reviews"].append({
+                "id": str(r.id),
+                "text": r.text[:200] if r.text else "",
+                "rating": r.rating,
+                "sentiment": analysis.sentiment,
+                "topics_positive": analysis.topics_positive or [],
+                "topics_negative": analysis.topics_negative or [],
+            })
+
+            if analysis.sentiment == "positive":
+                daily_data[date_key]["positive"] += 1
+            elif analysis.sentiment == "negative":
+                daily_data[date_key]["negative"] += 1
+            else:
+                daily_data[date_key]["neutral"] += 1
+
+        if not daily_data:
+            return
+
+        # Calculate positive percentages
+        trend_data = []
+        for date_key, data in sorted(daily_data.items()):
+            if data["total"] > 0:
+                positive_pct = round(data["positive"] / data["total"] * 100)
+                trend_data.append({
+                    "date": date_key,
+                    "positive_pct": positive_pct,
+                    "total": data["total"],
+                    "reviews": data["reviews"],
+                    "positive": data["positive"],
+                    "negative": data["negative"],
+                })
+
+        if len(trend_data) < 3:
+            return
+
+        # Statistical anomaly detection (2σ)
+        positive_pcts = [p["positive_pct"] for p in trend_data]
+        mean_pct = statistics.mean(positive_pcts)
+        try:
+            std_pct = statistics.stdev(positive_pcts)
+        except statistics.StatisticsError:
+            return
+
+        if std_pct == 0:
+            return
+
+        # Find anomalies and queue insight generation
+        channel = None
+        for point in trend_data:
+            z_score = (point["positive_pct"] - mean_pct) / std_pct
+
+            if abs(z_score) > 2:
+                anomaly_type = "spike" if z_score > 0 else "drop"
+                magnitude = round(point["positive_pct"] - mean_pct, 1)
+
+                # Check if insight already exists
+                existing = session.query(AnomalyInsight).filter(
+                    AnomalyInsight.date == point["date"],
+                    AnomalyInsight.place_id == place_id,
+                    AnomalyInsight.topic.is_(None)
+                ).first()
+
+                if existing:
+                    continue
+
+                # Build context for LLM
+                topic_counts = defaultdict(lambda: {"positive": 0, "negative": 0})
+                for rd in point["reviews"]:
+                    for t in rd.get("topics_positive", []):
+                        topic_counts[t]["positive"] += 1
+                    for t in rd.get("topics_negative", []):
+                        topic_counts[t]["negative"] += 1
+
+                topic_comp = "\n".join([
+                    f"- {t}: +{c['positive']} positive, -{c['negative']} negative"
+                    for t, c in sorted(topic_counts.items(), key=lambda x: -(x[1]['positive'] + x[1]['negative']))[:5]
+                ]) or "No specific topics identified"
+
+                reviews_summary = "\n".join([
+                    f"- [{rd['sentiment']}] \"{rd['text'][:100]}...\" (Rating: {rd.get('rating', 'N/A')})"
+                    for rd in point["reviews"][:5]
+                ]) or "No reviews available"
+
+                # Generate reason
+                reason_parts = []
+                if anomaly_type == "drop":
+                    neg_topics = sorted(topic_counts.items(), key=lambda x: -x[1]["negative"])
+                    if neg_topics and neg_topics[0][1]["negative"] > 0:
+                        reason_parts.append(f"'{neg_topics[0][0]}' complaints: {neg_topics[0][1]['negative']}")
+                else:
+                    pos_topics = sorted(topic_counts.items(), key=lambda x: -x[1]["positive"])
+                    if pos_topics and pos_topics[0][1]["positive"] > 0:
+                        reason_parts.append(f"'{pos_topics[0][0]}' praised: {pos_topics[0][1]['positive']}x")
+
+                reason = f"Sentiment {'dropped' if anomaly_type == 'drop' else 'spiked'} {abs(magnitude):.0f}%"
+                if reason_parts:
+                    reason += f" - {', '.join(reason_parts)}"
+
+                # Queue for LLM processing
+                task_data = {
+                    "type": "anomaly_insight",
+                    "date": point["date"],
+                    "place_id": str(place_id),
+                    "topic": None,
+                    "anomaly_type": anomaly_type,
+                    "magnitude": magnitude,
+                    "reason": reason,
+                    "topic_comparison": topic_comp,
+                    "reviews_summary": reviews_summary,
+                    "review_ids": [rd["id"] for rd in point["reviews"]]
+                }
+
+                try:
+                    if channel is None:
+                        channel = get_channel()
+                    channel.basic_publish(
+                        exchange='',
+                        routing_key='anomaly_insights',
+                        body=json.dumps(task_data)
+                    )
+                    logger.info(f"Queued anomaly insight for {point['date']}", extra={"extra_data": {"place_id": str(place_id), "type": anomaly_type}})
+                except Exception as e:
+                    logger.warning(f"Failed to queue anomaly insight: {e}")
+
+    except Exception as e:
+        logger.error(f"Error detecting anomalies for job {job_id}: {e}", exc_info=True)
+    finally:
+        session.close()
 
 
 def update_job_progress(job_id: str):
@@ -71,8 +252,9 @@ def update_job_progress(job_id: str):
     if job_completed and place_name:
         log_job_completed(job_id, place_name, total_reviews)
 
-    # If this job just completed, check if the parent scrape job is done
+    # If this job just completed, run anomaly detection for this place
     if job_completed:
+        detect_and_queue_anomalies(job_id)
         check_and_send_scrape_job_report(job_id)
 
 
@@ -313,6 +495,83 @@ def process_message(ch, method, properties, body):
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
 
+def process_anomaly_insight(ch, method, properties, body):
+    """Process an anomaly insight generation request."""
+    try:
+        message = json.loads(body)
+
+        date = message["date"]
+        place_id = message.get("place_id")
+        topic = message.get("topic")
+        anomaly_type = message["anomaly_type"]
+        magnitude = message["magnitude"]
+        reason = message["reason"]
+        topic_comparison = message["topic_comparison"]
+        reviews_summary = message["reviews_summary"]
+        review_ids = message.get("review_ids", [])
+
+        logger.info(f"Generating anomaly insight for {date}", extra={"extra_data": {"date": date, "type": anomaly_type}})
+
+        session = get_session()
+        try:
+            # Check if already exists (avoid duplicates)
+            existing = session.query(AnomalyInsight).filter(
+                AnomalyInsight.date == date,
+                AnomalyInsight.place_id == place_id if place_id else AnomalyInsight.place_id.is_(None),
+                AnomalyInsight.topic == topic if topic else AnomalyInsight.topic.is_(None)
+            ).first()
+
+            if existing:
+                logger.debug(f"Anomaly insight already exists for {date}, skipping")
+                ch.basic_ack(delivery_tag=method.delivery_tag)
+                return
+
+            # Generate LLM insight
+            insight = generate_anomaly_insight(
+                anomaly_date=date,
+                anomaly_type=anomaly_type,
+                magnitude=magnitude,
+                topic_comparison=topic_comparison,
+                reviews_summary=reviews_summary
+            )
+
+            # Convert review_ids to UUIDs
+            import uuid
+            review_uuid_list = []
+            for rid in review_ids:
+                try:
+                    review_uuid_list.append(uuid.UUID(rid) if isinstance(rid, str) else rid)
+                except:
+                    pass
+
+            # Save to database
+            anomaly_insight = AnomalyInsight(
+                place_id=uuid.UUID(place_id) if place_id else None,
+                date=date,
+                topic=topic,
+                anomaly_type=anomaly_type,
+                magnitude=magnitude,
+                reason=reason,
+                analysis=insight.get("analysis"),
+                recommendation=insight.get("recommendation"),
+                review_ids=review_uuid_list if review_uuid_list else None
+            )
+            session.add(anomaly_insight)
+            session.commit()
+
+            logger.info(f"Anomaly insight saved for {date}", extra={"extra_data": {"date": date}})
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+
+        finally:
+            session.close()
+
+    except Exception as e:
+        logger.error(f"Error processing anomaly insight: {e}", exc_info=True)
+        # Requeue for retry
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+        time.sleep(5)
+
+
 def run_worker():
     """Start consuming messages from queue."""
     global shutdown_requested
@@ -320,11 +579,12 @@ def run_worker():
     logger.info("Connecting to RabbitMQ...")
     connection, channel = get_consumer_channel()
 
-    logger.info(f"Worker started, listening on queue '{QUEUE_NAME}'")
+    logger.info(f"Worker started, listening on queues: '{QUEUE_NAME}', '{ANOMALY_QUEUE_NAME}'")
     log_worker_started()
 
-    # Set up consumer
+    # Set up consumers for both queues
     channel.basic_consume(queue=QUEUE_NAME, on_message_callback=process_message)
+    channel.basic_consume(queue=ANOMALY_QUEUE_NAME, on_message_callback=process_anomaly_insight)
 
     try:
         while not shutdown_requested:

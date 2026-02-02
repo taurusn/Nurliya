@@ -13,7 +13,11 @@
     "react": "^18",
     "react-dom": "^18",
     "swr": "^2.2.5",
-    "lucide-react": "^0.460.0"
+    "lucide-react": "^0.460.0",
+    "class-variance-authority": "^0.7.0",
+    "clsx": "^2.1.1",
+    "tailwind-merge": "^2.5.4",
+    "tailwindcss-animate": "^1.0.7"
   },
   "devDependencies": {
     "@types/node": "^20",

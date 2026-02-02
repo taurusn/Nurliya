@@ -3,20 +3,134 @@
 import { useEffect, useState } from 'react'
 import { AuthGuard } from '@/components/AuthGuard'
 import { useAuth } from '@/lib/auth'
-import { fetchOverview, fetchJobs, startScrape, OverviewData } from '@/lib/api'
+import {
+  fetchOverview,
+  fetchJobs,
+  startScrape,
+  fetchSentimentTrend,
+  fetchPlaces,
+  fetchDateReviews,
+  OverviewData,
+  TrendPeriod,
+  ZoomLevel,
+  TrendDataPoint,
+  TrendResponse,
+  Anomaly,
+  DateReview,
+  Place
+} from '@/lib/api'
+import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Badge } from '@/components/ui/badge'
+import {
+  Star,
+  TrendingUp,
+  MessageSquare,
+  AlertTriangle,
+  Clock,
+  BarChart3,
+  ThumbsUp,
+  ThumbsDown,
+  Bell,
+  Briefcase,
+  PieChart,
+  Search,
+  LogOut,
+  MapPin,
+  ChevronDown,
+  Loader2,
+  CheckCircle2,
+  XCircle,
+  Zap,
+  Cog,
+  ArrowLeft,
+  Lightbulb,
+  Filter,
+  Calendar,
+} from 'lucide-react'
+
+const ZOOM_LEVELS: { value: ZoomLevel; label: string }[] = [
+  { value: 'day', label: 'Days' },
+  { value: 'week', label: 'Weeks' },
+  { value: 'month', label: 'Months' },
+  { value: 'year', label: 'Years' },
+]
+
+// Format date string based on its format (handles day, week, month, year)
+function formatDateLabel(dateStr: string): string {
+  if (!dateStr) return ''
+
+  // Year format: 2025
+  if (/^\d{4}$/.test(dateStr)) {
+    return dateStr
+  }
+
+  // Month format: 2025-01
+  if (/^\d{4}-\d{2}$/.test(dateStr)) {
+    const [year, month] = dateStr.split('-')
+    const date = new Date(parseInt(year), parseInt(month) - 1, 1)
+    return date.toLocaleDateString('en-US', { year: 'numeric', month: 'long' })
+  }
+
+  // Week format: 2025-W01
+  if (/^\d{4}-W\d{2}$/i.test(dateStr)) {
+    const [year, week] = dateStr.toUpperCase().split('-W')
+    return `Week ${parseInt(week)}, ${year}`
+  }
+
+  // Day format: 2025-01-15
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+    const date = new Date(dateStr + 'T00:00:00')
+    return date.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
+  }
+
+  return dateStr
+}
 
 function OverviewContent() {
   const { user, logout } = useAuth()
   const [overview, setOverview] = useState<OverviewData | null>(null)
   const [jobs, setJobs] = useState<any[]>([])
+  const [places, setPlaces] = useState<Place[]>([])
+  const [selectedPlace, setSelectedPlace] = useState<string | null>(null)
+  const [placesDropdownOpen, setPlacesDropdownOpen] = useState(false)
   const [loading, setLoading] = useState(true)
   const [query, setQuery] = useState('')
   const [scraping, setScraping] = useState(false)
+  const [zoomLevel, setZoomLevel] = useState<ZoomLevel>('day')
+  const [trendPeriod, setTrendPeriod] = useState<TrendPeriod>('30d')
+  const [trendData, setTrendData] = useState<TrendDataPoint[]>([])
+  const [trendLoading, setTrendLoading] = useState(false)
+  const [trendAnomalies, setTrendAnomalies] = useState<Anomaly[]>([])
+  const [topicsInPeriod, setTopicsInPeriod] = useState<string[]>([])
+  const [selectedTopic, setSelectedTopic] = useState<string | null>(null)
+  const [trendBaseline, setTrendBaseline] = useState<{ avg_positive_pct: number; avg_daily_reviews: number } | null>(null)
 
-  const loadData = async () => {
+  // Drill-down state
+  const [drillDownDate, setDrillDownDate] = useState<string | null>(null)
+  const [drillDownReviews, setDrillDownReviews] = useState<DateReview[]>([])
+  const [drillDownLoading, setDrillDownLoading] = useState(false)
+  const [drillDownSentimentFilter, setDrillDownSentimentFilter] = useState<string | null>(null)
+  const [topicDropdownOpen, setTopicDropdownOpen] = useState(false)
+
+  // Custom date range
+  const [customStartDate, setCustomStartDate] = useState<string>('')
+  const [customEndDate, setCustomEndDate] = useState<string>('')
+
+  const loadPlaces = async () => {
+    try {
+      const data = await fetchPlaces(100)
+      setPlaces(data.places || [])
+    } catch (error) {
+      console.error('Failed to load places:', error)
+    }
+  }
+
+  const loadData = async (placeId?: string | null) => {
     try {
       const [overviewData, jobsData] = await Promise.all([
-        fetchOverview().catch(() => null),
+        fetchOverview(placeId || undefined).catch(() => null),
         fetchJobs(5).catch(() => ({ jobs: [] })),
       ])
       if (overviewData) setOverview(overviewData)
@@ -28,11 +142,103 @@ function OverviewContent() {
     }
   }
 
+  const loadTrend = async (period: TrendPeriod, zoom: ZoomLevel, placeId?: string | null, topic?: string | null) => {
+    setTrendLoading(true)
+    try {
+      const response = await fetchSentimentTrend({
+        period,
+        zoom,
+        place_id: placeId || undefined,
+        topic: topic || undefined,
+        start_date: period === 'custom' ? customStartDate : undefined,
+        end_date: period === 'custom' ? customEndDate : undefined,
+      })
+      setTrendData(response.data)
+      setTrendAnomalies(response.anomalies)
+      setTopicsInPeriod(response.topics_in_period)
+      setTrendBaseline(response.baseline)
+    } catch (error) {
+      console.error('Failed to load trend:', error)
+      setTrendData([])
+      setTrendAnomalies([])
+    } finally {
+      setTrendLoading(false)
+    }
+  }
+
+  const loadDrillDownReviews = async (date: string, sentimentFilter?: string | null) => {
+    setDrillDownLoading(true)
+    try {
+      const response = await fetchDateReviews(date, {
+        sentiment: sentimentFilter || undefined,
+        topic: selectedTopic || undefined,
+        place_id: selectedPlace || undefined,
+      })
+      setDrillDownReviews(response.reviews)
+    } catch (error) {
+      console.error('Failed to load reviews:', error)
+      setDrillDownReviews([])
+    } finally {
+      setDrillDownLoading(false)
+    }
+  }
+
+  const handleBarClick = (point: TrendDataPoint) => {
+    if (point.total === 0) return
+    setDrillDownDate(point.date)
+    setDrillDownSentimentFilter(null)
+    loadDrillDownReviews(point.date)
+  }
+
+  const handleBackToChart = () => {
+    setDrillDownDate(null)
+    setDrillDownReviews([])
+    setDrillDownSentimentFilter(null)
+  }
+
+  const handleSentimentFilterChange = (sentiment: string | null) => {
+    setDrillDownSentimentFilter(sentiment)
+    if (drillDownDate) {
+      loadDrillDownReviews(drillDownDate, sentiment)
+    }
+  }
+
+  const getAnomalyForDate = (date: string): Anomaly | undefined => {
+    return trendAnomalies.find(a => a.date === date)
+  }
+
   useEffect(() => {
-    loadData()
-    const interval = setInterval(loadData, 10000)
+    loadPlaces()
+    loadData(selectedPlace)
+    loadTrend(trendPeriod, zoomLevel, selectedPlace)
+    const interval = setInterval(() => {
+      loadData(selectedPlace)
+      loadPlaces()
+    }, 10000)
     return () => clearInterval(interval)
   }, [])
+
+  useEffect(() => {
+    loadTrend(trendPeriod, zoomLevel, selectedPlace, selectedTopic)
+  }, [trendPeriod, zoomLevel, selectedTopic])
+
+  // When place selection changes, reload all data
+  useEffect(() => {
+    loadData(selectedPlace)
+    loadTrend(trendPeriod, zoomLevel, selectedPlace, selectedTopic)
+    // Reset drill-down when place changes
+    setDrillDownDate(null)
+    setDrillDownReviews([])
+  }, [selectedPlace])
+
+  const handlePlaceSelect = (placeId: string | null) => {
+    setSelectedPlace(placeId)
+    setPlacesDropdownOpen(false)
+  }
+
+  const selectedPlaceName = selectedPlace
+    ? places.find(p => p.id === selectedPlace)?.name || 'Selected Place'
+    : 'All Places'
 
   const handleStartScrape = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -41,7 +247,8 @@ function OverviewContent() {
     try {
       await startScrape(query, user?.email)
       setQuery('')
-      loadData()
+      loadData(selectedPlace)
+      loadPlaces() // Reload places to show the new place
     } catch (error) {
       console.error('Failed to start scrape:', error)
     } finally {
@@ -51,8 +258,8 @@ function OverviewContent() {
 
   if (loading) {
     return (
-      <div className="min-h-screen bg-zinc-950 flex items-center justify-center">
-        <div className="animate-spin w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full" />
+      <div className="min-h-screen bg-background flex items-center justify-center">
+        <Loader2 className="w-8 h-8 text-primary animate-spin" />
       </div>
     )
   }
@@ -66,311 +273,655 @@ function OverviewContent() {
   }
 
   return (
-    <div className="min-h-screen bg-zinc-950">
+    <div className="min-h-screen bg-background">
       {/* Top Navigation */}
-      <nav className="bg-zinc-900 border-b border-zinc-800 px-6 py-3 flex items-center justify-between sticky top-0 z-50">
-        <div className="flex items-center gap-4">
-          <div className="flex items-center gap-2">
-            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
-              <span className="text-sm font-bold text-white">N</span>
+      <nav className="bg-card border-b border-border px-4 sm:px-6 py-3 sticky top-0 z-50">
+        <div className="max-w-7xl mx-auto flex items-center justify-between">
+          <div className="flex items-center gap-2 sm:gap-4">
+            <div className="flex items-center gap-2">
+              <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-primary to-blue-700 flex items-center justify-center">
+                <span className="text-sm font-bold text-white">N</span>
+              </div>
+              <span className="text-lg sm:text-xl font-bold text-foreground hidden sm:inline">NURLIYA</span>
             </div>
-            <span className="text-xl font-bold text-white">NURLIYA</span>
+            <div className="relative">
+              <button
+                onClick={() => setPlacesDropdownOpen(!placesDropdownOpen)}
+                className="flex items-center gap-2 bg-card-hover px-3 py-1.5 rounded-lg border border-border hover:border-muted transition-colors"
+              >
+                <MapPin className="w-4 h-4 text-muted" />
+                <span className="text-sm text-foreground hidden sm:inline truncate max-w-[120px]">{selectedPlaceName}</span>
+                <span className="text-sm text-foreground sm:hidden">{places.length}</span>
+                <ChevronDown className={`w-4 h-4 text-muted transition-transform ${placesDropdownOpen ? 'rotate-180' : ''}`} />
+              </button>
+              {placesDropdownOpen && (
+                <>
+                  {/* Backdrop */}
+                  <div
+                    className="fixed inset-0 z-40"
+                    onClick={() => setPlacesDropdownOpen(false)}
+                  />
+                  {/* Dropdown */}
+                  <div className="absolute top-full left-0 mt-1 w-64 max-h-80 overflow-y-auto bg-card border border-border rounded-lg shadow-lg z-50">
+                    <button
+                      onClick={() => handlePlaceSelect(null)}
+                      className={`w-full text-left px-3 py-2 text-sm hover:bg-card-hover transition-colors ${
+                        selectedPlace === null ? 'bg-primary/10 text-primary font-medium' : 'text-foreground'
+                      }`}
+                    >
+                      All Places ({places.length})
+                    </button>
+                    <div className="border-t border-border" />
+                    {places.length === 0 ? (
+                      <div className="px-3 py-2 text-sm text-muted">No places yet</div>
+                    ) : (
+                      places.map((place) => (
+                        <button
+                          key={place.id}
+                          onClick={() => handlePlaceSelect(place.id)}
+                          className={`w-full text-left px-3 py-2 text-sm hover:bg-card-hover transition-colors ${
+                            selectedPlace === place.id ? 'bg-primary/10 text-primary font-medium' : 'text-foreground'
+                          }`}
+                        >
+                          <div className="truncate">{place.name}</div>
+                          <div className="text-xs text-muted">
+                            {place.review_count} reviews | {place.analyzed_count} analyzed
+                          </div>
+                        </button>
+                      ))
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
           </div>
-          <div className="flex items-center gap-2 bg-zinc-800 px-3 py-1.5 rounded-lg">
-            <span className="text-sm text-zinc-300">{overview?.places_count || 0} Places</span>
-            <span className="text-zinc-500">▼</span>
+
+          <div className="flex items-center gap-2 sm:gap-4">
+            <div className="hidden md:flex items-center bg-card-hover border border-border px-3 py-1.5 rounded-lg">
+              <Search className="w-4 h-4 text-muted mr-2" />
+              <input
+                type="text"
+                placeholder="Search reviews..."
+                className="bg-transparent text-sm outline-none w-40 text-foreground placeholder-muted"
+              />
+            </div>
+            <span className="text-sm text-muted hidden sm:inline">{user?.name}</span>
+            <Button variant="ghost" size="sm" onClick={logout} className="text-muted hover:text-destructive">
+              <LogOut className="w-4 h-4" />
+              <span className="ml-2 hidden sm:inline">Logout</span>
+            </Button>
           </div>
-        </div>
-        <div className="flex items-center gap-4">
-          <div className="flex items-center bg-zinc-800 px-3 py-1.5 rounded-lg">
-            <span className="text-zinc-500 mr-2">🔍</span>
-            <input type="text" placeholder="Search reviews..." className="bg-transparent text-sm outline-none w-40 text-zinc-300 placeholder-zinc-500" />
-          </div>
-          <span className="text-sm text-zinc-400">{user?.name}</span>
-          <button onClick={logout} className="text-sm text-red-400 hover:text-red-300">Logout</button>
         </div>
       </nav>
 
-      {/* Hero Section */}
-      <div className="bg-zinc-900 border-b border-zinc-800 px-6 py-6">
+      {/* Metrics Bar - Compact */}
+      <div className="bg-card border-b border-border px-4 sm:px-6 py-3">
         <div className="max-w-7xl mx-auto">
-          {/* Metrics Row */}
-          <div className="grid grid-cols-5 gap-4 mb-6">
-            <div className="text-center">
-              <div className="text-3xl font-bold text-white">
-                {metrics.average_rating?.toFixed(1) || '—'} <span className="text-yellow-500">★</span>
-              </div>
-              <div className="text-sm text-zinc-500">Rating</div>
-              <div className="text-xs text-zinc-600">avg across places</div>
+          <div className="flex flex-wrap items-center gap-3 sm:gap-6">
+            {/* Metrics - Inline */}
+            <div className="flex items-center gap-2">
+              <Star className="w-4 h-4 text-yellow-500" />
+              <span className="text-lg font-bold text-foreground">{metrics.average_rating?.toFixed(1) || '—'}</span>
+              <span className="text-xs text-muted hidden sm:inline">rating</span>
             </div>
-            <div className="text-center">
-              <div className={`text-3xl font-bold ${metrics.positive_percentage >= 70 ? 'text-emerald-500' : metrics.positive_percentage >= 50 ? 'text-amber-500' : 'text-red-500'}`}>
-                {metrics.positive_percentage}%
-              </div>
-              <div className="text-sm text-zinc-500">Positive</div>
-              <div className="text-xs text-zinc-600">sentiment</div>
+            <div className="w-px h-6 bg-border hidden sm:block" />
+            <div className="flex items-center gap-2">
+              <TrendingUp className={`w-4 h-4 ${metrics.positive_percentage >= 70 ? 'text-success' : metrics.positive_percentage >= 50 ? 'text-warning' : 'text-destructive'}`} />
+              <span className={`text-lg font-bold ${metrics.positive_percentage >= 70 ? 'text-success' : metrics.positive_percentage >= 50 ? 'text-warning' : 'text-destructive'}`}>{metrics.positive_percentage}%</span>
+              <span className="text-xs text-muted hidden sm:inline">positive</span>
             </div>
-            <div className="text-center">
-              <div className="text-3xl font-bold text-white">{metrics.reviews_count}</div>
-              <div className="text-sm text-zinc-500">Reviews</div>
-              <div className="text-xs text-zinc-600">total</div>
+            <div className="w-px h-6 bg-border hidden sm:block" />
+            <div className="flex items-center gap-2">
+              <MessageSquare className="w-4 h-4 text-primary" />
+              <span className="text-lg font-bold text-foreground">{metrics.reviews_count.toLocaleString()}</span>
+              <span className="text-xs text-muted hidden sm:inline">reviews</span>
             </div>
-            <div className="text-center">
-              <div className={`text-3xl font-bold ${metrics.urgent_count > 0 ? 'text-red-500' : 'text-zinc-600'}`}>
-                {metrics.urgent_count}
-              </div>
-              <div className="text-sm text-zinc-500">Urgent</div>
-              <div className="text-xs text-red-500 font-medium">{metrics.urgent_count > 0 ? 'needs attention' : 'all good'}</div>
-            </div>
-            <div className="text-center">
-              <div className={`text-3xl font-bold ${metrics.pending_analyses > 0 ? 'text-blue-500' : 'text-zinc-600'}`}>
-                {metrics.pending_analyses}
-              </div>
-              <div className="text-sm text-zinc-500">Pending</div>
-              <div className="text-xs text-blue-500 font-medium">analyses</div>
-            </div>
-          </div>
+            {metrics.urgent_count > 0 && (
+              <>
+                <div className="w-px h-6 bg-border hidden sm:block" />
+                <div className="flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 text-destructive" />
+                  <span className="text-lg font-bold text-destructive">{metrics.urgent_count}</span>
+                  <span className="text-xs text-muted hidden sm:inline">urgent</span>
+                </div>
+              </>
+            )}
+            {metrics.pending_analyses > 0 && (
+              <>
+                <div className="w-px h-6 bg-border hidden sm:block" />
+                <div className="flex items-center gap-2">
+                  <Clock className="w-4 h-4 text-warning" />
+                  <span className="text-lg font-bold text-warning">{metrics.pending_analyses}</span>
+                  <span className="text-xs text-muted hidden sm:inline">pending</span>
+                </div>
+              </>
+            )}
 
-          {/* AI Summary Box */}
-          <div className="bg-gradient-to-r from-blue-900/30 to-indigo-900/30 border border-blue-800/50 rounded-xl p-4">
-            <div className="flex items-start gap-3">
-              <div className="text-2xl">🤖</div>
-              <div className="flex-1">
-                <p className="text-zinc-300">
-                  {metrics.reviews_count === 0 ? (
-                    <>
-                      <span className="font-semibold text-white">Getting started</span> — Start by creating a scrape job below to analyze reviews from Google Maps.
-                    </>
-                  ) : (
-                    <>
-                      <span className="font-semibold text-white">
-                        {metrics.positive_percentage >= 70 ? 'Great performance' : metrics.positive_percentage >= 50 ? 'Room for improvement' : 'Needs attention'}
-                      </span> — You have {metrics.reviews_count} reviews across {overview?.places_count || 0} places with {metrics.positive_percentage}% positive sentiment.
-                      {metrics.urgent_count > 0 && (
-                        <span className="text-red-400"> {metrics.urgent_count} urgent items need your attention.</span>
-                      )}
-                      {metrics.pending_analyses > 0 && (
-                        <span className="text-amber-400"> {metrics.pending_analyses} reviews pending analysis.</span>
-                      )}
-                      {overview?.whats_hot?.[0] && (
-                        <span className="text-emerald-400"> Top strength: {overview.whats_hot[0].item}.</span>
-                      )}
-                    </>
-                  )}
-                </p>
-              </div>
-            </div>
           </div>
         </div>
       </div>
 
       {/* New Scrape Form */}
-      <div className="bg-zinc-900/50 border-b border-zinc-800 px-6 py-4">
+      <div className="bg-card/50 border-b border-border px-4 sm:px-6 py-4">
         <div className="max-w-7xl mx-auto">
-          <form onSubmit={handleStartScrape} className="flex gap-3">
-            <input
+          <form onSubmit={handleStartScrape} className="flex flex-col sm:flex-row gap-3">
+            <Input
               type="text"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search query (e.g., 'coffee shops in Riyadh')"
-              className="flex-1 px-4 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-blue-500 placeholder-zinc-500"
+              placeholder="Search or paste Google Maps URL"
+              className="flex-1"
             />
-            <button
-              type="submit"
-              disabled={scraping || !query.trim()}
-              className="px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg disabled:opacity-50"
-            >
-              {scraping ? 'Starting...' : 'Start Scrape'}
-            </button>
+            <Button type="submit" disabled={scraping || !query.trim()} className="w-full sm:w-auto">
+              {scraping ? (
+                <>
+                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                  Starting...
+                </>
+              ) : (
+                <>
+                  <Zap className="w-4 h-4 mr-2" />
+                  Start Scrape
+                </>
+              )}
+            </Button>
           </form>
         </div>
       </div>
 
       {/* Main Content */}
-      <div className="max-w-7xl mx-auto px-6 py-6">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 py-6">
         <div className="space-y-6">
-          {/* Charts Row */}
-          <div className="grid grid-cols-2 gap-6">
+          {/* Charts Row - Responsive */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
             {/* Sentiment Trend */}
-            <div className="bg-zinc-900 rounded-xl border border-zinc-800 p-5">
-              <h3 className="font-semibold text-white mb-4">📈 Sentiment Trend (Last 7 Days)</h3>
-              <div className="h-40 flex items-end justify-between gap-2 px-4">
-                {(overview?.sentiment_trend || []).map((day, i) => (
-                  <div key={i} className="flex-1 flex flex-col items-center">
-                    <span className={`text-xs font-medium mb-1 ${day.positive >= 70 ? 'text-emerald-500' : day.positive >= 50 ? 'text-amber-500' : 'text-red-500'}`}>
-                      {day.count > 0 ? `${day.positive}%` : '—'}
-                    </span>
-                    <div
-                      className={`w-full rounded-t-lg ${day.positive >= 70 ? 'bg-emerald-600' : day.positive >= 50 ? 'bg-amber-600' : 'bg-red-600'}`}
-                      style={{ height: `${day.count > 0 ? Math.max(day.positive, 10) : 5}%` }}
-                    />
-                    <span className="text-xs text-zinc-500 mt-2">{day.day}</span>
+            <Card>
+              <CardHeader className="pb-2">
+                <div className="flex items-center justify-between flex-wrap gap-2">
+                  <CardTitle>
+                    <BarChart3 className="w-5 h-5 text-primary" />
+                    Sentiment Trend
+                  </CardTitle>
+                  <div className="flex items-center gap-2">
+                    {/* Topic Filter */}
+                    {topicsInPeriod.length > 0 && !drillDownDate && (
+                      <div className="relative">
+                        <button
+                          onClick={() => setTopicDropdownOpen(!topicDropdownOpen)}
+                          className="flex items-center gap-1 px-2 py-1 text-xs bg-card-hover rounded-lg border border-border hover:border-muted transition-colors"
+                        >
+                          <Filter className="w-3 h-3 text-muted" />
+                          <span className="text-foreground">{selectedTopic || 'All Topics'}</span>
+                          <ChevronDown className={`w-3 h-3 text-muted transition-transform ${topicDropdownOpen ? 'rotate-180' : ''}`} />
+                        </button>
+                        {topicDropdownOpen && (
+                          <>
+                            <div className="fixed inset-0 z-40" onClick={() => setTopicDropdownOpen(false)} />
+                            <div className="absolute top-full right-0 mt-1 w-40 bg-card border border-border rounded-lg shadow-lg z-50 max-h-48 overflow-y-auto">
+                              <button
+                                onClick={() => { setSelectedTopic(null); setTopicDropdownOpen(false) }}
+                                className={`w-full text-left px-3 py-2 text-xs hover:bg-card-hover transition-colors ${
+                                  selectedTopic === null ? 'bg-primary/10 text-primary font-medium' : 'text-foreground'
+                                }`}
+                              >
+                                All Topics
+                              </button>
+                              {topicsInPeriod.map((t) => (
+                                <button
+                                  key={t}
+                                  onClick={() => { setSelectedTopic(t); setTopicDropdownOpen(false) }}
+                                  className={`w-full text-left px-3 py-2 text-xs hover:bg-card-hover transition-colors capitalize ${
+                                    selectedTopic === t ? 'bg-primary/10 text-primary font-medium' : 'text-foreground'
+                                  }`}
+                                >
+                                  {t.replace('_', ' ')}
+                                </button>
+                              ))}
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    )}
+                    {/* Zoom Level Selector */}
+                    {!drillDownDate && (
+                      <div className="flex items-center gap-2">
+                        {/* Period quick select */}
+                        <select
+                          value={trendPeriod}
+                          onChange={(e) => setTrendPeriod(e.target.value as TrendPeriod)}
+                          className="text-xs bg-card-hover border border-border rounded-lg px-2 py-1 text-foreground"
+                        >
+                          <option value="7d">7 Days</option>
+                          <option value="30d">30 Days</option>
+                          <option value="90d">90 Days</option>
+                          <option value="1y">1 Year</option>
+                          <option value="2y">2 Years</option>
+                          <option value="5y">5 Years</option>
+                          <option value="all">All Time</option>
+                        </select>
+                        {/* Zoom level buttons */}
+                        <div className="flex items-center gap-1 bg-card-hover rounded-lg p-1">
+                          {ZOOM_LEVELS.map((z) => (
+                            <button
+                              key={z.value}
+                              onClick={() => setZoomLevel(z.value)}
+                              className={`px-2 py-1 text-xs font-medium rounded transition-colors ${
+                                zoomLevel === z.value
+                                  ? 'bg-primary text-white'
+                                  : 'text-muted hover:text-foreground'
+                              }`}
+                            >
+                              {z.label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                   </div>
-                ))}
-                {(!overview?.sentiment_trend || overview.sentiment_trend.length === 0) && (
-                  <div className="flex-1 flex items-center justify-center text-zinc-500 text-sm">
-                    No data yet
+                </div>
+              </CardHeader>
+              <CardContent>
+                {drillDownDate ? (
+                  /* Drill-Down View */
+                  <div className="space-y-3">
+                    {/* Header */}
+                    <div className="flex items-center justify-between">
+                      <button
+                        onClick={handleBackToChart}
+                        className="flex items-center gap-1 text-sm text-primary hover:text-primary/80 transition-colors"
+                      >
+                        <ArrowLeft className="w-4 h-4" />
+                        Back to Chart
+                      </button>
+                      <span className="text-sm font-medium text-foreground">
+                        {formatDateLabel(drillDownDate)}
+                      </span>
+                    </div>
+
+                    {/* Anomaly Info */}
+                    {(() => {
+                      const anomaly = getAnomalyForDate(drillDownDate)
+                      if (!anomaly) return null
+                      return (
+                        <div className={`p-3 rounded-lg border ${
+                          anomaly.type === 'drop' ? 'bg-destructive/10 border-destructive/20' : 'bg-success/10 border-success/20'
+                        }`}>
+                          <div className="flex items-start gap-2">
+                            <AlertTriangle className={`w-4 h-4 mt-0.5 ${anomaly.type === 'drop' ? 'text-destructive' : 'text-success'}`} />
+                            <div className="flex-1">
+                              <div className="text-sm font-medium text-foreground">Anomaly Detected</div>
+                              <div className="text-xs text-muted mt-0.5">{anomaly.reason}</div>
+                            </div>
+                          </div>
+                          {anomaly.llm_insight && (
+                            <div className="mt-3 pt-3 border-t border-border">
+                              <div className="flex items-center gap-1 text-xs font-medium text-foreground mb-1">
+                                <Lightbulb className="w-3 h-3 text-warning" />
+                                AI Insight
+                              </div>
+                              <p className="text-xs text-muted">{anomaly.llm_insight.analysis}</p>
+                              <div className="mt-2 flex items-start gap-1">
+                                <span className="text-primary text-xs">→</span>
+                                <p className="text-xs text-foreground">{anomaly.llm_insight.recommendation}</p>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )
+                    })()}
+
+                    {/* Sentiment Tabs */}
+                    <div className="flex items-center gap-1 bg-card-hover rounded-lg p-1">
+                      {[
+                        { value: null, label: 'All', count: drillDownReviews.length },
+                        { value: 'positive', label: 'Positive', count: drillDownReviews.filter(r => r.sentiment === 'positive').length },
+                        { value: 'negative', label: 'Negative', count: drillDownReviews.filter(r => r.sentiment === 'negative').length },
+                        { value: 'neutral', label: 'Neutral', count: drillDownReviews.filter(r => r.sentiment === 'neutral').length },
+                      ].map((tab) => (
+                        <button
+                          key={tab.label}
+                          onClick={() => handleSentimentFilterChange(tab.value)}
+                          className={`px-2 py-1 text-xs font-medium rounded transition-colors ${
+                            drillDownSentimentFilter === tab.value
+                              ? 'bg-primary text-white'
+                              : 'text-muted hover:text-foreground'
+                          }`}
+                        >
+                          {tab.label}: {tab.count}
+                        </button>
+                      ))}
+                    </div>
+
+                    {/* Reviews List */}
+                    <div className="max-h-48 overflow-y-auto space-y-2">
+                      {drillDownLoading ? (
+                        <div className="flex items-center justify-center py-4">
+                          <Loader2 className="w-5 h-5 text-muted animate-spin" />
+                        </div>
+                      ) : drillDownReviews.length > 0 ? (
+                        drillDownReviews
+                          .filter(r => !drillDownSentimentFilter || r.sentiment === drillDownSentimentFilter)
+                          .map((review) => (
+                          <div key={review.id} className="p-2 bg-card-hover rounded-lg border border-border">
+                            <div className="flex items-center justify-between mb-1">
+                              <div className="flex items-center gap-1">
+                                {[1,2,3,4,5].map((s) => (
+                                  <Star key={s} className={`w-3 h-3 ${s <= (review.rating || 0) ? 'text-yellow-500 fill-yellow-500' : 'text-muted'}`} />
+                                ))}
+                              </div>
+                              <Badge variant={review.sentiment === 'positive' ? 'success' : review.sentiment === 'negative' ? 'destructive' : 'default'}>
+                                {review.sentiment}
+                              </Badge>
+                            </div>
+                            <p className="text-xs text-foreground line-clamp-2">{review.text}</p>
+                            {(review.topics_positive.length > 0 || review.topics_negative.length > 0) && (
+                              <div className="flex flex-wrap gap-1 mt-1">
+                                {review.topics_positive.map((t) => (
+                                  <span key={t} className="text-[10px] px-1.5 py-0.5 bg-success/10 text-success rounded capitalize">{t.replace('_', ' ')}</span>
+                                ))}
+                                {review.topics_negative.map((t) => (
+                                  <span key={t} className="text-[10px] px-1.5 py-0.5 bg-destructive/10 text-destructive rounded capitalize">{t.replace('_', ' ')}</span>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        ))
+                      ) : (
+                        <div className="text-center py-4 text-sm text-muted">No reviews for this date</div>
+                      )}
+                    </div>
+                  </div>
+                ) : trendLoading ? (
+                  <div className="h-40 flex items-center justify-center">
+                    <Loader2 className="w-5 h-5 text-muted animate-spin" />
+                  </div>
+                ) : trendData.length > 0 ? (
+                  (() => {
+                    const maxTotal = Math.max(...trendData.map(p => p.total), 1)
+                    const labelInterval = Math.max(1, Math.ceil(trendData.length / 12))
+
+                    return (
+                      <div className="h-40 flex items-end gap-px overflow-visible">
+                        {trendData.map((point, i) => {
+                          const barHeight = point.total > 0 ? Math.max((point.total / maxTotal) * 100, 8) : 4
+                          const isAnomaly = point.is_anomaly
+                          const showLabel = trendData.length <= 14 || i % labelInterval === 0
+
+                          return (
+                            <div
+                              key={point.date || i}
+                              className="flex-1 min-w-0 group cursor-pointer"
+                              onClick={() => handleBarClick(point)}
+                            >
+                              {/* Bar area - h-36 = 144px, leaves 16px for labels */}
+                              <div className="h-36 w-full relative">
+                                {/* Tooltip */}
+                                <div className="absolute -top-2 left-1/2 -translate-x-1/2 -translate-y-full hidden group-hover:block z-20 pointer-events-none">
+                                  <div className="bg-card border border-border rounded-lg px-2 py-1.5 text-xs shadow-lg whitespace-nowrap">
+                                    <div className="font-medium text-foreground">{point.label || point.date}</div>
+                                    <div className="text-success">+{point.positive} positive</div>
+                                    <div className="text-destructive">-{point.negative} negative</div>
+                                    <div className="text-muted">{point.total} total</div>
+                                    {isAnomaly && point.anomaly_reason && (
+                                      <div className={`mt-1 pt-1 border-t border-border text-[11px] ${point.anomaly_type === 'drop' ? 'text-destructive' : 'text-success'}`}>
+                                        {point.anomaly_reason}
+                                      </div>
+                                    )}
+                                    {point.total > 0 && <div className="text-primary text-[10px] mt-1">Click to view</div>}
+                                  </div>
+                                </div>
+
+                                {/* Anomaly dot - positioned just above bar */}
+                                {isAnomaly && (
+                                  <div
+                                    className={`absolute left-1/2 -translate-x-1/2 w-1.5 h-1.5 rounded-full z-10 ${
+                                      point.anomaly_type === 'drop' ? 'bg-destructive' : 'bg-success'
+                                    }`}
+                                    style={{ bottom: `calc(${Math.min(barHeight, 94)}% + 6px)` }}
+                                  />
+                                )}
+
+                                {/* Bar */}
+                                <div
+                                  className={`absolute bottom-0 left-0 right-0 rounded-t transition-colors ${
+                                    point.positive_pct >= 70 ? 'bg-success hover:bg-success/80' :
+                                    point.positive_pct >= 50 ? 'bg-warning hover:bg-warning/80' :
+                                    point.total === 0 ? 'bg-muted/30' : 'bg-destructive hover:bg-destructive/80'
+                                  } ${isAnomaly ? 'ring-1 ring-offset-1 ' + (point.anomaly_type === 'drop' ? 'ring-destructive/40' : 'ring-success/40') : ''}`}
+                                  style={{ height: `${barHeight}%` }}
+                                />
+                              </div>
+
+                              {/* Label - fixed 16px height */}
+                              <div className="h-4 flex items-center justify-center">
+                                {showLabel && (
+                                  <span className="text-[10px] text-muted truncate max-w-full px-0.5">{point.label}</span>
+                                )}
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    )
+                  })()
+                ) : (
+                  <div className="h-40 flex items-center justify-center text-muted text-sm">
+                    No data for this period
                   </div>
                 )}
-              </div>
-            </div>
+                {/* Legend - only show when not in drill-down */}
+                {!drillDownDate && (
+                  <div className="flex items-center justify-center gap-4 mt-3 text-xs text-muted">
+                    <span className="flex items-center gap-1"><span className="w-2 h-2 rounded bg-success" /> &gt;70% positive</span>
+                    <span className="flex items-center gap-1"><span className="w-2 h-2 rounded bg-warning" /> 50-70%</span>
+                    <span className="flex items-center gap-1"><span className="w-2 h-2 rounded bg-destructive" /> &lt;50%</span>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
 
             {/* Rating Distribution */}
-            <div className="bg-zinc-900 rounded-xl border border-zinc-800 p-5">
-              <h3 className="font-semibold text-white mb-4">⭐ Rating Distribution</h3>
-              <div className="space-y-3">
-                {[5, 4, 3, 2, 1].map((star) => {
-                  const pct = overview?.rating_distribution?.[String(star)] || 0
-                  return (
-                    <div key={star} className="flex items-center gap-3">
-                      <span className="text-sm w-16 text-yellow-500">
-                        {'★'.repeat(star)}{'☆'.repeat(5 - star)}
-                      </span>
-                      <div className="flex-1 h-4 bg-zinc-800 rounded-full overflow-hidden">
-                        <div
-                          className="h-full bg-yellow-500 rounded-full transition-all"
-                          style={{ width: `${pct}%` }}
-                        />
+            <Card>
+              <CardHeader>
+                <CardTitle>
+                  <Star className="w-5 h-5 text-yellow-500" />
+                  Rating Distribution
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="space-y-3">
+                  {[5, 4, 3, 2, 1].map((star) => {
+                    const pct = overview?.rating_distribution?.[String(star)] || 0
+                    return (
+                      <div key={star} className="flex items-center gap-3">
+                        <span className="text-sm w-8 text-foreground font-medium">{star}<Star className="w-3 h-3 text-yellow-500 inline ml-0.5" /></span>
+                        <div className="flex-1 h-3 bg-card-hover rounded-full overflow-hidden">
+                          <div
+                            className="h-full bg-yellow-500 rounded-full transition-all duration-500"
+                            style={{ width: `${pct}%` }}
+                          />
+                        </div>
+                        <span className="text-sm text-muted w-12 text-right">{pct}%</span>
                       </div>
-                      <span className="text-sm text-zinc-400 w-10">{pct}%</span>
-                    </div>
-                  )
-                })}
-              </div>
-            </div>
+                    )
+                  })}
+                </div>
+              </CardContent>
+            </Card>
           </div>
 
-          {/* Hot / Cold Row */}
-          <div className="grid grid-cols-2 gap-6">
+          {/* Hot / Cold Row - Responsive */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
             {/* What's Hot */}
-            <div className="bg-zinc-900 rounded-xl border border-zinc-800 p-5">
-              <h3 className="font-semibold text-white mb-4">🔥 What's Hot</h3>
-              <div className="space-y-3">
-                {(overview?.whats_hot || []).length > 0 ? (
-                  overview?.whats_hot.map((item, i) => (
-                    <div key={i} className="flex items-center justify-between p-3 bg-emerald-900/20 border border-emerald-800/30 rounded-lg">
-                      <span className="font-medium text-zinc-200">{item.item}</span>
-                      <div className="flex items-center gap-2">
-                        <span className="text-emerald-400 font-bold">{item.score}</span>
-                        <span className="text-emerald-500 text-sm">{item.mentions} mentions</span>
+            <Card>
+              <CardHeader>
+                <CardTitle>
+                  <ThumbsUp className="w-5 h-5 text-success" />
+                  What's Hot
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="space-y-2">
+                  {(overview?.whats_hot || []).length > 0 ? (
+                    overview?.whats_hot.map((item, i) => (
+                      <div key={i} className="flex items-center justify-between p-3 bg-success/10 border border-success/20 rounded-lg">
+                        <span className="font-medium text-foreground text-sm sm:text-base truncate mr-2">{item.item}</span>
+                        <div className="flex items-center gap-2 flex-shrink-0">
+                          <Badge variant="success">{item.score}</Badge>
+                          <span className="text-success text-xs sm:text-sm">{item.mentions} mentions</span>
+                        </div>
                       </div>
+                    ))
+                  ) : (
+                    <div className="text-muted text-sm p-3 text-center">
+                      No positive topics found yet. Run analysis to see what customers love.
                     </div>
-                  ))
-                ) : (
-                  <div className="text-zinc-500 text-sm p-3">
-                    No positive topics found yet. Run analysis to see what customers love.
-                  </div>
-                )}
-              </div>
-            </div>
+                  )}
+                </div>
+              </CardContent>
+            </Card>
 
             {/* What's Not */}
-            <div className="bg-zinc-900 rounded-xl border border-zinc-800 p-5">
-              <h3 className="font-semibold text-white mb-4">❄️ What's Not</h3>
-              <div className="space-y-3">
-                {(overview?.whats_not || []).length > 0 ? (
-                  overview?.whats_not.map((item, i) => (
-                    <div key={i} className="flex items-center justify-between p-3 bg-red-900/20 border border-red-800/30 rounded-lg">
-                      <span className="font-medium text-zinc-200">{item.item}</span>
-                      <div className="flex items-center gap-2">
-                        <span className="text-red-400 font-bold">{item.score}</span>
-                        <span className="text-red-500 text-sm">{item.mentions} mentions</span>
+            <Card>
+              <CardHeader>
+                <CardTitle>
+                  <ThumbsDown className="w-5 h-5 text-destructive" />
+                  What's Not
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="space-y-2">
+                  {(overview?.whats_not || []).length > 0 ? (
+                    overview?.whats_not.map((item, i) => (
+                      <div key={i} className="flex items-center justify-between p-3 bg-destructive/10 border border-destructive/20 rounded-lg">
+                        <span className="font-medium text-foreground text-sm sm:text-base truncate mr-2">{item.item}</span>
+                        <div className="flex items-center gap-2 flex-shrink-0">
+                          <Badge variant="destructive">{item.score}</Badge>
+                          <span className="text-destructive text-xs sm:text-sm">{item.mentions} mentions</span>
+                        </div>
                       </div>
+                    ))
+                  ) : (
+                    <div className="text-muted text-sm p-3 text-center">
+                      No negative topics found yet. Great news or more data needed!
                     </div>
-                  ))
-                ) : (
-                  <div className="text-zinc-500 text-sm p-3">
-                    No negative topics found yet. Great news or more data needed!
-                  </div>
-                )}
-              </div>
-            </div>
+                  )}
+                </div>
+              </CardContent>
+            </Card>
           </div>
 
           {/* Alerts */}
-          <div className="bg-zinc-900 rounded-xl border border-zinc-800 p-5">
-            <h3 className="font-semibold text-white mb-4">🚨 Needs Attention</h3>
-            <div className="space-y-2">
-              {(overview?.alerts || []).length > 0 ? (
-                overview?.alerts.map((alert, i) => (
-                  <div
-                    key={i}
-                    className={`flex items-center gap-3 p-3 rounded-lg ${
-                      alert.type === 'urgent' ? 'bg-red-900/20 border border-red-800/30' :
-                      alert.type === 'warning' ? 'bg-amber-900/20 border border-amber-800/30' :
-                      alert.type === 'processing' ? 'bg-blue-900/20 border border-blue-800/30' :
-                      'bg-zinc-800/50 border border-zinc-700/30'
-                    }`}
-                  >
-                    <span>{alert.icon}</span>
-                    <span className="text-zinc-200">{alert.message}</span>
+          <Card>
+            <CardHeader>
+              <CardTitle>
+                <Bell className="w-5 h-5 text-warning" />
+                Needs Attention
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="space-y-2">
+                {(overview?.alerts || []).length > 0 ? (
+                  overview?.alerts.map((alert, i) => (
+                    <div
+                      key={i}
+                      className={`flex items-center gap-3 p-3 rounded-lg ${
+                        alert.type === 'urgent' ? 'bg-destructive/10 border border-destructive/20' :
+                        alert.type === 'warning' ? 'bg-warning/10 border border-warning/20' :
+                        alert.type === 'processing' ? 'bg-primary/10 border border-primary/20' :
+                        'bg-card-hover border border-border'
+                      }`}
+                    >
+                      {alert.type === 'urgent' ? <AlertTriangle className="w-4 h-4 text-destructive flex-shrink-0" /> :
+                       alert.type === 'warning' ? <AlertTriangle className="w-4 h-4 text-warning flex-shrink-0" /> :
+                       alert.type === 'processing' ? <Clock className="w-4 h-4 text-primary flex-shrink-0" /> :
+                       <Bell className="w-4 h-4 text-muted flex-shrink-0" />}
+                      <span className="text-foreground text-sm">{alert.message}</span>
+                    </div>
+                  ))
+                ) : (
+                  <div className="flex items-center gap-3 p-3 rounded-lg bg-success/10 border border-success/20">
+                    <CheckCircle2 className="w-4 h-4 text-success flex-shrink-0" />
+                    <span className="text-foreground text-sm">All caught up! No urgent items.</span>
                   </div>
-                ))
-              ) : (
-                <div className="flex items-center gap-3 p-3 rounded-lg bg-emerald-900/20 border border-emerald-800/30">
-                  <span>✅</span>
-                  <span className="text-zinc-200">All caught up! No urgent items.</span>
-                </div>
-              )}
-            </div>
-          </div>
+                )}
+              </div>
+            </CardContent>
+          </Card>
 
           {/* Recent Jobs */}
-          <div className="bg-zinc-900 rounded-xl border border-zinc-800 p-5">
-            <h3 className="font-semibold text-white mb-4">📋 Recent Jobs</h3>
-            {jobs.length === 0 ? (
-              <p className="text-zinc-500 text-sm">No jobs yet. Start a scrape job to analyze reviews.</p>
-            ) : (
-              <div className="space-y-2">
-                {jobs.map((job) => (
-                  <div
-                    key={job.id}
-                    className="flex items-center justify-between p-3 bg-zinc-800/50 rounded-lg"
-                  >
-                    <div>
-                      <span className="text-sm font-medium text-white">{job.query}</span>
-                      <span className={`ml-3 text-xs px-2 py-0.5 rounded ${
-                        job.status === 'completed' ? 'bg-emerald-500/20 text-emerald-400' :
-                        job.status === 'failed' ? 'bg-red-500/20 text-red-400' :
-                        'bg-blue-500/20 text-blue-400'
-                      }`}>
-                        {job.status}
-                      </span>
+          <Card>
+            <CardHeader>
+              <CardTitle>
+                <Briefcase className="w-5 h-5 text-primary" />
+                Recent Jobs
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              {jobs.length === 0 ? (
+                <p className="text-muted text-sm text-center py-4">No jobs yet. Start a scrape job to analyze reviews.</p>
+              ) : (
+                <div className="space-y-2">
+                  {jobs.map((job) => (
+                    <div
+                      key={job.id}
+                      className="flex flex-col sm:flex-row sm:items-center justify-between p-3 bg-card-hover rounded-lg gap-2"
+                    >
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span className="text-sm font-medium text-foreground truncate">{job.query}</span>
+                        <Badge variant={
+                          job.status === 'completed' ? 'success' :
+                          job.status === 'failed' ? 'destructive' :
+                          'default'
+                        }>
+                          {job.status}
+                        </Badge>
+                      </div>
+                      <div className="flex items-center gap-4 text-xs text-muted">
+                        <span className="flex items-center gap-1">
+                          <MapPin className="w-3 h-3" />
+                          {job.places_found || 0}
+                        </span>
+                        <span className="flex items-center gap-1">
+                          <MessageSquare className="w-3 h-3" />
+                          {job.reviews_total || 0}
+                        </span>
+                      </div>
                     </div>
-                    <div className="flex items-center gap-4 text-xs text-zinc-500">
-                      <span>{job.places_found || 0} places</span>
-                      <span>{job.reviews_total || 0} reviews</span>
+                  ))}
+                </div>
+              )}
+            </CardContent>
+          </Card>
+
+          {/* Job Status Summary */}
+          <Card>
+            <CardHeader>
+              <CardTitle>
+                <PieChart className="w-5 h-5 text-primary" />
+                Job Status Overview
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="grid grid-cols-3 sm:grid-cols-5 gap-2">
+                {[
+                  { status: 'pending', icon: Clock, color: 'text-muted', bg: 'bg-card-hover border-border' },
+                  { status: 'scraping', icon: Loader2, color: 'text-primary', bg: 'bg-primary/10 border-primary/20' },
+                  { status: 'processing', icon: Cog, color: 'text-primary', bg: 'bg-primary/10 border-primary/20' },
+                  { status: 'completed', icon: CheckCircle2, color: 'text-success', bg: 'bg-success/10 border-success/20' },
+                  { status: 'failed', icon: XCircle, color: 'text-destructive', bg: 'bg-destructive/10 border-destructive/20' },
+                ].map(({ status, icon: Icon, color, bg }) => (
+                  <div key={status} className={`p-3 rounded-lg border text-center ${bg}`}>
+                    <Icon className={`w-4 h-4 mx-auto mb-1 ${color} ${status === 'scraping' ? 'animate-spin' : ''}`} />
+                    <div className={`text-lg font-bold ${color}`}>
+                      {overview?.scrape_jobs?.[status] || 0}
                     </div>
+                    <div className="text-xs text-muted capitalize">{status}</div>
                   </div>
                 ))}
               </div>
-            )}
-          </div>
-
-          {/* Job Status Summary */}
-          <div className="bg-zinc-900 rounded-xl border border-zinc-800 p-5">
-            <h3 className="font-semibold text-white mb-4">📊 Job Status Overview</h3>
-            <div className="grid grid-cols-5 gap-2 text-center">
-              {['pending', 'scraping', 'processing', 'completed', 'failed'].map((status) => (
-                <div key={status} className={`p-3 rounded-lg ${
-                  status === 'completed' ? 'bg-emerald-900/20 border border-emerald-800/30' :
-                  status === 'failed' ? 'bg-red-900/20 border border-red-800/30' :
-                  status === 'pending' ? 'bg-zinc-800/50 border border-zinc-700/30' :
-                  'bg-blue-900/20 border border-blue-800/30'
-                }`}>
-                  <div className={`text-lg font-bold ${
-                    status === 'completed' ? 'text-emerald-400' :
-                    status === 'failed' ? 'text-red-400' :
-                    status === 'pending' ? 'text-zinc-400' :
-                    'text-blue-400'
-                  }`}>
-                    {overview?.scrape_jobs?.[status] || 0}
-                  </div>
-                  <div className="text-xs text-zinc-500 capitalize">{status}</div>
-                </div>
-              ))}
-            </div>
-          </div>
+            </CardContent>
+          </Card>
         </div>
       </div>
     </div>

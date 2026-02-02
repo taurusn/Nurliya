@@ -113,6 +113,7 @@ def save_place_and_reviews(place_data: dict, job_id: str = None) -> tuple:
     try:
         # Upsert place
         place = session.query(Place).filter_by(place_id=place_data["place_id"]).first()
+        is_new_place = place is None
         if not place:
             place = Place(
                 name=place_data["name"],
@@ -127,12 +128,31 @@ def save_place_and_reviews(place_data: dict, job_id: str = None) -> tuple:
             session.add(place)
             session.flush()
             logger.debug("Created new place", extra={"extra_data": {"name": place_data["name"], "place_id": place_data["place_id"]}})
+        else:
+            # Update place data with latest info
+            place.rating = place_data["rating"]
+            place.review_count = place_data["review_count"]
+            place.reviews_per_rating = place_data["reviews_per_rating"]
+            place.metadata_ = place_data["metadata"]
+            logger.debug("Updated existing place", extra={"extra_data": {"name": place_data["name"], "place_id": place_data["place_id"]}})
 
         place_id = str(place.id)
 
-        # Insert reviews
+        # Insert reviews (with duplicate detection)
         review_ids = []
+        skipped_count = 0
         for r in place_data["reviews"]:
+            # Check for duplicate: same place + author + review_date
+            existing_review = session.query(Review).filter(
+                Review.place_id == place.id,
+                Review.author == r["author"],
+                Review.review_date == r["review_date"]
+            ).first()
+
+            if existing_review:
+                skipped_count += 1
+                continue  # Skip duplicate review
+
             review = Review(
                 place_id=place.id,
                 job_id=job_id,
@@ -150,7 +170,12 @@ def save_place_and_reviews(place_data: dict, job_id: str = None) -> tuple:
         session.commit()
         logger.info(
             "Saved place and reviews",
-            extra={"extra_data": {"place_name": place_data["name"], "reviews_count": len(review_ids)}}
+            extra={"extra_data": {
+                "place_name": place_data["name"],
+                "new_reviews": len(review_ids),
+                "skipped_duplicates": skipped_count,
+                "is_new_place": is_new_place
+            }}
         )
         return place_id, review_ids
     except Exception as e:

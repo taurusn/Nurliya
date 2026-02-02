@@ -125,6 +125,70 @@ def analyze_review(review_text: str, rating: int = None) -> dict:
     return result
 
 
+def generate_anomaly_insight(anomaly_date: str, anomaly_type: str, magnitude: float,
+                             topic_comparison: str, reviews_summary: str) -> dict:
+    """Generate LLM insight for a sentiment anomaly."""
+
+    prompt = f"""Analyze this sentiment anomaly for a Saudi business:
+
+DATE: {anomaly_date}
+ANOMALY TYPE: {anomaly_type} ({magnitude:.1f}% change from baseline)
+
+TOPIC CHANGES VS 7-DAY BASELINE:
+{topic_comparison}
+
+REVIEWS FROM THIS DATE:
+{reviews_summary}
+
+Provide a brief analysis in JSON format:
+{{
+  "analysis": "2-3 sentences explaining what likely caused this anomaly. Look for patterns across reviews.",
+  "recommendation": "One specific, actionable step the business can take."
+}}
+
+Be specific to the data provided. Do not give generic advice.
+Return ONLY valid JSON, no markdown or explanation."""
+
+    logger.debug("Generating anomaly insight", extra={"extra_data": {"date": anomaly_date, "type": anomaly_type}})
+
+    try:
+        response = client.chat.completions.create(
+            model=VLLM_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a business analyst helping Saudi businesses understand customer feedback patterns."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_tokens=500
+        )
+
+        content = response.choices[0].message.content.strip()
+
+        # Clean up response
+        if content.startswith("```"):
+            lines = content.split("\n")
+            content = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+
+        result = json.loads(content)
+
+        # Ensure required fields
+        if "analysis" not in result:
+            result["analysis"] = "Unusual sentiment pattern detected."
+        if "recommendation" not in result:
+            result["recommendation"] = "Review the feedback from this period."
+
+        logger.debug("Anomaly insight generated", extra={"extra_data": {"analysis_length": len(result.get("analysis", ""))}})
+
+        return result
+
+    except Exception as e:
+        logger.error("Failed to generate anomaly insight", extra={"extra_data": {"error": str(e)}})
+        return {
+            "analysis": "Unable to generate detailed analysis.",
+            "recommendation": "Review the reviews from this date manually."
+        }
+
+
 if __name__ == "__main__":
     # Test with sample review
     test_review = "القهوة ممتازة والمكان هادي بس الخدمة بطيئة شوي"

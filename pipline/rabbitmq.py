@@ -10,6 +10,8 @@ from config import RABBITMQ_URL, QUEUE_NAME, DLQ_NAME, PREFETCH_COUNT
 
 logger = get_logger(__name__, service="rabbitmq")
 
+ANOMALY_QUEUE_NAME = "anomaly_insights"
+
 
 def get_connection():
     """Create RabbitMQ connection."""
@@ -35,7 +37,11 @@ def setup_queues(channel):
             "x-dead-letter-routing-key": QUEUE_NAME,
         }
     )
-    logger.debug("Queues configured", extra={"extra_data": {"queue": QUEUE_NAME, "dlq": DLQ_NAME}})
+
+    # Anomaly insights queue (for background LLM processing)
+    channel.queue_declare(queue=ANOMALY_QUEUE_NAME, durable=True)
+
+    logger.debug("Queues configured", extra={"extra_data": {"queue": QUEUE_NAME, "dlq": DLQ_NAME, "anomaly_queue": ANOMALY_QUEUE_NAME}})
 
 
 def publish_message(channel, message: dict):
@@ -70,6 +76,32 @@ def get_producer_channel():
     setup_queues(channel)
     logger.debug("RabbitMQ producer connected")
     return connection, channel
+
+
+# Singleton connection for API use
+_api_connection = None
+_api_channel = None
+
+
+def get_channel():
+    """Get a channel for publishing messages (reuses connection)."""
+    global _api_connection, _api_channel
+    try:
+        if _api_connection is None or _api_connection.is_closed:
+            _api_connection = get_connection()
+            _api_channel = _api_connection.channel()
+            setup_queues(_api_channel)
+        elif _api_channel is None or _api_channel.is_closed:
+            _api_channel = _api_connection.channel()
+            setup_queues(_api_channel)
+        return _api_channel
+    except Exception as e:
+        logger.warning(f"Failed to get RabbitMQ channel: {e}")
+        # Try to reconnect
+        _api_connection = get_connection()
+        _api_channel = _api_connection.channel()
+        setup_queues(_api_channel)
+        return _api_channel
 
 
 if __name__ == "__main__":
