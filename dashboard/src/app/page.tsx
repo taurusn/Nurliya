@@ -4,7 +4,7 @@ import { useEffect, useState, useCallback } from 'react'
 import useSWR from 'swr'
 import { motion } from 'framer-motion'
 import { useWebSocket } from '@/lib/useWebSocket'
-import { fetchStats, fetchQueueStatus, fetchRecentAnalyses, fetchSystemHealth, fetchJobs } from '@/lib/api'
+import { fetchStats, fetchQueueStatus, fetchRecentAnalyses, fetchSystemHealth, fetchJobs, fetchPlaces, Place } from '@/lib/api'
 import { Card } from '@/components/Card'
 import { StatValue } from '@/components/StatValue'
 import { StatusIndicator } from '@/components/StatusIndicator'
@@ -15,16 +15,28 @@ import { ConnectionStatus } from '@/components/ConnectionStatus'
 import { LogsTable } from '@/components/LogsTable'
 import { Overview } from '@/components/Overview'
 import { PipelineStatus } from '@/components/PipelineStatus'
+import { PlaceSelector } from '@/components/PlaceSelector'
 import { Database, Server, Cpu, MessageSquare, Layers } from 'lucide-react'
 
 export default function Dashboard() {
   const { isConnected, stats: wsStats, recentAnalysis } = useWebSocket()
-  
-  // Initial data fetch
-  const { data: initialStats, mutate: mutateStats } = useSWR('stats', fetchStats, {
-    refreshInterval: 10000,
+  const [selectedPlace, setSelectedPlace] = useState<Place | null>(null)
+
+  // Fetch places list
+  const { data: placesData } = useSWR('places', fetchPlaces, {
     revalidateOnFocus: false,
   })
+  const places = placesData?.places || []
+
+  // Initial data fetch - filtered by place
+  const { data: initialStats, mutate: mutateStats } = useSWR(
+    selectedPlace ? `stats-${selectedPlace.id}` : 'stats',
+    () => fetchStats(selectedPlace?.id),
+    {
+      refreshInterval: 5000,
+      revalidateOnFocus: false,
+    }
+  )
   
   const { data: queueStatus } = useSWR('queue', fetchQueueStatus, {
     refreshInterval: 5000,
@@ -46,9 +58,9 @@ export default function Dashboard() {
     revalidateOnFocus: false,
   })
 
-  // Use WebSocket stats if available, otherwise fall back to REST
-  const stats = wsStats || initialStats
-  const activeJobs = wsStats?.active_jobs || jobsData?.jobs?.filter((j: any) => 
+  // Use REST stats when place is selected (WebSocket is global), otherwise prefer WebSocket
+  const stats = selectedPlace ? initialStats : (wsStats || initialStats)
+  const activeJobs = wsStats?.active_jobs || jobsData?.jobs?.filter((j: any) =>
     ['pending', 'scraping', 'processing'].includes(j.status)
   ) || []
 
@@ -93,7 +105,14 @@ export default function Dashboard() {
             <h1 className="text-lg font-semibold text-foreground">Nurliya</h1>
             <span className="text-xs text-muted px-2 py-0.5 bg-card rounded">dev</span>
           </div>
-          <ConnectionStatus isConnected={isConnected} />
+          <div className="flex items-center gap-4">
+            <PlaceSelector
+              places={places}
+              selectedPlace={selectedPlace}
+              onSelect={setSelectedPlace}
+            />
+            <ConnectionStatus isConnected={isConnected} />
+          </div>
         </div>
       </header>
 
@@ -145,9 +164,9 @@ export default function Dashboard() {
         {/* Stats Grid */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
           {/* Database Stats */}
-          <Card title="Database">
+          <Card title={selectedPlace ? selectedPlace.name : "Database"}>
             <div className="space-y-1">
-              <StatValue label="Places" value={stats?.places_count ?? '-'} />
+              {!selectedPlace && <StatValue label="Places" value={stats?.places_count ?? '-'} />}
               <StatValue label="Reviews" value={stats?.reviews_count ?? '-'} />
               <StatValue label="Analyzed" value={stats?.analyses_count ?? '-'} />
               <StatValue label="Mentions" value={stats?.mentions_count ?? '-'} />

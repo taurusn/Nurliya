@@ -1809,14 +1809,22 @@ async def get_place_stats(place_id: str):
 
 # Dashboard API endpoints
 @app.get("/api/stats")
-async def get_stats():
-    """Get system-wide statistics for the dashboard."""
+async def get_stats(place_id: Optional[str] = None):
+    """Get statistics for the dashboard, optionally filtered by place."""
     session = get_session()
     try:
-        places_count = session.query(Place).count()
-        reviews_count = session.query(Review).count()
-        analyses_count = session.query(ReviewAnalysis).count()
-        mentions_count = session.query(RawMention).count()
+        # Base queries - filter by place if specified
+        if place_id:
+            place_uuid = UUID(place_id)
+            places_count = 1
+            reviews_count = session.query(Review).join(Job).filter(Job.place_id == place_uuid).count()
+            analyses_count = session.query(ReviewAnalysis).join(Review).join(Job).filter(Job.place_id == place_uuid).count()
+            mentions_count = session.query(RawMention).filter(RawMention.place_id == place_uuid).count()
+        else:
+            places_count = session.query(Place).count()
+            reviews_count = session.query(Review).count()
+            analyses_count = session.query(ReviewAnalysis).count()
+            mentions_count = session.query(RawMention).count()
 
         # Get RabbitMQ queue status
         queue_messages = 0
@@ -1842,6 +1850,7 @@ async def get_stats():
         scrape_jobs = {status: count for status, count in job_statuses}
 
         return {
+            "place_id": place_id,
             "places_count": places_count,
             "reviews_count": reviews_count,
             "analyses_count": analyses_count,

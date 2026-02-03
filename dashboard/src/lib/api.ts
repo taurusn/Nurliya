@@ -1,8 +1,26 @@
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
-export async function fetchStats() {
-  const res = await fetch(`${API_URL}/api/stats`)
+export async function fetchStats(placeId?: string) {
+  const url = placeId
+    ? `${API_URL}/api/stats?place_id=${placeId}`
+    : `${API_URL}/api/stats`
+  const res = await fetch(url)
   if (!res.ok) throw new Error('Failed to fetch stats')
+  return res.json()
+}
+
+export interface Place {
+  id: string
+  name: string
+  google_place_id?: string
+  address?: string
+  rating?: number
+  total_reviews?: number
+}
+
+export async function fetchPlaces(): Promise<{ places: Place[] }> {
+  const res = await fetch(`${API_URL}/api/places?limit=100`)
+  if (!res.ok) throw new Error('Failed to fetch places')
   return res.json()
 }
 
