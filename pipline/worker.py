@@ -16,6 +16,7 @@ from logging_config import get_logger
 from rabbitmq import get_consumer_channel, QUEUE_NAME, ANOMALY_QUEUE_NAME, TAXONOMY_CLUSTERING_QUEUE
 from llm_client import analyze_review, generate_anomaly_insight, extract_mentions
 from database import Review, ReviewAnalysis, Job, ScrapeJob, Place, AnomalyInsight, RawMention, get_session
+from uuid import UUID
 from email_service import send_completion_report, gather_scrape_job_stats
 from activity_logger import (
     log_review_analyzed, log_job_completed, log_worker_started,
@@ -33,6 +34,12 @@ ENTITY_RESOLUTION_THRESHOLD = 0.85
 
 # Valid sentiment values for mentions
 VALID_SENTIMENTS = {"positive", "negative", "neutral"}
+
+
+# BUG-004 FIX: Removed _increment_product_stats() and _increment_category_stats()
+# Stats are now computed ONLY via _aggregate_taxonomy_analytics() during publish.
+# This ensures single source of truth (RawMention table) for all statistics.
+# Live updates were causing conflicts with batch aggregation on re-publish.
 
 
 def process_mentions(review_id: str, place_id, review_text: str, analysis: dict):
@@ -90,6 +97,9 @@ def process_mentions(review_id: str, place_id, review_text: str, analysis: dict)
         # Process each mention: resolve entity, save to DB
         session = get_session()
         try:
+            # Check once if active taxonomy exists for this place
+            active_taxonomy_id = vector_store.get_active_taxonomy_id(str(place_id))
+
             for mention, embedding in zip(all_mentions, embeddings):
                 if embedding is None or all(v == 0.0 for v in embedding):
                     logger.debug("Skipping mention with zero embedding",
@@ -164,6 +174,34 @@ def process_mentions(review_id: str, place_id, review_text: str, analysis: dict)
                     logger.debug("Qdrant unavailable, saving mention without resolution",
                                extra={"extra_data": {"text": mention["text"]}})
 
+                # Resolve to active taxonomy if exists
+                resolved_product_id = None
+                resolved_category_id = None
+
+                if active_taxonomy_id and embedding is not None:
+                    result = vector_store.find_matching_product(
+                        text_embedding=embedding,
+                        place_id=str(place_id),
+                        mention_type=mention_type,
+                    )
+
+                    if result:
+                        payload = result.payload
+                        if payload.entity_type == "product":
+                            resolved_product_id = UUID(payload.entity_id)
+                            if payload.category_id:
+                                resolved_category_id = UUID(payload.category_id)
+                            # BUG-004 FIX: Removed _increment_product_stats() call
+                            # Stats computed via _aggregate_taxonomy_analytics() on publish
+                            logger.debug("Resolved mention to product",
+                                       extra={"extra_data": {"text": mention["text"], "product_id": str(resolved_product_id)}})
+                        else:
+                            resolved_category_id = UUID(payload.entity_id)
+                            # BUG-004 FIX: Removed _increment_category_stats() call
+                            # Stats computed via _aggregate_taxonomy_analytics() on publish
+                            logger.debug("Resolved mention to category",
+                                       extra={"extra_data": {"text": mention["text"], "category_id": str(resolved_category_id)}})
+
                 # Save RawMention to database
                 raw_mention = RawMention(
                     review_id=review_id,
@@ -172,8 +210,8 @@ def process_mentions(review_id: str, place_id, review_text: str, analysis: dict)
                     mention_type=mention_type,
                     sentiment=mention["sentiment"],
                     qdrant_point_id=qdrant_point_id,
-                    # resolved_product_id and resolved_category_id remain NULL
-                    # until taxonomy is approved in Phase 3
+                    resolved_product_id=resolved_product_id,
+                    resolved_category_id=resolved_category_id,
                 )
                 session.add(raw_mention)
 

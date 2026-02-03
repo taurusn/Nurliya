@@ -232,6 +232,10 @@ class TaxonomyCategory(Base):
     display_name_en = Column(String(100))
     display_name_ar = Column(String(100))
     has_products = Column(Boolean, default=False)  # Whether this category contains products
+    vector_id = Column(String(100))  # Reference to Qdrant point ID for category centroid
+    # BUG-006 FIX: Store cluster centroid embedding computed during discovery
+    # This preserves the semantic center of all mentions in this category
+    centroid_embedding = Column(JSONB)  # List[float] - 384-dim for MiniLM
 
     # Approval workflow
     is_approved = Column(Boolean, default=False)

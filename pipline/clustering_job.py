@@ -75,15 +75,47 @@ Return ONLY valid JSON (no markdown, no explanation):
 Set has_products to true if these are orderable items (food, drinks), false if service aspects."""
 
 
-def is_clustering_needed(place_id: str) -> Tuple[bool, str]:
+def is_clustering_needed(place_id: str, job_id: str = None) -> Tuple[bool, str]:
     """
     Check if clustering is needed and appropriate.
+
+    Args:
+        place_id: UUID of the place
+        job_id: Optional job ID to verify extraction completion
 
     Returns:
         (should_cluster, reason)
     """
     session = get_session()
     try:
+        # BUG-001 FIX: Verify mention extraction completed successfully
+        # If job_id provided, check that mentions were actually extracted
+        if job_id:
+            job = session.query(Job).filter_by(id=job_id).first()
+            if job:
+                # Count reviews in this job
+                review_count = job.total_reviews or 0
+                if review_count > 0:
+                    # Count RawMentions for reviews in this job
+                    from database import Review
+                    mention_count_for_job = session.query(RawMention).join(
+                        Review, RawMention.review_id == Review.id
+                    ).filter(
+                        Review.job_id == job_id
+                    ).count()
+
+                    # Expect at least 30% of reviews to have mentions extracted
+                    # (some reviews have no extractable mentions, that's normal)
+                    MIN_EXTRACTION_RATE = 0.3
+                    extraction_rate = mention_count_for_job / review_count if review_count > 0 else 0
+
+                    if extraction_rate < MIN_EXTRACTION_RATE:
+                        logger.warning(
+                            f"Low mention extraction rate: {extraction_rate:.1%} ({mention_count_for_job}/{review_count})",
+                            extra={"extra_data": {"place_id": place_id, "job_id": job_id}}
+                        )
+                        return False, f"Extraction incomplete: only {extraction_rate:.1%} of reviews have mentions"
+
         # Check existing taxonomy
         existing = session.query(PlaceTaxonomy).filter_by(place_id=place_id).first()
 
@@ -141,8 +173,8 @@ def trigger_taxonomy_clustering(job_id: str) -> bool:
 
         place_id = str(job.place_id)
 
-        # Check if clustering is needed
-        should_cluster, reason = is_clustering_needed(place_id)
+        # Check if clustering is needed (pass job_id for extraction verification)
+        should_cluster, reason = is_clustering_needed(place_id, job_id=job_id)
 
         if not should_cluster:
             logger.debug(f"Clustering skipped: {reason}",
@@ -361,12 +393,19 @@ def build_hierarchy(
     product_labels: Dict[int, dict],
     aspect_labels: Dict[int, dict],
     product_centroids: Dict[int, List[float]],
+    aspect_centroids: Dict[int, List[float]] = None,  # BUG-006 FIX: Accept aspect centroids
     business_type: str = "business",
 ) -> dict:
     """
     Build taxonomy hierarchy from clustered items.
 
     Args:
+        product_items: Clustered product mention items
+        aspect_items: Clustered aspect mention items
+        product_labels: LLM-generated labels for product clusters
+        aspect_labels: LLM-generated labels for aspect clusters
+        product_centroids: Centroid embeddings for product clusters
+        aspect_centroids: Centroid embeddings for aspect clusters (BUG-006 FIX)
         business_type: Type of business (e.g., "Cafe", "Restaurant") for LLM context
 
     Returns:
@@ -377,6 +416,7 @@ def build_hierarchy(
             "aspect_categories": [...],
         }
     """
+    aspect_centroids = aspect_centroids or {}
     hierarchy = {
         "main_categories": [],
         "sub_categories": [],
@@ -494,6 +534,8 @@ def build_hierarchy(
             "has_products": False,
             "parent_id": None,
             "discovered_mention_count": sum(item.mention_count for item in items),
+            # BUG-006 FIX: Include centroid embedding for later indexing
+            "centroid_embedding": aspect_centroids.get(cluster_id),
         }
         hierarchy["aspect_categories"].append(aspect_cat)
 
@@ -652,6 +694,8 @@ def save_draft_taxonomy(place_id: str, hierarchy: dict, reviews_sampled: int) ->
                 display_name_ar=cat_data["display_name_ar"],
                 has_products=False,
                 discovered_mention_count=cat_data.get("discovered_mention_count", 0),
+                # BUG-006 FIX: Store centroid embedding for later use in publish indexing
+                centroid_embedding=cat_data.get("centroid_embedding"),
             )
             session.add(category)
             session.flush()
@@ -773,6 +817,7 @@ def run_clustering_job(place_id: str, job_id: Optional[str] = None) -> Optional[
 
     # Step 4: Cluster aspects
     aspect_labels = {}
+    aspect_centroids = {}  # BUG-006 FIX: Store aspect centroids
 
     if aspect_items:
         aspect_embeddings = np.array([item.embedding for item in aspect_items])
@@ -794,6 +839,10 @@ def run_clustering_job(place_id: str, job_id: Optional[str] = None) -> Optional[
             # Override has_products for aspects
             aspect_labels[cluster_id]["has_products"] = False
 
+            # BUG-006 FIX: Compute centroid for aspect clusters
+            cluster_embeddings = [item.embedding for item in items]
+            aspect_centroids[cluster_id] = compute_cluster_centroid(cluster_embeddings)
+
     # Step 5: Build hierarchy
     hierarchy = build_hierarchy(
         product_items=product_items,
@@ -801,6 +850,7 @@ def run_clustering_job(place_id: str, job_id: Optional[str] = None) -> Optional[
         product_labels=product_labels,
         aspect_labels=aspect_labels,
         product_centroids=product_centroids,
+        aspect_centroids=aspect_centroids,  # BUG-006 FIX: Pass aspect centroids
         business_type=business_type,
     )
 

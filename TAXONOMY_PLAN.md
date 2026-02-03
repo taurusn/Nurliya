@@ -299,7 +299,7 @@ Qdrant (vectors)
 - Audit logging for all decisions
 - **Live at: https://onboarding.nurliya.com**
 
-### Phase 4: Integration (Weeks 10-11)
+### Phase 4: Integration (Weeks 10-11) 🔄 IN PROGRESS
 - Match mentions to approved taxonomy
 - Add resolved_products/categories to ReviewAnalysis
 - Analytics endpoints (by category, by product, timeline)

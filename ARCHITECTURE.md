@@ -117,12 +117,23 @@
 │  │   ┌────────────────────┐    ┌────────────────────┐    ┌─────────────────┐  │   │
 │  │   │  client-portal/    │    │    dashboard/      │    │    api.py       │  │   │
 │  │   │  (Next.js)         │    │    (Next.js)       │    │   (FastAPI)     │  │   │
+│  │   │   :3002            │    │     :3000          │    │    :8000        │  │   │
 │  │   │                    │    │                    │    │                 │  │   │
 │  │   │ • User login/reg   │    │ • System monitor   │    │ • REST API      │  │   │
 │  │   │ • Overview metrics │    │ • Real-time stats  │    │ • WebSocket     │  │   │
 │  │   │ • Sentiment trends │    │ • Activity logs    │    │ • Auth deps     │  │   │
 │  │   │ • Anomaly insights │    │ • Queue status     │    │                 │  │   │
 │  │   └────────────────────┘    └────────────────────┘    └─────────────────┘  │   │
+│  │                                                                              │   │
+│  │   ┌────────────────────┐                                                    │   │
+│  │   │ onboarding-portal/ │                                                    │   │
+│  │   │  (Next.js) :3001   │                                                    │   │
+│  │   │                    │                                                    │   │
+│  │   │ • Taxonomy review  │                                                    │   │
+│  │   │ • Category/product │                                                    │   │
+│  │   │   approval         │                                                    │   │
+│  │   │ • Publish workflow │                                                    │   │
+│  │   └────────────────────┘                                                    │   │
 │  │                                                                              │   │
 │  │   API Endpoints:                                                             │   │
 │  │   ├── GET  /health                    → Health check                        │   │
@@ -144,7 +155,16 @@
 │  │   ├── GET  /api/recent-analyses       → Recent review analyses              │   │
 │  │   ├── GET  /api/system-health         → All component health                │   │
 │  │   ├── GET  /api/logs                  → Paginated activity logs             │   │
-│  │   └── WS   /ws                        → Real-time WebSocket updates         │   │
+│  │   ├── WS   /ws                        → Real-time WebSocket updates         │   │
+│  │   │                                                                         │   │
+│  │   │  Onboarding Portal (Taxonomy Management):                               │   │
+│  │   ├── GET  /api/onboarding/pending         → Taxonomies pending review      │   │
+│  │   ├── GET  /api/onboarding/taxonomies/{id} → Taxonomy detail                │   │
+│  │   ├── PATCH /api/onboarding/categories/{id}→ Update category                │   │
+│  │   ├── PATCH /api/onboarding/products/{id}  → Update product                 │   │
+│  │   ├── POST /api/onboarding/categories      → Create category                │   │
+│  │   ├── POST /api/onboarding/products        → Create product                 │   │
+│  │   └── POST /api/onboarding/taxonomies/{id}/publish → Publish taxonomy       │   │
 │  └─────────────────────────────────────────────────────────────────────────────┘   │
 │                                         │                                           │
 │                                         ▼                                           │
@@ -1525,15 +1545,15 @@ T+301s  ScrapeJob status = "completed"
     │   │   │   ┌─────────────────────────────────────────────────────┐   │   │  │
     │   │   │   │                   FRONTENDS                          │   │   │  │
     │   │   │   │                                                      │   │   │  │
-    │   │   │   │   ┌──────────────┐      ┌──────────────┐            │   │   │  │
-    │   │   │   │   │  dashboard   │      │client-portal │            │   │   │  │
-    │   │   │   │   │   :3000      │      │   :3002      │            │   │   │  │
-    │   │   │   │   │              │      │              │            │   │   │  │
-    │   │   │   │   │ • Next.js    │      │ • Next.js    │            │   │   │  │
-    │   │   │   │   │ • Admin UI   │      │ • User UI    │            │   │   │  │
-    │   │   │   │   │ • WebSocket  │      │ • Auth       │            │   │   │  │
-    │   │   │   │   │ • Real-time  │      │ • Analytics  │            │   │   │  │
-    │   │   │   │   └──────────────┘      └──────────────┘            │   │   │  │
+    │   │   │   │   ┌────────────┐  ┌────────────┐  ┌──────────────┐  │   │   │  │
+    │   │   │   │   │ dashboard  │  │client-     │  │ onboarding-  │  │   │   │  │
+    │   │   │   │   │  :3000     │  │ portal     │  │ portal :3001 │  │   │   │  │
+    │   │   │   │   │            │  │  :3002     │  │              │  │   │   │  │
+    │   │   │   │   │ • Next.js  │  │ • Next.js  │  │ • Next.js    │  │   │   │  │
+    │   │   │   │   │ • Admin UI │  │ • User UI  │  │ • Taxonomy   │  │   │   │  │
+    │   │   │   │   │ • WS/Real- │  │ • Auth     │  │   review     │  │   │   │  │
+    │   │   │   │   │   time     │  │ • Analytic │  │ • Publish    │  │   │   │  │
+    │   │   │   │   └────────────┘  └────────────┘  └──────────────┘  │   │   │  │
     │   │   │   └─────────────────────────────────────────────────────┘   │   │  │
     │   │   │                                                               │   │  │
     │   │   │   ┌─────────────────────────────────────────────────────┐   │   │  │
@@ -1701,6 +1721,7 @@ Secret Loading Priority:
 │   │
 │   ├── embedding_client.py           # Sentence-transformers + Arabic normalization
 │   ├── vector_store.py               # Qdrant client wrapper + entity resolution
+│   ├── clustering_job.py             # HDBSCAN clustering + taxonomy discovery
 │   │
 │   ├── database.py                   # SQLAlchemy models (13 tables)
 │   ├── rabbitmq.py                   # Queue setup
@@ -1733,6 +1754,20 @@ Secret Loading Priority:
 │   └── src/
 │       └── app/
 │           └── page.tsx              # Real-time monitoring dashboard
+│
+├── onboarding-portal/                # Next.js taxonomy review portal
+│   ├── Dockerfile                    # Live at: https://onboarding.nurliya.com
+│   ├── package.json
+│   └── src/
+│       ├── app/
+│       │   ├── page.tsx              # Pending taxonomies list
+│       │   └── [taxonomyId]/page.tsx # Taxonomy editor (tree view)
+│       ├── components/
+│       │   ├── CategoryTree.tsx      # Hierarchical category display
+│       │   ├── ProductList.tsx       # Product approval interface
+│       │   └── modals/               # Reject, Move, Add modals
+│       └── lib/
+│           └── api.ts                # Onboarding API client
 │
 └── google-maps-scraper/              # Go scraper project
     ├── Dockerfile                    # Scraper container
@@ -1776,4 +1811,4 @@ docker-compose -f docker-compose.yml up -d  # Production stack
 
 *Document generated for Nurliya v2.1 (with Dynamic Taxonomy System)*
 *Last updated: February 2026*
-*Taxonomy Phase 1A+1B+2+3 complete - see TAXONOMY_PROGRESS.md for status*
+*Taxonomy Phase 1A+1B+2+3 complete, Phase 4 in progress - see TAXONOMY_PROGRESS.md for status*
