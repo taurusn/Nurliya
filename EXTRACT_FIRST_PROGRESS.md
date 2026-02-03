@@ -46,8 +46,8 @@
 
 | Task | Status | Notes |
 |------|--------|-------|
-| Modify scrape job creation to default to extraction mode | ⬜ Pending | |
-| Update orchestrator if needed | ⬜ Pending | |
+| Modify scrape job creation to default to extraction mode | ✅ Completed | EXTRACTION_ONLY_MODE=true in docker-compose.yml |
+| Update orchestrator if needed | ✅ Completed | Not needed - env var overrides message mode |
 
 ---
 
