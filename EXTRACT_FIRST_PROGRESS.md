@@ -1,6 +1,6 @@
 # Extract-First Pipeline Refactor - Progress Tracker
 
-## Status: Implementation In Progress
+## Status: Deployed - Ready for Testing
 
 **Started**: 2026-02-03
 **Plan File**: `/home/42group/nurliya/EXTRACT_FIRST_PLAN.md`
@@ -66,9 +66,9 @@
 
 | Task | Status | Notes |
 |------|--------|-------|
-| Rebuild API container | ⬜ Pending | |
-| Rebuild Worker containers | ⬜ Pending | |
-| Commit and push | ⬜ Pending | |
+| Rebuild API container | ✅ Completed | 2026-02-03 09:12 UTC |
+| Rebuild Worker containers | ✅ Completed | 2026-02-03 09:12 UTC |
+| Commit and push | ⬜ Pending | Waiting for testing |
 | Update TAXONOMY_PROGRESS.md | ⬜ Pending | |
 
 ---
@@ -131,3 +131,11 @@
 |-------|-----|
 | Topics backward compat assigned ALL categories to one sentiment | Changed prompt to return per-item sentiment; updated handling |
 | N+1 query in publish_taxonomy | Use Review.job_id directly instead of querying Job |
+
+### 2026-02-03 - Deployment Complete
+
+- Docker images rebuilt with cache (13.1GB each due to torch/nvidia deps)
+- API container restarted successfully
+- Worker containers (x2) restarted successfully
+- All services healthy and listening on queues
+- Note: Image size optimization identified for future work (use CPU-only torch, add .dockerignore)
