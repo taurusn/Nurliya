@@ -4,6 +4,7 @@ Consumes messages from RabbitMQ and analyzes reviews using LLM.
 """
 
 import json
+import os
 import time
 import signal
 import sys
@@ -111,6 +112,15 @@ def process_mentions(review_id: str, place_id, review_text: str, analysis: dict)
                     if existing:
                         # Found similar - use existing canonical
                         qdrant_point_id = existing.payload.canonical_id or existing.id
+
+                        # Increment mention count in Qdrant
+                        sentiment_delta = 1.0 if mention["sentiment"] == "positive" else (-1.0 if mention["sentiment"] == "negative" else 0.0)
+                        vector_store.increment_mention_count(
+                            MENTIONS_COLLECTION,
+                            qdrant_point_id,
+                            sentiment_delta=sentiment_delta,
+                        )
+
                         logger.debug("Resolved to existing mention",
                                    extra={"extra_data": {
                                        "text": mention["text"],
@@ -587,6 +597,19 @@ def process_message(ch, method, properties, body):
 
         if not review_text:
             logger.debug("Empty review text, skipping", extra={"extra_data": {"review_id": review_id}})
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            update_job_progress(job_id)
+            return
+
+        # Check if we should skip sentiment analysis (extraction-only mode)
+        # This is used when building taxonomy before running full analysis
+        extraction_only = os.environ.get("EXTRACTION_ONLY_MODE", "").lower() == "true"
+
+        if extraction_only:
+            # Only extract mentions, skip sentiment analysis
+            if place_id:
+                process_mentions(review_id, place_id, review_text, {})
+            logger.info("Extraction complete (no analysis)", extra={"extra_data": {"review_id": review_id}})
             ch.basic_ack(delivery_tag=method.delivery_tag)
             update_job_progress(job_id)
             return

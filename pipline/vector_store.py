@@ -248,6 +248,58 @@ def upsert_vectors_batch(
         return 0
 
 
+def increment_mention_count(
+    collection_name: str,
+    vector_id: str,
+    sentiment_delta: float = 0.0,
+) -> bool:
+    """
+    Increment mention_count and update sentiment_sum for an existing vector.
+
+    Args:
+        collection_name: Target collection
+        vector_id: ID of the vector to update
+        sentiment_delta: Value to add to sentiment_sum (+1, -1, or 0)
+
+    Returns:
+        True if update succeeded, False otherwise
+    """
+    client = _get_client()
+    if client is None:
+        return False
+
+    try:
+        # Retrieve current point
+        points = client.retrieve(
+            collection_name=collection_name,
+            ids=[vector_id],
+            with_payload=True,
+        )
+
+        if not points:
+            logger.warning(f"Vector {vector_id} not found for increment")
+            return False
+
+        current_payload = points[0].payload
+        new_count = current_payload.get("mention_count", 1) + 1
+        new_sentiment_sum = current_payload.get("sentiment_sum", 0.0) + sentiment_delta
+
+        # Update payload
+        client.set_payload(
+            collection_name=collection_name,
+            payload={
+                "mention_count": new_count,
+                "sentiment_sum": new_sentiment_sum,
+            },
+            points=[vector_id],
+        )
+
+        return True
+    except Exception as e:
+        logger.error(f"Failed to increment mention count for {vector_id}: {e}")
+        return False
+
+
 def search_similar(
     collection_name: str,
     query_vector: List[float],

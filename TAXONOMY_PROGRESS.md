@@ -408,6 +408,40 @@ x-powered-by: Next.js
 
 **Portal is now live at: https://onboarding.nurliya.com**
 
+### 2026-02-03 - Bug Fix: Entity Resolution Mention Counts
+
+**Issue:** Products in taxonomy showed `discovered_mention_count: 1` for all items instead of actual aggregated counts.
+
+**Root cause:** Two bugs found:
+1. **Qdrant API mismatch:** `vector_store.py` used deprecated `client.search()` method instead of `client.query_points()` - caused all searches to fail silently, so every mention was treated as new
+2. **Missing increment:** When resolving to existing canonical mention, `mention_count` in Qdrant payload was not incremented
+
+**Fixes applied:**
+
+`vector_store.py`:
+- Fixed `search_similar()` to use `client.query_points()` (qdrant-client 1.7+ API)
+- Added `increment_mention_count()` function to update existing vector's `mention_count` and `sentiment_sum`
+
+```python
+def increment_mention_count(collection_name: str, vector_id: str, sentiment_delta: float = 0.0) -> bool:
+    """Increment mention_count and update sentiment_sum for existing vector."""
+    # Retrieve current payload
+    points = client.retrieve(collection_name, ids=[vector_id], with_payload=True)
+    # Update with incremented values
+    client.set_payload(collection_name, payload={
+        "mention_count": current + 1,
+        "sentiment_sum": current_sentiment + sentiment_delta,
+    }, points=[vector_id])
+```
+
+`worker.py`:
+- Now calls `increment_mention_count()` when resolving to existing mention
+
+**Result:**
+- Before: 11 separate "coffee" products with 1 mention each
+- After: 1 "coffee" product with 111 mentions (proper deduplication)
+- Entity resolution ratio: 4.1x (1170 mentions → 284 unique entities)
+
 ---
 
 **Phase 3 Complete. Ready for Phase 4: Integration.**
