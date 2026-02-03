@@ -11,9 +11,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
 from typing import Optional, List, Set
 from uuid import UUID
-from sqlalchemy import func, text
+from sqlalchemy import func, text, case
 
 from logging_config import get_logger
+import embedding_client
+import vector_store
 from database import (
     Place, Review, ReviewAnalysis, Job, ScrapeJob, ActivityLog, User, AnomalyInsight,
     PlaceTaxonomy, TaxonomyCategory, TaxonomyProduct, RawMention, TaxonomyAuditLog,
@@ -719,8 +721,28 @@ async def update_product(
             message = f"Product '{product.display_name or product.canonical_text}' rejected"
 
         elif request.action == "move":
+            old_category_id = product.assigned_category_id
             product.assigned_category_id = request.assigned_category_id
+
+            # BUG-009 FIX: Cascade update to RawMentions that reference this product
+            # Their resolved_category_id should follow the product to the new category
+            updated_mentions = session.query(RawMention).filter(
+                RawMention.resolved_product_id == product.id
+            ).update(
+                {RawMention.resolved_category_id: request.assigned_category_id},
+                synchronize_session=False
+            )
+            if updated_mentions > 0:
+                logger.info(f"Cascaded category update to {updated_mentions} mentions",
+                           extra={"extra_data": {
+                               "product_id": str(product.id),
+                               "old_category": str(old_category_id) if old_category_id else None,
+                               "new_category": str(request.assigned_category_id) if request.assigned_category_id else None
+                           }})
+
             message = f"Product '{product.display_name or product.canonical_text}' moved"
+            if updated_mentions > 0:
+                message += f" ({updated_mentions} mentions updated)"
 
         elif request.action == "add_variant":
             if not request.variant:
@@ -874,38 +896,411 @@ async def create_product(
         session.close()
 
 
+# --- Taxonomy Publish Helpers ---
+
+def _index_taxonomy_vectors(session, place_id: str, taxonomy_id: str, products, categories) -> tuple:
+    """
+    Generate embeddings and index approved taxonomy items in Qdrant.
+
+    BUG-003 FIX: Added validation and logging for embedding failures.
+
+    Returns:
+        tuple: (indexed_count, skipped_products, skipped_categories)
+    """
+    import numpy as np
+
+    products_to_index = []
+    categories_to_index = []
+    skipped_products = []
+    skipped_categories = []
+
+    # Batch generate embeddings for all products
+    if products:
+        # Collect all texts with their product index
+        all_texts = []
+        product_text_ranges = []  # (product, start_idx, end_idx)
+
+        for p in products:
+            texts = [p.canonical_text] + (p.variants or [])[:3]
+            start_idx = len(all_texts)
+            all_texts.extend(texts)
+            product_text_ranges.append((p, start_idx, len(all_texts)))
+
+        # Single batch embedding call
+        all_embeddings = embedding_client.generate_embeddings(all_texts, normalize=True)
+
+        # BUG-003 FIX: Validate embedding generation result
+        if all_embeddings is None:
+            logger.error(
+                "Embedding generation failed completely for products",
+                extra={"extra_data": {
+                    "place_id": place_id,
+                    "taxonomy_id": taxonomy_id,
+                    "product_count": len(products),
+                    "text_count": len(all_texts)
+                }}
+            )
+            skipped_products = [p.canonical_text for p in products]
+        elif len(all_embeddings) != len(all_texts):
+            logger.error(
+                f"Embedding count mismatch: expected {len(all_texts)}, got {len(all_embeddings)}",
+                extra={"extra_data": {
+                    "place_id": place_id,
+                    "taxonomy_id": taxonomy_id,
+                    "expected": len(all_texts),
+                    "actual": len(all_embeddings)
+                }}
+            )
+            # Process what we can, but log the discrepancy
+            all_embeddings = all_embeddings or []
+
+        if all_embeddings:
+            # BUG-008 FIX: Index each variant separately instead of averaging
+            # This improves cross-lingual matching (Arabic variants match Arabic mentions)
+            for p, start_idx, end_idx in product_text_ranges:
+                # Check if we have embeddings for this product's range
+                if end_idx <= len(all_embeddings):
+                    texts = [p.canonical_text] + (p.variants or [])[:3]
+                    product_embs = all_embeddings[start_idx:end_idx]
+                    category_id = str(p.assigned_category_id) if p.assigned_category_id else None
+                    product_id = str(p.id)
+                    indexed_any = False
+
+                    # Index each variant as a separate point with same entity_id
+                    for i, (text, emb) in enumerate(zip(texts, product_embs)):
+                        if emb is not None and not all(v == 0.0 for v in emb):
+                            # Use product_id for canonical, product_id_variant_{i} for variants
+                            point_id = product_id if i == 0 else f"{product_id}_v{i}"
+                            products_to_index.append((point_id, text, emb, product_id, category_id))
+                            indexed_any = True
+
+                    if indexed_any:
+                        p.vector_id = product_id  # Reference to canonical point
+                    else:
+                        skipped_products.append(p.canonical_text)
+                        logger.warning(
+                            f"Skipping product with invalid embeddings: {p.canonical_text}",
+                            extra={"extra_data": {"product_id": str(p.id)}}
+                        )
+                else:
+                    skipped_products.append(p.canonical_text)
+                    logger.warning(
+                        f"Skipping product - embeddings out of range: {p.canonical_text}",
+                        extra={"extra_data": {"product_id": str(p.id), "start": start_idx, "end": end_idx}}
+                    )
+
+    # Process aspect categories (has_products=False)
+    # BUG-006 FIX: Use stored centroid embeddings when available, fallback to name-based
+    aspect_categories = [c for c in categories if not c.has_products]
+    if aspect_categories:
+        # Separate categories with/without stored centroids
+        cats_with_centroid = [c for c in aspect_categories if c.centroid_embedding]
+        cats_without_centroid = [c for c in aspect_categories if not c.centroid_embedding]
+
+        # Use stored centroids directly (BUG-006 FIX)
+        for c in cats_with_centroid:
+            emb = c.centroid_embedding
+            if emb is not None and not all(v == 0.0 for v in emb):
+                categories_to_index.append((str(c.id), c.name, emb))
+                c.vector_id = str(c.id)
+                logger.debug(f"Using stored centroid for category: {c.name}")
+            else:
+                skipped_categories.append(c.name)
+                logger.warning(f"Stored centroid invalid for category: {c.name}")
+
+        # Generate embeddings from name for categories without centroids (legacy data)
+        if cats_without_centroid:
+            cat_texts = [c.name for c in cats_without_centroid]
+            cat_embeddings = embedding_client.generate_embeddings(cat_texts, normalize=True)
+
+            # BUG-003 FIX: Validate category embedding generation
+            if cat_embeddings is None:
+                logger.error(
+                    "Embedding generation failed for categories without centroids",
+                    extra={"extra_data": {
+                        "place_id": place_id,
+                        "category_count": len(cats_without_centroid)
+                    }}
+                )
+                skipped_categories.extend([c.name for c in cats_without_centroid])
+            elif len(cat_embeddings) != len(cat_texts):
+                logger.error(
+                    f"Category embedding count mismatch: expected {len(cat_texts)}, got {len(cat_embeddings)}",
+                    extra={"extra_data": {"place_id": place_id}}
+                )
+                cat_embeddings = cat_embeddings or []
+
+            if cat_embeddings:
+                for i, c in enumerate(cats_without_centroid):
+                    if i < len(cat_embeddings):
+                        emb = cat_embeddings[i]
+                        if emb is not None and not all(v == 0.0 for v in emb):
+                            categories_to_index.append((str(c.id), c.name, emb))
+                            c.vector_id = str(c.id)
+                            logger.debug(f"Generated embedding from name for category: {c.name}")
+                        else:
+                            skipped_categories.append(c.name)
+                            logger.warning(f"Skipping category with invalid embedding: {c.name}")
+                    else:
+                        skipped_categories.append(c.name)
+
+    # Log summary if any items were skipped
+    if skipped_products or skipped_categories:
+        logger.warning(
+            f"Indexing incomplete: {len(skipped_products)} products and {len(skipped_categories)} categories skipped",
+            extra={"extra_data": {
+                "place_id": place_id,
+                "taxonomy_id": taxonomy_id,
+                "skipped_products": skipped_products[:10],  # Limit to first 10
+                "skipped_categories": skipped_categories[:10]
+            }}
+        )
+
+    indexed_count = vector_store.index_approved_taxonomy(
+        place_id, taxonomy_id, products_to_index, categories_to_index
+    )
+
+    return indexed_count, len(skipped_products), len(skipped_categories)
+
+
+def _resolve_mentions_batch(session, place_id: str, taxonomy_id: str = None) -> tuple:
+    """
+    Resolve RawMentions using vector similarity against approved taxonomy.
+
+    BUG-005 FIX: Now resolves ALL mentions for the place, not just completely unresolved ones.
+    This allows:
+    - Re-resolution when new products are approved
+    - Better matching when a mention was only category-resolved before
+
+    Args:
+        session: Database session
+        place_id: Place UUID
+        taxonomy_id: Optional taxonomy ID to limit resolution to specific taxonomy's products
+
+    Returns:
+        tuple: (products_resolved, categories_resolved)
+    """
+    from uuid import UUID as UUIDType
+    from sqlalchemy import or_
+
+    product_resolved = 0
+    category_resolved = 0
+
+    # Convert place_id to UUID for query if needed
+    place_uuid = UUIDType(place_id) if isinstance(place_id, str) else place_id
+
+    # BUG-005 FIX: Get ALL mentions for this place that could benefit from resolution
+    # This includes:
+    # 1. Completely unresolved (both NULL)
+    # 2. Category-only resolved (product NULL) - might match a newly approved product
+    # 3. Already resolved - might match a BETTER product in new taxonomy
+    mentions = session.query(RawMention).filter(
+        RawMention.place_id == place_uuid,
+    ).all()
+
+    if not mentions:
+        return 0, 0
+
+    # Track which mentions changed for logging
+    newly_resolved = 0
+    re_resolved = 0
+
+    mention_texts = [m.mention_text for m in mentions]
+    embeddings = embedding_client.generate_embeddings(mention_texts, normalize=True)
+
+    if not embeddings:
+        logger.warning("Batch embedding generation failed for mention resolution",
+                      extra={"extra_data": {"place_id": place_id, "mention_count": len(mentions)}})
+        return 0, 0
+
+    for mention, emb in zip(mentions, embeddings):
+        # Skip if embedding failed for this mention
+        if emb is None or (hasattr(emb, '__len__') and len(emb) == 0):
+            continue
+
+        result = vector_store.find_matching_product(
+            text_embedding=emb,
+            place_id=place_id,
+            mention_type=mention.mention_type,
+        )
+
+        if result:
+            payload = result.payload
+            was_unresolved = mention.resolved_product_id is None and mention.resolved_category_id is None
+
+            if payload.entity_type == "product":
+                new_product_id = UUID(payload.entity_id)
+                new_category_id = UUID(payload.category_id) if payload.category_id else None
+
+                # Only count as resolved if it changed
+                if mention.resolved_product_id != new_product_id:
+                    mention.resolved_product_id = new_product_id
+                    mention.resolved_category_id = new_category_id
+                    product_resolved += 1
+                    if was_unresolved:
+                        newly_resolved += 1
+                    else:
+                        re_resolved += 1
+            else:
+                new_category_id = UUID(payload.entity_id)
+                # Only update category if not already product-resolved
+                if mention.resolved_product_id is None and mention.resolved_category_id != new_category_id:
+                    mention.resolved_category_id = new_category_id
+                    category_resolved += 1
+                    if was_unresolved:
+                        newly_resolved += 1
+                    else:
+                        re_resolved += 1
+
+    if re_resolved > 0:
+        logger.info(f"Re-resolved {re_resolved} previously resolved mentions to better matches",
+                   extra={"extra_data": {"place_id": place_id}})
+
+    return product_resolved, category_resolved
+
+
+def _aggregate_taxonomy_analytics(session, taxonomy_id: UUID):
+    """
+    Compute and store aggregated mention_count and avg_sentiment for this taxonomy's products/categories.
+
+    BUG-002 FIX: Category stats now include both:
+    1. Direct category mentions (aspects like "service was slow")
+    2. Indirect mentions through products (e.g., "Spanish Latte" -> "Hot Coffee" category)
+    """
+
+    # Get approved products for this taxonomy (need full objects for category rollup)
+    approved_products = session.query(TaxonomyProduct).filter_by(
+        taxonomy_id=taxonomy_id, is_approved=True
+    ).all()
+    approved_product_ids = [p.id for p in approved_products]
+
+    # Get approved category IDs for this taxonomy
+    approved_category_ids = [
+        c.id for c in session.query(TaxonomyCategory).filter_by(
+            taxonomy_id=taxonomy_id, is_approved=True
+        ).all()
+    ]
+
+    # Build product -> category mapping for rollup
+    product_to_category = {
+        p.id: p.assigned_category_id for p in approved_products if p.assigned_category_id
+    }
+
+    # Aggregate for products (only this taxonomy's products)
+    product_stats_map = {}  # product_id -> (count, sentiment_sum)
+    if approved_product_ids:
+        product_stats = session.query(
+            RawMention.resolved_product_id,
+            func.count(RawMention.id).label('count'),
+            func.avg(case(
+                (RawMention.sentiment == 'positive', 1.0),
+                (RawMention.sentiment == 'negative', -1.0),
+                else_=0.0
+            )).label('avg_sent')
+        ).filter(
+            RawMention.resolved_product_id.in_(approved_product_ids)
+        ).group_by(RawMention.resolved_product_id).all()
+
+        for product_id, count, avg_sent in product_stats:
+            product = session.query(TaxonomyProduct).filter_by(id=product_id).first()
+            if product:
+                product.mention_count = count
+                product.avg_sentiment = (avg_sent + 1) / 2 if avg_sent is not None else 0.5
+                # Store for category rollup
+                product_stats_map[product_id] = (count, avg_sent if avg_sent is not None else 0.0)
+
+    # Aggregate for categories - TWO SOURCES:
+    # 1. Direct category mentions (aspects)
+    # 2. Rollup from products assigned to each category
+    if approved_category_ids:
+        # Initialize category stats with zeros
+        category_totals = {cid: {'count': 0, 'sentiment_sum': 0.0} for cid in approved_category_ids}
+
+        # Source 1: Direct category mentions (aspects like "service was slow")
+        direct_category_stats = session.query(
+            RawMention.resolved_category_id,
+            func.count(RawMention.id).label('count'),
+            func.sum(case(
+                (RawMention.sentiment == 'positive', 1.0),
+                (RawMention.sentiment == 'negative', -1.0),
+                else_=0.0
+            )).label('sent_sum')
+        ).filter(
+            RawMention.resolved_category_id.in_(approved_category_ids),
+            RawMention.resolved_product_id.is_(None),  # Direct mentions only
+        ).group_by(RawMention.resolved_category_id).all()
+
+        for category_id, count, sent_sum in direct_category_stats:
+            if category_id in category_totals:
+                category_totals[category_id]['count'] += count
+                category_totals[category_id]['sentiment_sum'] += (sent_sum or 0.0)
+
+        # Source 2: Rollup from products in each category
+        for product_id, (count, avg_sent) in product_stats_map.items():
+            category_id = product_to_category.get(product_id)
+            if category_id and category_id in category_totals:
+                category_totals[category_id]['count'] += count
+                # Convert avg back to sum: avg_sent * count = sum
+                category_totals[category_id]['sentiment_sum'] += (avg_sent * count)
+
+        # Update category records
+        for category_id, totals in category_totals.items():
+            category = session.query(TaxonomyCategory).filter_by(id=category_id).first()
+            if category:
+                count = totals['count']
+                if count > 0:
+                    avg_sent = totals['sentiment_sum'] / count
+                    category.mention_count = count
+                    category.avg_sentiment = (avg_sent + 1) / 2  # Normalize from [-1,1] to [0,1]
+                else:
+                    category.mention_count = 0
+                    category.avg_sentiment = 0.5  # Neutral default
+
+
 @app.post("/api/onboarding/taxonomies/{taxonomy_id}/publish", response_model=ActionResponse)
 async def publish_taxonomy(
     taxonomy_id: UUID,
     current_user: User = Depends(get_current_user)
 ):
     """
-    Publish a taxonomy (draft -> active).
+    Publish a taxonomy (draft -> active) with vector-based resolution.
 
     This will:
     1. Set status to 'active'
-    2. Set published_at and published_by
-    3. Resolve all RawMentions to approved products/categories
-    4. Log the publish action
+    2. Index approved products/categories in Qdrant PRODUCTS_COLLECTION
+    3. Resolve all RawMentions using vector similarity
+    4. Aggregate mention_count and avg_sentiment on products/categories
+    5. Log the publish action
     """
     session = get_session()
+    lock_acquired = False
     try:
         taxonomy = session.query(PlaceTaxonomy).filter_by(id=taxonomy_id).first()
         if not taxonomy:
             raise HTTPException(status_code=404, detail="Taxonomy not found")
 
+        # BUG-007 FIX: Acquire advisory lock to prevent concurrent publish
+        # Use taxonomy UUID's int representation as lock key
+        lock_key = taxonomy_id.int % (2**31 - 1)  # PostgreSQL bigint limit
+        session.execute(text(f"SELECT pg_advisory_lock({lock_key})"))
+        lock_acquired = True
+
+        # Re-check status after acquiring lock (another request may have published)
+        session.refresh(taxonomy)
         if taxonomy.status == "active":
             raise HTTPException(status_code=400, detail="Taxonomy already published")
 
-        # Check that at least some items are approved
+        place_id = str(taxonomy.place_id)
+
+        # Get approved items
         approved_categories = session.query(TaxonomyCategory).filter_by(
             taxonomy_id=taxonomy_id, is_approved=True
-        ).count()
+        ).all()
         approved_products = session.query(TaxonomyProduct).filter_by(
             taxonomy_id=taxonomy_id, is_approved=True
-        ).count()
+        ).all()
 
-        if approved_categories == 0 and approved_products == 0:
+        if not approved_categories and not approved_products:
             raise HTTPException(status_code=400, detail="No approved categories or products")
 
         # Update taxonomy status
@@ -914,52 +1309,65 @@ async def publish_taxonomy(
         taxonomy.published_at = datetime.utcnow()
         taxonomy.published_by = current_user.id
 
-        # Resolve RawMentions to approved products
-        approved_products_list = session.query(TaxonomyProduct).filter_by(
-            taxonomy_id=taxonomy_id, is_approved=True
-        ).all()
+        # Step 1: Index approved items in Qdrant
+        indexed_count, skipped_products, skipped_categories = _index_taxonomy_vectors(
+            session, place_id, str(taxonomy_id), approved_products, approved_categories
+        )
 
-        # Build mapping: canonical_text -> product_id and variants -> product_id
-        text_to_product = {}
-        for product in approved_products_list:
-            text_to_product[product.canonical_text.lower()] = product.id
-            for variant in (product.variants or []):
-                text_to_product[variant.lower()] = product.id
+        # BUG-003 FIX: Warn if significant items were skipped
+        if skipped_products > 0 or skipped_categories > 0:
+            logger.warning(
+                f"Publish completed with skipped items: {skipped_products} products, {skipped_categories} categories",
+                extra={"extra_data": {"taxonomy_id": str(taxonomy_id), "place_id": place_id}}
+            )
 
-        # Update RawMentions
-        mentions = session.query(RawMention).filter_by(
-            place_id=taxonomy.place_id,
-            mention_type="product",
-            resolved_product_id=None
-        ).all()
+        # Step 2: Resolve mentions using vector similarity
+        products_resolved, categories_resolved = _resolve_mentions_batch(session, place_id)
 
-        resolved_count = 0
-        for mention in mentions:
-            mention_text_lower = mention.mention_text.lower().strip()
-            if mention_text_lower in text_to_product:
-                mention.resolved_product_id = text_to_product[mention_text_lower]
-                resolved_count += 1
+        # Step 3: Aggregate analytics
+        _aggregate_taxonomy_analytics(session, taxonomy_id)
 
         # Log publish action
         log_taxonomy_action(
             session, taxonomy_id, current_user.id,
             "publish", "taxonomy", taxonomy_id,
             {"status": old_status},
-            {"status": "active", "resolved_mentions": resolved_count}
+            {
+                "status": "active",
+                "indexed_vectors": indexed_count,
+                "skipped_products": skipped_products,
+                "skipped_categories": skipped_categories,
+                "products_resolved": products_resolved,
+                "categories_resolved": categories_resolved,
+            }
         )
 
         session.commit()
 
+        # Build response message
+        message = f"Taxonomy published. {indexed_count} items indexed, "
+        message += f"{products_resolved} product mentions and {categories_resolved} category mentions resolved."
+        if skipped_products > 0 or skipped_categories > 0:
+            message += f" Warning: {skipped_products} products and {skipped_categories} categories could not be indexed."
+
         return ActionResponse(
             success=True,
-            message=f"Taxonomy published. {resolved_count} mentions resolved."
+            message=message
         )
     except HTTPException:
         raise
     except Exception as e:
         session.rollback()
+        logger.error(f"Failed to publish taxonomy: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
+        # BUG-007 FIX: Release advisory lock
+        if lock_acquired:
+            try:
+                lock_key = taxonomy_id.int % (2**31 - 1)
+                session.execute(text(f"SELECT pg_advisory_unlock({lock_key})"))
+            except Exception:
+                pass  # Lock will be released when session closes anyway
         session.close()
 
 

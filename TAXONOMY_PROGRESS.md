@@ -61,12 +61,12 @@
 
 ---
 
-## Phase 4: Integration (Weeks 10-11)
+## Phase 4: Integration (Weeks 10-11) 🔄 IN PROGRESS
 
 | Task | Status | Notes |
 |------|--------|-------|
-| Match mentions to approved taxonomy | ⬜ Pending | |
-| Add resolved_products/categories to ReviewAnalysis | ⬜ Pending | |
+| Match mentions to approved taxonomy | ✅ Completed | Vector-based resolution in publish + worker |
+| Add resolved_products/categories to ReviewAnalysis | ✅ Completed | Live resolution in worker.py |
 | Analytics endpoints | ⬜ Pending | /categories, /products, /timeline |
 | Client portal category breakdown | ⬜ Pending | |
 
@@ -444,4 +444,45 @@ def increment_mention_count(collection_name: str, vector_id: str, sentiment_delt
 
 ---
 
-**Phase 3 Complete. Ready for Phase 4: Integration.**
+**Phase 3 Complete. Phase 4 implementation in progress.**
+
+### 2026-02-03 - Phase 4 Implementation Started
+
+See `/home/42group/nurliya/PHASE4_PLAN.md` and `/home/42group/nurliya/PHASE4_PROGRESS.md` for detailed tracking.
+
+**Core implementation complete:**
+- `database.py`: Added `vector_id` column to TaxonomyCategory
+- `vector_store.py`: Added TaxonomyVectorPayload, find_matching_product(), index_approved_taxonomy(), get_active_taxonomy_id()
+- `api.py`: Refactored publish_taxonomy() with vector indexing, batch resolution, analytics aggregation
+- `worker.py`: Added live resolution in process_mentions() with incremental stats updates
+
+**Remaining:**
+- Analytics endpoints (/categories, /products, /timeline)
+- Client portal category breakdown
+- Testing and deployment
+
+### 2026-02-03 - P2 Bug Fixes Complete
+
+All P2 bugs from TAXONOMY_BUGS.md fixed:
+
+**BUG-007: Distributed Lock on Publish**
+- Added PostgreSQL advisory lock to `publish_taxonomy()`
+- Uses `pg_advisory_lock(taxonomy_id.int % (2**31 - 1))`
+- Re-checks status after acquiring lock (double-check pattern)
+- Properly releases lock in finally block
+
+**BUG-008: Product Variants Indexed Individually**
+- Changed `_index_taxonomy_vectors()` to index each variant as separate point
+- Tuple format changed from `(product_id, text, embedding, category_id)` to `(point_id, text, embedding, entity_id, category_id)`
+- Updated `index_approved_taxonomy()` in vector_store.py to handle new format
+- Arabic variants now match Arabic mentions directly (improved cross-lingual matching)
+
+**BUG-009: Cascade Updates on Product Move**
+- Added cascade update to RawMentions when product is moved
+- Updates `resolved_category_id` for all mentions referencing the moved product
+- Response message indicates how many mentions were updated
+
+**All bugs now fixed:**
+- P0: 3/3 fixed
+- P1: 3/3 fixed
+- P2: 3/3 fixed

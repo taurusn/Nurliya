@@ -4,7 +4,7 @@ Handles embedding storage, similarity search, and entity resolution.
 """
 
 import uuid
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, Union
 from dataclasses import dataclass
 from enum import Enum
 
@@ -23,6 +23,9 @@ PRODUCTS_COLLECTION = "products"
 
 # Default similarity threshold for entity resolution
 DEFAULT_SIMILARITY_THRESHOLD = 0.85
+
+# Lower threshold for matching mentions to approved products (catches variants)
+PRODUCT_MATCH_THRESHOLD = 0.80
 
 
 class MentionType(str, Enum):
@@ -66,11 +69,43 @@ class VectorPayload:
 
 
 @dataclass
+class TaxonomyVectorPayload:
+    """Payload for approved taxonomy items in PRODUCTS_COLLECTION."""
+    text: str                          # canonical_text or category name
+    place_id: str
+    taxonomy_id: str
+    entity_type: str                   # 'product' or 'category'
+    entity_id: str                     # UUID of product/category
+    category_id: Optional[str] = None  # Parent category for products
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "text": self.text,
+            "place_id": self.place_id,
+            "taxonomy_id": self.taxonomy_id,
+            "entity_type": self.entity_type,
+            "entity_id": self.entity_id,
+            "category_id": self.category_id,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "TaxonomyVectorPayload":
+        return cls(
+            text=data.get("text", ""),
+            place_id=data.get("place_id", ""),
+            taxonomy_id=data.get("taxonomy_id", ""),
+            entity_type=data.get("entity_type", "product"),
+            entity_id=data.get("entity_id", ""),
+            category_id=data.get("category_id"),
+        )
+
+
+@dataclass
 class SearchResult:
     """Result from similarity search."""
     id: str
     score: float
-    payload: VectorPayload
+    payload: Union[VectorPayload, TaxonomyVectorPayload]
 
 
 def _get_client():
@@ -398,6 +433,183 @@ def find_similar_mention(
     return None
 
 
+def find_matching_product(
+    text_embedding: List[float],
+    place_id: str,
+    mention_type: str,
+    threshold: float = PRODUCT_MATCH_THRESHOLD,
+) -> Optional[SearchResult]:
+    """
+    Find matching approved product/category for a mention.
+
+    Args:
+        text_embedding: Embedding of the mention text
+        place_id: Place to search within
+        mention_type: 'product' or 'aspect'
+        threshold: Similarity threshold (default 0.80)
+
+    Returns:
+        Best matching result if above threshold, else None
+    """
+    entity_type = "product" if mention_type == "product" else "category"
+
+    client = _get_client()
+    if client is None:
+        return None
+
+    try:
+        from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+
+        results = client.query_points(
+            collection_name=PRODUCTS_COLLECTION,
+            query=text_embedding,
+            query_filter=Filter(
+                must=[
+                    FieldCondition(key="place_id", match=MatchValue(value=place_id)),
+                    FieldCondition(key="entity_type", match=MatchValue(value=entity_type)),
+                ]
+            ),
+            limit=1,
+            score_threshold=threshold,
+        )
+
+        if results.points:
+            point = results.points[0]
+            return SearchResult(
+                id=str(point.id),
+                score=point.score,
+                payload=TaxonomyVectorPayload.from_dict(point.payload),
+            )
+
+        return None
+    except Exception as e:
+        logger.error(f"Failed to find matching product: {e}")
+        return None
+
+
+def index_approved_taxonomy(
+    place_id: str,
+    taxonomy_id: str,
+    products: List[Tuple[str, str, List[float], str, Optional[str]]],
+    categories: List[Tuple[str, str, List[float]]],
+) -> int:
+    """
+    Index approved products and categories in PRODUCTS_COLLECTION.
+
+    BUG-008 FIX: Now indexes each variant as a separate point for better cross-lingual matching.
+
+    Args:
+        place_id: Place UUID
+        taxonomy_id: Taxonomy UUID
+        products: List of (point_id, text, embedding, entity_id, category_id)
+                  - point_id: Unique ID for this vector point
+                  - text: The text for this specific variant
+                  - embedding: Vector embedding
+                  - entity_id: Product UUID (same for all variants of a product)
+                  - category_id: Category UUID or None
+        categories: List of (category_id, name, embedding)
+
+    Returns:
+        Number of indexed vectors
+    """
+    client = _get_client()
+    if client is None:
+        logger.warning("Qdrant unavailable, cannot index taxonomy")
+        return 0
+
+    try:
+        from qdrant_client.http.models import PointStruct, Filter, FieldCondition, MatchValue, FilterSelector
+
+        # Clear existing vectors for this place in PRODUCTS_COLLECTION
+        place_filter = Filter(
+            must=[FieldCondition(key="place_id", match=MatchValue(value=place_id))]
+        )
+        client.delete(
+            collection_name=PRODUCTS_COLLECTION,
+            points_selector=FilterSelector(filter=place_filter),
+        )
+
+        points = []
+
+        # Index products (BUG-008 FIX: each variant is a separate point)
+        for point_id, text, embedding, entity_id, category_id in products:
+            payload = TaxonomyVectorPayload(
+                text=text,
+                place_id=place_id,
+                taxonomy_id=taxonomy_id,
+                entity_type="product",
+                entity_id=entity_id,  # Same entity_id for all variants of a product
+                category_id=category_id,
+            )
+            points.append(PointStruct(
+                id=point_id,  # Unique ID per variant
+                vector=embedding,
+                payload=payload.to_dict(),
+            ))
+
+        # Index categories (for aspect resolution)
+        for category_id, name, embedding in categories:
+            payload = TaxonomyVectorPayload(
+                text=name,
+                place_id=place_id,
+                taxonomy_id=taxonomy_id,
+                entity_type="category",
+                entity_id=category_id,
+                category_id=None,
+            )
+            points.append(PointStruct(
+                id=category_id,
+                vector=embedding,
+                payload=payload.to_dict(),
+            ))
+
+        if points:
+            client.upsert(collection_name=PRODUCTS_COLLECTION, points=points)
+
+        logger.info(f"Indexed {len(points)} taxonomy items for place {place_id}")
+        return len(points)
+    except Exception as e:
+        logger.error(f"Failed to index taxonomy: {e}")
+        return 0
+
+
+def get_active_taxonomy_id(place_id: str) -> Optional[str]:
+    """
+    Check if an active taxonomy exists for a place.
+
+    Returns:
+        taxonomy_id if active taxonomy exists, None otherwise
+    """
+    client = _get_client()
+    if client is None:
+        return None
+
+    try:
+        from qdrant_client.http.models import Filter, FieldCondition, MatchValue, ScrollRequest
+
+        place_filter = Filter(
+            must=[FieldCondition(key="place_id", match=MatchValue(value=place_id))]
+        )
+
+        # Use scroll to check if any vectors exist (avoids zero vector issue)
+        result = client.scroll(
+            collection_name=PRODUCTS_COLLECTION,
+            scroll_filter=place_filter,
+            limit=1,
+            with_payload=True,
+            with_vectors=False,
+        )
+
+        points, _ = result
+        if points:
+            return points[0].payload.get("taxonomy_id")
+
+        return None
+    except Exception as e:
+        logger.debug(f"No active taxonomy for place {place_id}: {e}")
+        return None
+
+
 def delete_vector(collection_name: str, vector_id: str) -> bool:
     """Delete a vector by ID."""
     client = _get_client()
@@ -621,12 +833,56 @@ def initialize_collections() -> bool:
         if not ensure_collection(collection_name):
             success = False
 
+    # Create payload indexes for efficient filtering on PRODUCTS_COLLECTION
+    if success:
+        _create_payload_indexes()
+
     if success:
         logger.info("All Qdrant collections initialized")
     else:
         logger.error("Some collections failed to initialize")
 
     return success
+
+
+def _create_payload_indexes():
+    """Create payload indexes for efficient filtering."""
+    client = _get_client()
+    if client is None:
+        return
+
+    try:
+        from qdrant_client.http.models import PayloadSchemaType
+
+        # Index place_id and entity_type on PRODUCTS_COLLECTION for fast filtering
+        for field in ["place_id", "entity_type", "taxonomy_id"]:
+            try:
+                client.create_payload_index(
+                    collection_name=PRODUCTS_COLLECTION,
+                    field_name=field,
+                    field_schema=PayloadSchemaType.KEYWORD,
+                )
+                logger.debug(f"Created payload index for {PRODUCTS_COLLECTION}.{field}")
+            except Exception as e:
+                # Index may already exist
+                if "already exists" not in str(e).lower():
+                    logger.debug(f"Payload index {field} may already exist: {e}")
+
+        # Index place_id and mention_type on MENTIONS_COLLECTION
+        for field in ["place_id", "mention_type"]:
+            try:
+                client.create_payload_index(
+                    collection_name=MENTIONS_COLLECTION,
+                    field_name=field,
+                    field_schema=PayloadSchemaType.KEYWORD,
+                )
+                logger.debug(f"Created payload index for {MENTIONS_COLLECTION}.{field}")
+            except Exception as e:
+                if "already exists" not in str(e).lower():
+                    logger.debug(f"Payload index {field} may already exist: {e}")
+
+    except Exception as e:
+        logger.warning(f"Failed to create some payload indexes: {e}")
 
 
 # Fallback/retry queue for when Qdrant is unavailable
