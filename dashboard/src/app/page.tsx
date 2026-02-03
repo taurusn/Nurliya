@@ -14,6 +14,7 @@ import { ScrapeForm } from '@/components/ScrapeForm'
 import { ConnectionStatus } from '@/components/ConnectionStatus'
 import { LogsTable } from '@/components/LogsTable'
 import { Overview } from '@/components/Overview'
+import { PipelineStatus } from '@/components/PipelineStatus'
 import { Database, Server, Cpu, MessageSquare, Layers } from 'lucide-react'
 
 export default function Dashboard() {
@@ -149,20 +150,13 @@ export default function Dashboard() {
               <StatValue label="Places" value={stats?.places_count ?? '-'} />
               <StatValue label="Reviews" value={stats?.reviews_count ?? '-'} />
               <StatValue label="Analyzed" value={stats?.analyses_count ?? '-'} />
-              <StatValue label="Pending" value={stats?.pending_analyses ?? '-'} />
+              <StatValue label="Mentions" value={stats?.mentions_count ?? '-'} />
             </div>
           </Card>
 
-          {/* Queue Stats */}
-          <Card title="Queue">
-            <div className="space-y-1">
-              <StatValue label="Messages" value={queueStatus?.messages_ready ?? '-'} />
-              <StatValue label="Workers" value={queueStatus?.consumers ?? '-'} />
-              <StatValue 
-                label="Status" 
-                value={queueStatus?.status === 'connected' ? 'Connected' : 'Disconnected'} 
-              />
-            </div>
+          {/* Pipeline Status - Real-time via WebSocket */}
+          <Card title="Pipeline Status">
+            <PipelineStatus stats={stats} />
           </Card>
 
           {/* Jobs Summary */}

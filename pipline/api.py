@@ -102,6 +102,22 @@ async def poll_database():
                     places_count = session.query(Place).count()
                     reviews_count = session.query(Review).count()
                     analyses_count = session.query(ReviewAnalysis).count()
+                    mentions_count = session.query(RawMention).count()
+
+                    # Get RabbitMQ queue status
+                    queue_messages = 0
+                    queue_consumers = 0
+                    try:
+                        import pika
+                        params = pika.URLParameters(RABBITMQ_URL)
+                        connection = pika.BlockingConnection(params)
+                        channel = connection.channel()
+                        queue = channel.queue_declare(queue=QUEUE_NAME, passive=True)
+                        queue_messages = queue.method.message_count
+                        queue_consumers = queue.method.consumer_count
+                        connection.close()
+                    except Exception:
+                        pass  # Queue stats unavailable
 
                     # Get job status counts
                     job_statuses = (
@@ -111,12 +127,38 @@ async def poll_database():
                     )
                     scrape_jobs = {status: count for status, count in job_statuses}
 
-                    # Get active jobs
+                    # Get active jobs with extraction stats
                     active_jobs = (
                         session.query(ScrapeJob)
                         .filter(ScrapeJob.status.in_(["pending", "scraping", "processing"]))
                         .all()
                     )
+
+                    # Build active jobs with extraction progress
+                    active_jobs_data = []
+                    for job in active_jobs:
+                        # Get places for this job
+                        job_places = session.query(Place.id).join(Job).filter(
+                            Job.id.in_(job.pipeline_job_ids or [])
+                        ).all() if job.pipeline_job_ids else []
+                        place_ids = [p[0] for p in job_places]
+
+                        # Count mentions extracted for these places
+                        mentions_extracted = 0
+                        if place_ids:
+                            mentions_extracted = session.query(RawMention).filter(
+                                RawMention.place_id.in_(place_ids)
+                            ).count()
+
+                        active_jobs_data.append({
+                            "id": str(job.id),
+                            "query": job.query,
+                            "status": job.status,
+                            "places_found": job.places_found or 0,
+                            "reviews_total": job.reviews_total or 0,
+                            "reviews_processed": job.reviews_processed or 0,
+                            "mentions_extracted": mentions_extracted,
+                        })
 
                     await manager.broadcast({
                         "type": "stats",
@@ -124,7 +166,10 @@ async def poll_database():
                             "places_count": places_count,
                             "reviews_count": reviews_count,
                             "analyses_count": analyses_count,
+                            "mentions_count": mentions_count,
                             "pending_analyses": reviews_count - analyses_count,
+                            "queue_messages": queue_messages,
+                            "queue_consumers": queue_consumers,
                             "scrape_jobs": {
                                 "pending": scrape_jobs.get("pending", 0),
                                 "scraping": scrape_jobs.get("scraping", 0),
@@ -132,17 +177,7 @@ async def poll_database():
                                 "completed": scrape_jobs.get("completed", 0),
                                 "failed": scrape_jobs.get("failed", 0),
                             },
-                            "active_jobs": [
-                                {
-                                    "id": str(job.id),
-                                    "query": job.query,
-                                    "status": job.status,
-                                    "places_found": job.places_found or 0,
-                                    "reviews_total": job.reviews_total or 0,
-                                    "reviews_processed": job.reviews_processed or 0,
-                                }
-                                for job in active_jobs
-                            ]
+                            "active_jobs": active_jobs_data
                         }
                     })
 
@@ -1781,6 +1816,22 @@ async def get_stats():
         places_count = session.query(Place).count()
         reviews_count = session.query(Review).count()
         analyses_count = session.query(ReviewAnalysis).count()
+        mentions_count = session.query(RawMention).count()
+
+        # Get RabbitMQ queue status
+        queue_messages = 0
+        queue_consumers = 0
+        try:
+            import pika
+            params = pika.URLParameters(RABBITMQ_URL)
+            connection = pika.BlockingConnection(params)
+            channel = connection.channel()
+            queue = channel.queue_declare(queue=QUEUE_NAME, passive=True)
+            queue_messages = queue.method.message_count
+            queue_consumers = queue.method.consumer_count
+            connection.close()
+        except Exception:
+            pass  # Queue stats unavailable
 
         # Job status counts
         job_statuses = (
@@ -1794,7 +1845,10 @@ async def get_stats():
             "places_count": places_count,
             "reviews_count": reviews_count,
             "analyses_count": analyses_count,
+            "mentions_count": mentions_count,
             "pending_analyses": reviews_count - analyses_count,
+            "queue_messages": queue_messages,
+            "queue_consumers": queue_consumers,
             "scrape_jobs": {
                 "pending": scrape_jobs.get("pending", 0),
                 "scraping": scrape_jobs.get("scraping", 0),

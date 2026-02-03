@@ -10,6 +10,7 @@ interface Job {
   places_found: number
   reviews_total: number
   reviews_processed: number
+  mentions_extracted?: number
 }
 
 interface JobProgressProps {
@@ -19,6 +20,7 @@ interface JobProgressProps {
 export function JobProgress({ job }: JobProgressProps) {
   const reviewsProcessed = job.reviews_processed ?? 0
   const reviewsTotal = job.reviews_total ?? 0
+  const mentionsExtracted = job.mentions_extracted ?? 0
   const progress = reviewsTotal > 0
     ? (reviewsProcessed / reviewsTotal) * 100
     : 0
@@ -59,9 +61,16 @@ export function JobProgress({ job }: JobProgressProps) {
         />
       </div>
       
-      <p className="text-xs text-muted mt-2 font-mono">
-        {reviewsProcessed.toLocaleString()} / {reviewsTotal.toLocaleString()} processed
-      </p>
+      <div className="flex justify-between items-center mt-2">
+        <p className="text-xs text-muted font-mono">
+          {reviewsProcessed.toLocaleString()} / {reviewsTotal.toLocaleString()} processed
+        </p>
+        {mentionsExtracted > 0 && (
+          <p className="text-xs text-blue-400 font-mono">
+            {mentionsExtracted.toLocaleString()} mentions
+          </p>
+        )}
+      </div>
     </div>
   )
 }

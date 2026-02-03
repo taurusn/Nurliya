@@ -191,32 +191,43 @@ Return ONLY valid JSON, no markdown or explanation."""
 
 MENTION_EXTRACTION_PROMPT = """You are a mention extractor for Saudi business reviews (cafes, restaurants, hotels, retail).
 
-Your job is to extract SPECIFIC product names and service aspects mentioned in reviews.
+Extract SPECIFIC products and CATEGORIES mentioned in reviews.
+
+PRODUCTS = SPECIFIC menu items ONLY (items with a price on a menu)
+  ✓ Extract: "Spanish Latte", "V60", "كرواسون", "تشيز كيك", "برجر واجيو", "آيس أمريكانو"
+  ✗ Do NOT extract generic terms as products: "coffee", "قهوة", "drinks", "food", "مشروبات"
+
+ASPECTS = ALL CATEGORIES (product categories + service categories)
+  Product categories: "coffee", "قهوة", "juice", "عصير", "desserts", "حلويات", "breakfast", "فطور"
+  Service categories: "service", "خدمة", "price", "سعر", "ambiance", "أجواء", "cleanliness", "نظافة", "staff", "موظفين", "parking", "مواقف"
 
 RULES:
 1. Extract ONLY items explicitly mentioned - never assume or hallucinate
-2. Products = specific items (drinks, food items, dishes by name)
-3. Aspects = service-related topics (speed, staff, cleanliness, atmosphere, parking, delivery, price)
+2. If someone says "القهوة ممتازة" (coffee is excellent) → aspect: "القهوة" (it's a category, not a specific item)
+3. If someone says "السبانش لاتيه لذيذ" (Spanish Latte is delicious) → product: "السبانش لاتيه" (specific menu item)
 4. Keep original text as mentioned (Arabic or English)
 5. Determine sentiment for EACH mention based on context
-6. If a product/aspect is mentioned neutrally (just stated, no opinion), use "neutral"
+6. If mentioned neutrally (just stated, no opinion), use "neutral"
 7. Maximum 10 mentions per review (prioritize most significant)
+8. Do NOT extract: people names, general phrases like "the place", "المكان", objects like "customers", "employees"
 
 EXAMPLES:
 - "السبانش لاتيه لذيذ" → product: "السبانش لاتيه", sentiment: positive
 - "the V60 was bitter" → product: "V60", sentiment: negative
+- "القهوة عندهم ممتازة" → aspect: "القهوة", sentiment: positive (category, not specific item)
 - "الخدمة بطيئة" → aspect: "الخدمة", sentiment: negative
-- "المكان نظيف" → aspect: "النظافة", sentiment: positive
-- "ordered a croissant" → product: "croissant", sentiment: neutral
+- "أسعارهم مرتفعة" → aspect: "الأسعار", sentiment: negative
+- "great coffee" → aspect: "coffee", sentiment: positive (category)
+- "loved the flat white" → product: "flat white", sentiment: positive (specific item)
 
 OUTPUT FORMAT:
 Return ONLY valid JSON (no markdown, no explanation):
 {
   "products": [
-    {"text": "extracted product name", "sentiment": "positive|negative|neutral"}
+    {"text": "specific menu item name", "sentiment": "positive|negative|neutral"}
   ],
   "aspects": [
-    {"text": "extracted aspect", "sentiment": "positive|negative|neutral"}
+    {"text": "category name", "sentiment": "positive|negative|neutral"}
   ]
 }
 
