@@ -129,8 +129,9 @@ services:
       SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL:-}
       # Vector DB
       QDRANT_URL: http://qdrant:6333
-      # Extraction mode (set to "true" to skip sentiment analysis)
-      EXTRACTION_ONLY_MODE: ${EXTRACTION_ONLY_MODE:-false}
+      # Extraction mode - default TRUE for extract-first pipeline
+      # Sentiment analysis runs AFTER taxonomy is approved/published
+      EXTRACTION_ONLY_MODE: ${EXTRACTION_ONLY_MODE:-true}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
