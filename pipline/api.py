@@ -23,6 +23,7 @@ from database import (
 )
 from datetime import datetime
 from config import RABBITMQ_URL, QUEUE_NAME
+from rabbitmq import get_channel, publish_message
 from scraper_client import ScraperClient
 from auth import (
     UserCreate, UserLogin, UserResponse, TokenResponse,
@@ -1344,9 +1345,38 @@ async def publish_taxonomy(
 
         session.commit()
 
+        # Queue reviews for sentiment analysis now that taxonomy is active
+        # Fetch all reviews for this place that don't have analysis yet
+        reviews_to_analyze = session.query(Review).filter(
+            Review.place_id == taxonomy.place_id,
+            Review.job_id.isnot(None)  # Must have a job_id
+        ).outerjoin(ReviewAnalysis, Review.id == ReviewAnalysis.review_id).filter(
+            ReviewAnalysis.id.is_(None)  # No existing analysis
+        ).all()
+
+        queued_count = 0
+        if reviews_to_analyze:
+            try:
+                channel = get_channel()
+                for review in reviews_to_analyze:
+                    # Review already has job_id, no need to query Job
+                    publish_message(channel, {
+                        "review_id": str(review.id),
+                        "job_id": str(review.job_id),
+                        "mode": "sentiment"  # Only sentiment analysis, extraction already done
+                    })
+                    queued_count += 1
+                logger.info(f"Queued {queued_count} reviews for sentiment analysis after publish",
+                           extra={"extra_data": {"taxonomy_id": str(taxonomy_id), "place_id": place_id}})
+            except Exception as e:
+                logger.warning(f"Failed to queue reviews for sentiment analysis: {e}",
+                             extra={"extra_data": {"taxonomy_id": str(taxonomy_id)}})
+
         # Build response message
         message = f"Taxonomy published. {indexed_count} items indexed, "
         message += f"{products_resolved} product mentions and {categories_resolved} category mentions resolved."
+        if queued_count > 0:
+            message += f" {queued_count} reviews queued for sentiment analysis."
         if skipped_products > 0 or skipped_categories > 0:
             message += f" Warning: {skipped_products} products and {skipped_categories} categories could not be indexed."
 

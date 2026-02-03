@@ -14,8 +14,8 @@ from sqlalchemy import text
 
 from logging_config import get_logger
 from rabbitmq import get_consumer_channel, QUEUE_NAME, ANOMALY_QUEUE_NAME, TAXONOMY_CLUSTERING_QUEUE
-from llm_client import analyze_review, generate_anomaly_insight, extract_mentions
-from database import Review, ReviewAnalysis, Job, ScrapeJob, Place, AnomalyInsight, RawMention, get_session
+from llm_client import analyze_review, generate_anomaly_insight, extract_mentions, analyze_with_taxonomy
+from database import Review, ReviewAnalysis, Job, ScrapeJob, Place, AnomalyInsight, RawMention, PlaceTaxonomy, TaxonomyProduct, TaxonomyCategory, get_session
 from uuid import UUID
 from email_service import send_completion_report, gather_scrape_job_stats
 from activity_logger import (
@@ -34,6 +34,57 @@ ENTITY_RESOLUTION_THRESHOLD = 0.85
 
 # Valid sentiment values for mentions
 VALID_SENTIMENTS = {"positive", "negative", "neutral"}
+
+
+def get_active_taxonomy_for_place(session, place_id) -> PlaceTaxonomy:
+    """Get the active (published) taxonomy for a place, if any."""
+    return session.query(PlaceTaxonomy).filter_by(
+        place_id=place_id,
+        status="active"
+    ).first()
+
+
+def get_approved_products_for_taxonomy(session, taxonomy_id) -> list:
+    """
+    Get approved products for a taxonomy formatted for LLM prompt.
+
+    Returns:
+        List of dicts with {id, name, variants}
+    """
+    products = session.query(TaxonomyProduct).filter_by(
+        taxonomy_id=taxonomy_id,
+        is_approved=True
+    ).all()
+
+    return [
+        {
+            "id": str(p.id),
+            "name": p.display_name or p.canonical_text,
+            "variants": p.variants or []
+        }
+        for p in products
+    ]
+
+
+def get_approved_categories_for_taxonomy(session, taxonomy_id) -> list:
+    """
+    Get approved categories for a taxonomy formatted for LLM prompt.
+
+    Returns:
+        List of dicts with {id, name}
+    """
+    categories = session.query(TaxonomyCategory).filter_by(
+        taxonomy_id=taxonomy_id,
+        is_approved=True
+    ).all()
+
+    return [
+        {
+            "id": str(c.id),
+            "name": c.display_name_en or c.name
+        }
+        for c in categories
+    ]
 
 
 # BUG-004 FIX: Removed _increment_product_stats() and _increment_category_stats()
@@ -602,15 +653,23 @@ def save_analysis(review_id: str, analysis: dict):
 
 
 def process_message(ch, method, properties, body):
-    """Process a single review message."""
+    """
+    Process a single review message.
+
+    Supports three modes via message["mode"]:
+    - "extraction": Only extract mentions (no sentiment analysis)
+    - "sentiment": Only sentiment analysis (uses taxonomy if available)
+    - "full" (default): Both extraction and sentiment analysis
+    """
     global shutdown_requested
 
     try:
         message = json.loads(body)
         review_id = message["review_id"]
         job_id = message["job_id"]
+        mode = message.get("mode", "full")  # "extraction" | "sentiment" | "full"
 
-        logger.info("Processing review", extra={"extra_data": {"review_id": review_id, "job_id": job_id}})
+        logger.info("Processing review", extra={"extra_data": {"review_id": review_id, "job_id": job_id, "mode": mode}})
 
         # Fetch review from DB
         session = get_session()
@@ -639,12 +698,15 @@ def process_message(ch, method, properties, body):
             update_job_progress(job_id)
             return
 
-        # Check if we should skip sentiment analysis (extraction-only mode)
-        # This is used when building taxonomy before running full analysis
-        extraction_only = os.environ.get("EXTRACTION_ONLY_MODE", "").lower() == "true"
+        # Determine processing mode
+        # Environment variable overrides message mode for backward compatibility
+        extraction_only_env = os.environ.get("EXTRACTION_ONLY_MODE", "").lower() == "true"
+        if extraction_only_env:
+            mode = "extraction"
 
-        if extraction_only:
-            # Only extract mentions, skip sentiment analysis
+        # Mode: extraction - Only extract mentions, skip sentiment analysis
+        # Used when building taxonomy before running full analysis
+        if mode == "extraction":
             if place_id:
                 process_mentions(review_id, place_id, review_text, {})
             logger.info("Extraction complete (no analysis)", extra={"extra_data": {"review_id": review_id}})
@@ -652,13 +714,46 @@ def process_message(ch, method, properties, body):
             update_job_progress(job_id)
             return
 
+        # Mode: sentiment or full - Run sentiment analysis
+        # Check if we have an active taxonomy for taxonomy-aware analysis
+        taxonomy = None
+        approved_products = []
+        approved_categories = []
+
+        if place_id:
+            session = get_session()
+            try:
+                taxonomy = get_active_taxonomy_for_place(session, place_id)
+                if taxonomy:
+                    approved_products = get_approved_products_for_taxonomy(session, taxonomy.id)
+                    approved_categories = get_approved_categories_for_taxonomy(session, taxonomy.id)
+                    logger.debug("Using taxonomy-aware analysis",
+                               extra={"extra_data": {
+                                   "taxonomy_id": str(taxonomy.id),
+                                   "products": len(approved_products),
+                                   "categories": len(approved_categories)
+                               }})
+            finally:
+                session.close()
+
         # Call LLM API with retry logic
         max_retries = 3
         retry_delay = 30  # seconds
+        analysis = None
 
         for attempt in range(max_retries):
             try:
-                analysis = analyze_review(review_text, review_rating)
+                # Use taxonomy-aware analysis if taxonomy exists
+                if taxonomy and (approved_products or approved_categories):
+                    analysis = analyze_with_taxonomy(
+                        review_text,
+                        approved_products,
+                        approved_categories,
+                        review_rating
+                    )
+                else:
+                    # Fallback to original analysis (no taxonomy)
+                    analysis = analyze_review(review_text, review_rating)
                 break
             except Exception as e:
                 error_msg = str(e)
@@ -692,8 +787,9 @@ def process_message(ch, method, properties, body):
         # Save analysis
         save_analysis(review_id, analysis)
 
-        # Extract and save mentions (non-blocking dual-write)
-        if place_id:
+        # Mode: full - Also extract and save mentions
+        # Skip extraction for "sentiment" mode (mentions already extracted)
+        if mode == "full" and place_id:
             process_mentions(review_id, place_id, review_text, analysis)
 
         # Log activity

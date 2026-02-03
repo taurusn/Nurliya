@@ -305,6 +305,239 @@ def extract_mentions(review_text: str) -> dict:
         return {"products": [], "aspects": []}
 
 
+# Prompt for taxonomy-aware sentiment analysis
+# Used after taxonomy is approved - LLM knows the approved products/categories
+TAXONOMY_AWARE_PROMPT = """You are a review analysis assistant for Saudi businesses.
+
+You will receive:
+1. The original review text
+2. The APPROVED products for this specific business
+3. The APPROVED categories for this specific business
+
+Your job is to:
+1. Determine overall sentiment (positive/neutral/negative) with confidence score
+2. Identify which APPROVED products are mentioned in this review
+3. Identify which APPROVED categories are relevant to this review
+4. Generate summaries that reference the SPECIFIC products/categories mentioned
+5. Generate a suggested reply that addresses the SPECIFIC products/issues
+
+RULES:
+- Match review content to products/categories from the approved lists
+- If a product variant is mentioned (e.g., "سبانش لاتيه" for "Spanish Latte"), still match it
+- Summaries MUST mention specific product/category names, not generic terms
+- Reply should acknowledge specific products praised or complained about
+- Use Saudi dialect naturally in Arabic reply (ياهلا، نقدر، نعتذر منك)
+
+LANGUAGE DETECTION:
+- ar: Arabic (formal or any dialect)
+- en: English
+- arabizi: Arabic written in English letters
+
+URGENCY RULES:
+Set urgent=true if:
+- Sentiment is negative AND score > 0.7
+- Review mentions health/safety issue
+- Review threatens to report or escalate
+
+OUTPUT FORMAT:
+Return ONLY valid JSON (no markdown, no explanation):
+{
+  "sentiment": "positive" | "neutral" | "negative",
+  "score": 0.0-1.0,
+  "matched_products": [
+    {"id": "uuid", "sentiment": "positive|negative|neutral"}
+  ],
+  "matched_categories": [
+    {"id": "uuid", "sentiment": "positive|negative|neutral"}
+  ],
+  "language": "ar" | "en" | "arabizi",
+  "urgent": true | false,
+  "summary_ar": "ملخص يذكر المنتجات المحددة بالاسم",
+  "summary_en": "Summary mentioning specific product names",
+  "suggested_reply_ar": "رد يذكر المنتج أو المشكلة المحددة"
+}
+
+NOTE: For matched_products and matched_categories, specify the sentiment for EACH item
+based on how it was mentioned in the review (positive praise, negative complaint, or neutral mention)."""
+
+
+def _format_taxonomy_for_prompt(products: list, categories: list) -> str:
+    """Format approved products and categories for the LLM prompt."""
+    lines = []
+
+    if products:
+        lines.append("APPROVED PRODUCTS:")
+        for p in products:
+            variants = p.get("variants", [])
+            variant_str = f" (also: {', '.join(variants)})" if variants else ""
+            lines.append(f"  - ID: {p['id']} | Name: {p['name']}{variant_str}")
+
+    if categories:
+        lines.append("\nAPPROVED CATEGORIES:")
+        for c in categories:
+            lines.append(f"  - ID: {c['id']} | Name: {c['name']}")
+
+    if not lines:
+        lines.append("No approved products or categories yet.")
+
+    return "\n".join(lines)
+
+
+def analyze_with_taxonomy(
+    review_text: str,
+    approved_products: list,
+    approved_categories: list,
+    rating: int = None
+) -> dict:
+    """
+    Analyze review with knowledge of approved taxonomy.
+
+    The LLM knows what products/categories exist for this business
+    and can match the review to specific approved items, generating
+    more accurate and specific summaries/replies.
+
+    Args:
+        review_text: The review text to analyze
+        approved_products: List of dicts with {id, name, variants}
+        approved_categories: List of dicts with {id, name}
+        rating: Optional star rating (1-5)
+
+    Returns:
+        Dict with sentiment, score, matched_product_ids, matched_category_ids,
+        language, urgent, summary_ar, summary_en, suggested_reply_ar.
+        Compatible with ReviewAnalysis table schema.
+    """
+    if not review_text or not review_text.strip():
+        return {
+            "sentiment": "neutral",
+            "score": 0.5,
+            "matched_product_ids": [],
+            "matched_category_ids": [],
+            "language": "ar",
+            "urgent": False,
+            "summary_ar": "",
+            "summary_en": "",
+            "suggested_reply_ar": "",
+        }
+
+    # Format taxonomy context for the prompt
+    taxonomy_context = _format_taxonomy_for_prompt(approved_products, approved_categories)
+
+    # Build user prompt
+    prompt = f"""TAXONOMY FOR THIS BUSINESS:
+{taxonomy_context}
+
+REVIEW TO ANALYZE"""
+    if rating:
+        prompt += f" (rating: {rating}/5)"
+    prompt += f""":\n\n{review_text}
+
+Analyze this review and match it to the approved products/categories above.
+Return ONLY the JSON analysis."""
+
+    logger.debug("Calling LLM with taxonomy context",
+                extra={"extra_data": {
+                    "model": VLLM_MODEL,
+                    "text_length": len(review_text),
+                    "products_count": len(approved_products),
+                    "categories_count": len(approved_categories)
+                }})
+
+    try:
+        response = client.chat.completions.create(
+            model=VLLM_MODEL,
+            messages=[
+                {"role": "system", "content": TAXONOMY_AWARE_PROMPT},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.1,
+            max_tokens=1000
+        )
+
+        content = response.choices[0].message.content.strip()
+
+        # Clean up markdown if present
+        if content.startswith("```"):
+            lines = content.split("\n")
+            content = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+
+        # Parse JSON
+        try:
+            result = json.loads(content)
+        except json.JSONDecodeError:
+            start = content.find("{")
+            end = content.rfind("}") + 1
+            if start >= 0 and end > start:
+                result = json.loads(content[start:end])
+            else:
+                logger.error("Failed to parse taxonomy-aware analysis",
+                           extra={"extra_data": {"content": content[:200]}})
+                raise ValueError(f"Could not parse JSON: {content}")
+
+        # Validate and set defaults for required fields
+        result.setdefault("sentiment", "neutral")
+        result.setdefault("score", 0.5)
+        result.setdefault("matched_products", [])
+        result.setdefault("matched_categories", [])
+        result.setdefault("language", "ar")
+        result.setdefault("urgent", False)
+        result.setdefault("summary_ar", "")
+        result.setdefault("summary_en", "")
+        result.setdefault("suggested_reply_ar", "")
+
+        # Extract IDs for backward compatibility
+        result["matched_product_ids"] = [
+            m["id"] if isinstance(m, dict) else m
+            for m in result.get("matched_products", [])
+        ]
+        result["matched_category_ids"] = [
+            m["id"] if isinstance(m, dict) else m
+            for m in result.get("matched_categories", [])
+        ]
+
+        # Convert to topics_positive/topics_negative for backward compatibility
+        # Now uses per-item sentiment from LLM response
+        result["topics_positive"] = []
+        result["topics_negative"] = []
+
+        # Map matched categories to topics based on their individual sentiment
+        for match in result.get("matched_categories", []):
+            if isinstance(match, dict):
+                cat_id = match.get("id")
+                cat_sentiment = match.get("sentiment", "neutral")
+            else:
+                # Handle legacy format (just IDs)
+                cat_id = match
+                cat_sentiment = result["sentiment"]  # Fallback to overall
+
+            # Find category name
+            for cat in approved_categories:
+                if cat["id"] == cat_id:
+                    topic_name = cat["name"].lower()
+                    if cat_sentiment == "positive":
+                        result["topics_positive"].append(topic_name)
+                    elif cat_sentiment == "negative":
+                        result["topics_negative"].append(topic_name)
+                    break
+
+        logger.debug("Taxonomy-aware analysis complete",
+                    extra={"extra_data": {
+                        "sentiment": result.get("sentiment"),
+                        "score": result.get("score"),
+                        "matched_products": len(result.get("matched_product_ids", [])),
+                        "matched_categories": len(result.get("matched_category_ids", []))
+                    }})
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Taxonomy-aware analysis failed: {e}",
+                    extra={"extra_data": {"error": str(e)}})
+        # Fall back to original analysis
+        logger.info("Falling back to original analyze_review()")
+        return analyze_review(review_text, rating)
+
+
 if __name__ == "__main__":
     # Test with sample review
     test_review = "القهوة ممتازة والمكان هادي بس الخدمة بطيئة شوي"
