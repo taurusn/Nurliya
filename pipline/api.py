@@ -1870,6 +1870,96 @@ async def get_stats(place_id: Optional[str] = None):
         session.close()
 
 
+@app.get("/api/pipeline-status")
+async def get_pipeline_status(place_id: Optional[str] = None):
+    """Get pipeline stage status for a place or all places."""
+    session = get_session()
+    try:
+        if place_id:
+            # Single place pipeline status
+            place_uuid = UUID(place_id)
+            place = session.query(Place).filter_by(id=place_uuid).first()
+            if not place:
+                raise HTTPException(status_code=404, detail="Place not found")
+
+            return _get_place_pipeline_status(session, place)
+        else:
+            # All places pipeline status
+            places = session.query(Place).order_by(Place.created_at.desc()).limit(20).all()
+            return {
+                "places": [_get_place_pipeline_status(session, p) for p in places]
+            }
+    finally:
+        session.close()
+
+
+def _get_place_pipeline_status(session, place) -> dict:
+    """Calculate pipeline stage for a single place."""
+    place_id = place.id
+
+    # Count reviews
+    reviews_count = session.query(Review).join(Job).filter(Job.place_id == place_id).count()
+
+    # Count mentions extracted
+    mentions_count = session.query(RawMention).filter(RawMention.place_id == place_id).count()
+
+    # Check taxonomy status
+    taxonomy = session.query(PlaceTaxonomy).filter(
+        PlaceTaxonomy.place_id == place_id
+    ).order_by(PlaceTaxonomy.created_at.desc()).first()
+
+    taxonomy_status = taxonomy.status if taxonomy else None
+
+    # Count analyses
+    analyses_count = session.query(ReviewAnalysis).join(Review).join(Job).filter(
+        Job.place_id == place_id
+    ).count()
+
+    # Determine current stage
+    # Stages: scraping → extracting → clustering → approving → analyzing → complete
+    if reviews_count == 0:
+        stage = "scraping"
+        stage_progress = 0
+    elif mentions_count == 0:
+        stage = "extracting"
+        stage_progress = 0
+    elif mentions_count < reviews_count * 0.3:  # Less than 30% extraction rate
+        stage = "extracting"
+        stage_progress = int((mentions_count / (reviews_count * 0.3)) * 100) if reviews_count > 0 else 0
+    elif taxonomy_status is None:
+        stage = "clustering"
+        stage_progress = 50  # Waiting for clustering to run
+    elif taxonomy_status == "draft":
+        stage = "approving"
+        # Calculate approval progress
+        if taxonomy:
+            total_items = session.query(TaxonomyProduct).filter_by(taxonomy_id=taxonomy.id).count() + \
+                         session.query(TaxonomyCategory).filter_by(taxonomy_id=taxonomy.id).count()
+            approved_items = session.query(TaxonomyProduct).filter_by(taxonomy_id=taxonomy.id, is_approved=True).count() + \
+                            session.query(TaxonomyCategory).filter_by(taxonomy_id=taxonomy.id, is_approved=True).count()
+            stage_progress = int((approved_items / total_items) * 100) if total_items > 0 else 0
+        else:
+            stage_progress = 0
+    elif taxonomy_status == "active" and analyses_count < reviews_count:
+        stage = "analyzing"
+        stage_progress = int((analyses_count / reviews_count) * 100) if reviews_count > 0 else 0
+    else:
+        stage = "complete"
+        stage_progress = 100
+
+    return {
+        "place_id": str(place_id),
+        "place_name": place.name,
+        "stage": stage,
+        "stage_progress": stage_progress,
+        "reviews_count": reviews_count,
+        "mentions_count": mentions_count,
+        "analyses_count": analyses_count,
+        "taxonomy_status": taxonomy_status,
+        "taxonomy_id": str(taxonomy.id) if taxonomy else None,
+    }
+
+
 @app.get("/api/overview")
 async def get_overview(
     place_id: Optional[str] = None,

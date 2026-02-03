@@ -24,6 +24,27 @@ export async function fetchPlaces(): Promise<{ places: Place[] }> {
   return res.json()
 }
 
+export interface PipelineStageStatus {
+  place_id: string
+  place_name: string
+  stage: 'scraping' | 'extracting' | 'clustering' | 'approving' | 'analyzing' | 'complete'
+  stage_progress: number
+  reviews_count: number
+  mentions_count: number
+  analyses_count: number
+  taxonomy_status: string | null
+  taxonomy_id: string | null
+}
+
+export async function fetchPipelineStatus(placeId?: string): Promise<PipelineStageStatus | { places: PipelineStageStatus[] }> {
+  const url = placeId
+    ? `${API_URL}/api/pipeline-status?place_id=${placeId}`
+    : `${API_URL}/api/pipeline-status`
+  const res = await fetch(url)
+  if (!res.ok) throw new Error('Failed to fetch pipeline status')
+  return res.json()
+}
+
 export async function fetchQueueStatus() {
   const res = await fetch(`${API_URL}/api/queue-status`)
   if (!res.ok) throw new Error('Failed to fetch queue status')

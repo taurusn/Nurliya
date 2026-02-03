@@ -4,7 +4,7 @@ import { useEffect, useState, useCallback } from 'react'
 import useSWR from 'swr'
 import { motion } from 'framer-motion'
 import { useWebSocket } from '@/lib/useWebSocket'
-import { fetchStats, fetchQueueStatus, fetchRecentAnalyses, fetchSystemHealth, fetchJobs, fetchPlaces, Place } from '@/lib/api'
+import { fetchStats, fetchQueueStatus, fetchRecentAnalyses, fetchSystemHealth, fetchJobs, fetchPlaces, fetchPipelineStatus, Place, PipelineStageStatus } from '@/lib/api'
 import { Card } from '@/components/Card'
 import { StatValue } from '@/components/StatValue'
 import { StatusIndicator } from '@/components/StatusIndicator'
@@ -37,7 +37,18 @@ export default function Dashboard() {
       revalidateOnFocus: false,
     }
   )
-  
+
+  // Fetch pipeline status for selected place
+  const { data: pipelineStatusData } = useSWR(
+    selectedPlace ? `pipeline-${selectedPlace.id}` : null,
+    () => selectedPlace ? fetchPipelineStatus(selectedPlace.id) : null,
+    {
+      refreshInterval: 3000,
+      revalidateOnFocus: false,
+    }
+  )
+  const pipelineStatus = pipelineStatusData as PipelineStageStatus | null
+
   const { data: queueStatus } = useSWR('queue', fetchQueueStatus, {
     refreshInterval: 5000,
     revalidateOnFocus: false,
@@ -175,7 +186,7 @@ export default function Dashboard() {
 
           {/* Pipeline Status - Real-time via WebSocket */}
           <Card title="Pipeline Status">
-            <PipelineStatus stats={stats} />
+            <PipelineStatus stats={stats} pipelineStatus={pipelineStatus} />
           </Card>
 
           {/* Jobs Summary */}
