@@ -15,6 +15,7 @@
 | P0 (Blocking) | 3 | **Fixed** (2026-02-03) |
 | P1 (High) | 3 | **Fixed** (2026-02-03) |
 | P2 (Medium) | 3 | **Fixed** (2026-02-03) |
+| P2 (Medium) | 3 | **Open** - Extract-First Pipeline (2026-02-03) |
 
 ---
 
@@ -513,6 +514,110 @@ elif request.action == "move":
 
 ---
 
+### BUG-010: No Extraction Validation Before Sentiment Queue
+
+**Severity**: P2 (Medium)
+**Status**: **Open**
+**File**: `pipline/api.py:1383-1408`
+**Related**: Extract-First Pipeline (EXTRACT_FIRST_PLAN.md)
+
+**Description**:
+`publish_taxonomy()` queues reviews with `mode="sentiment"` but doesn't verify that extraction was completed. If extraction phase was skipped or failed, sentiment analysis runs without RawMention context.
+
+**Current Code**:
+```python
+# api.py:1383-1408
+reviews_to_analyze = session.query(Review).filter(
+    Review.place_id == taxonomy.place_id,
+    Review.job_id.isnot(None)
+).outerjoin(ReviewAnalysis, Review.id == ReviewAnalysis.review_id).filter(
+    ReviewAnalysis.id.is_(None)  # No existing analysis
+).all()
+# No check for RawMention extraction completion
+```
+
+**Impact**:
+- Sentiment analysis runs without taxonomy-aware context
+- LLM can't match to products/categories (no extraction data)
+- Silent degradation of analysis quality
+
+**Proposed Fix**:
+```python
+# Before queuing, verify extraction exists
+mentions_count = session.query(RawMention).filter(
+    RawMention.place_id == taxonomy.place_id
+).count()
+if mentions_count == 0:
+    logger.warning("No mentions extracted - sentiment analysis may lack context")
+```
+
+---
+
+### BUG-011: Silent Fallback Loses Taxonomy Context
+
+**Severity**: P2 (Medium)
+**Status**: **Open**
+**File**: `pipline/llm_client.py:545-549`
+**Related**: Extract-First Pipeline
+
+**Description**:
+If `analyze_with_taxonomy()` LLM call fails, it silently falls back to `analyze_review()` WITHOUT taxonomy context. After building and approving a taxonomy, the review loses all taxonomy-aware benefits.
+
+**Current Code**:
+```python
+# llm_client.py:545-549
+except Exception as e:
+    logger.error(f"Taxonomy-aware analysis failed: {e}")
+    # BUG: Falls back to analysis WITHOUT taxonomy context
+    return analyze_review(review_text, rating)
+```
+
+**Impact**:
+- Review analyzed without knowing approved products/categories
+- Summaries say "coffee was good" instead of "Spanish Latte was good"
+- Inconsistent analysis quality across reviews
+
+**Proposed Fix**:
+Option A: Queue for retry with taxonomy context
+Option B: Return error and let worker handle retry
+Option C: Store partial result with flag indicating fallback used
+
+---
+
+### BUG-012: No Explicit Extraction Complete Flag
+
+**Severity**: P2 (Medium)
+**Status**: **Open**
+**Files**: `pipline/worker.py`, `pipline/database.py`
+**Related**: Extract-First Pipeline
+
+**Description**:
+There's no explicit flag on Job to indicate extraction phase completed successfully. Clustering and sentiment queueing rely on implicit checks (review count vs mention count ratio).
+
+**Current Flow**:
+```
+Job completes → update_job_progress() → trigger_taxonomy_clustering()
+                                         └─ is_clustering_needed() checks mention ratio
+```
+
+**Impact**:
+- Race condition: clustering may check before all mentions saved
+- No way to query "jobs with completed extraction"
+- Publish can't verify extraction state
+
+**Proposed Fix**:
+Add `extraction_completed_at` timestamp to Job model:
+```python
+# database.py - Job model
+extraction_completed_at = Column(DateTime)  # Set when all mentions saved
+
+# worker.py - After all reviews processed
+if mode == "extraction":
+    job.extraction_completed_at = datetime.utcnow()
+```
+
+---
+
 ## Design Issues (Not Bugs)
 
 ### DESIGN-001: No Re-indexing Command for Disaster Recovery
@@ -562,3 +667,6 @@ Consider syncing collections or using single collection with status flags.
 | BUG-007 | api.py | 1036-1117 | Phase 3 (line 296-300) |
 | BUG-008 | vector_store.py | 436-487 | Schema (line 358-373) |
 | BUG-009 | api.py | 723-725 | Phase 3 Actions (line 147-163) |
+| BUG-010 | api.py | 1383-1408 | Extract-First Pipeline |
+| BUG-011 | llm_client.py | 545-549 | Extract-First Pipeline |
+| BUG-012 | worker.py, database.py | - | Extract-First Pipeline |
