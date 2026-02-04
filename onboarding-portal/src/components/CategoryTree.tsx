@@ -13,6 +13,8 @@ import {
   FolderTree,
   Package,
   MessageSquare,
+  Pencil,
+  Trash2,
 } from 'lucide-react'
 
 interface CategoryTreeProps {
@@ -23,6 +25,8 @@ interface CategoryTreeProps {
   onReject: (categoryId: string) => void
   onMove: (categoryId: string) => void
   onShowMentions?: (categoryId: string, categoryName: string) => void
+  onEdit?: (categoryId: string) => void
+  onDelete?: (categoryId: string) => void
 }
 
 interface CategoryNodeProps {
@@ -36,6 +40,8 @@ interface CategoryNodeProps {
   onReject: (categoryId: string) => void
   onMove: (categoryId: string) => void
   onShowMentions?: (categoryId: string, categoryName: string) => void
+  onEdit?: (categoryId: string) => void
+  onDelete?: (categoryId: string) => void
 }
 
 function CategoryNode({
@@ -49,6 +55,8 @@ function CategoryNode({
   onReject,
   onMove,
   onShowMentions,
+  onEdit,
+  onDelete,
 }: CategoryNodeProps) {
   const [expanded, setExpanded] = useState(true)
   const hasChildren = children.length > 0
@@ -57,10 +65,10 @@ function CategoryNode({
   return (
     <div>
       <div
-        className={`flex items-center gap-2 px-2 py-1.5 rounded-lg cursor-pointer transition-colors ${
+        className={`flex items-center gap-2 px-3 py-2.5 rounded-lg cursor-pointer transition-colors ${
           isSelected ? 'bg-primary/20' : 'hover:bg-card-hover'
         }`}
-        style={{ paddingLeft: `${depth * 16 + 8}px` }}
+        style={{ paddingLeft: `${depth * 16 + 12}px` }}
         onClick={() => onSelectCategory(category.id)}
       >
         {hasChildren ? (
@@ -100,27 +108,39 @@ function CategoryNode({
         </div>
 
         {isSelected && (
-          <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
+          <div className="flex items-center gap-0.5 flex-shrink-0 ml-2" onClick={(e) => e.stopPropagation()}>
             {!category.is_approved && !category.rejection_reason && (
               <>
-                <Button size="sm" variant="ghost" onClick={() => onApprove(category.id)}>
-                  <Check className="w-4 h-4 text-success" />
+                <Button size="icon" variant="ghost" className="h-7 w-7" onClick={() => onApprove(category.id)} title="Approve">
+                  <Check className="w-3.5 h-3.5 text-success" />
                 </Button>
-                <Button size="sm" variant="ghost" onClick={() => onReject(category.id)}>
-                  <X className="w-4 h-4 text-destructive" />
+                <Button size="icon" variant="ghost" className="h-7 w-7" onClick={() => onReject(category.id)} title="Reject">
+                  <X className="w-3.5 h-3.5 text-destructive" />
                 </Button>
               </>
             )}
-            <Button size="sm" variant="ghost" onClick={() => onMove(category.id)}>
-              <Move className="w-4 h-4 text-muted" />
+            {onEdit && (
+              <Button size="icon" variant="ghost" className="h-7 w-7" onClick={() => onEdit(category.id)} title="Edit">
+                <Pencil className="w-3.5 h-3.5 text-muted" />
+              </Button>
+            )}
+            <Button size="icon" variant="ghost" className="h-7 w-7" onClick={() => onMove(category.id)} title="Move">
+              <Move className="w-3.5 h-3.5 text-muted" />
             </Button>
             {onShowMentions && category.discovered_mention_count > 0 && (
               <Button
-                size="sm"
+                size="icon"
                 variant="ghost"
+                className="h-7 w-7"
                 onClick={() => onShowMentions(category.id, category.display_name_en || category.name)}
+                title="View mentions"
               >
-                <MessageSquare className="w-4 h-4 text-primary" />
+                <MessageSquare className="w-3.5 h-3.5 text-primary" />
+              </Button>
+            )}
+            {onDelete && (
+              <Button size="icon" variant="ghost" className="h-7 w-7" onClick={() => onDelete(category.id)} title="Delete">
+                <Trash2 className="w-3.5 h-3.5 text-muted hover:text-destructive" />
               </Button>
             )}
           </div>
@@ -142,6 +162,8 @@ function CategoryNode({
               onReject={onReject}
               onMove={onMove}
               onShowMentions={onShowMentions}
+              onEdit={onEdit}
+              onDelete={onDelete}
             />
           ))}
         </div>
@@ -158,6 +180,8 @@ export function CategoryTree({
   onReject,
   onMove,
   onShowMentions,
+  onEdit,
+  onDelete,
 }: CategoryTreeProps) {
   const mainCategories = categories.filter((c) => !c.parent_id)
 
@@ -189,6 +213,8 @@ export function CategoryTree({
           onReject={onReject}
           onMove={onMove}
           onShowMentions={onShowMentions}
+          onEdit={onEdit}
+          onDelete={onDelete}
         />
       ))}
     </div>

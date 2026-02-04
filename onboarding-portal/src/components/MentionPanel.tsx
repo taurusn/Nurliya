@@ -1,7 +1,7 @@
 'use client'
 
-import { useState, useEffect } from 'react'
-import { X, MessageSquare, ThumbsUp, ThumbsDown, Minus, Star, ChevronDown, ChevronUp } from 'lucide-react'
+import { useState, useEffect, useRef, useCallback } from 'react'
+import { X, MessageSquare, ThumbsUp, ThumbsDown, Minus, Star, ChevronDown, ChevronUp, Loader2 } from 'lucide-react'
 import { fetchProductMentions, fetchCategoryMentions, Mention, MentionListResponse } from '@/lib/api'
 
 interface MentionPanelProps {
@@ -11,29 +11,75 @@ interface MentionPanelProps {
   onClose: () => void
 }
 
+const PAGE_SIZE = 50
+
 export function MentionPanel({ type, itemId, itemName, onClose }: MentionPanelProps) {
   const [loading, setLoading] = useState(true)
-  const [data, setData] = useState<MentionListResponse | null>(null)
+  const [loadingMore, setLoadingMore] = useState(false)
+  const [mentions, setMentions] = useState<Mention[]>([])
+  const [stats, setStats] = useState<{ matched: number; similar: number; total: number } | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [expandedReviews, setExpandedReviews] = useState<Set<string>>(new Set())
+  const [hasMore, setHasMore] = useState(true)
+  const [offset, setOffset] = useState(0)
 
+  const scrollRef = useRef<HTMLDivElement>(null)
+
+  // Initial load
   useEffect(() => {
-    async function loadMentions() {
+    async function loadInitial() {
       setLoading(true)
       setError(null)
+      setMentions([])
+      setOffset(0)
+      setHasMore(true)
       try {
         const result = type === 'product'
-          ? await fetchProductMentions(itemId)
-          : await fetchCategoryMentions(itemId)
-        setData(result)
+          ? await fetchProductMentions(itemId, true, PAGE_SIZE, 0)
+          : await fetchCategoryMentions(itemId, true, PAGE_SIZE, 0)
+        setMentions(result.mentions)
+        setStats({
+          matched: result.matched_count,
+          similar: result.below_threshold_count,
+          total: result.total,
+        })
+        setHasMore(result.mentions.length < result.total)
+        setOffset(result.mentions.length)
       } catch (e) {
         setError(e instanceof Error ? e.message : 'Failed to load mentions')
       } finally {
         setLoading(false)
       }
     }
-    loadMentions()
+    loadInitial()
   }, [type, itemId])
+
+  // Load more
+  const loadMore = useCallback(async () => {
+    if (loadingMore || !hasMore) return
+    setLoadingMore(true)
+    try {
+      const result = type === 'product'
+        ? await fetchProductMentions(itemId, true, PAGE_SIZE, offset)
+        : await fetchCategoryMentions(itemId, true, PAGE_SIZE, offset)
+      setMentions(prev => [...prev, ...result.mentions])
+      setHasMore(offset + result.mentions.length < result.total)
+      setOffset(prev => prev + result.mentions.length)
+    } catch (e) {
+      console.error('Failed to load more mentions:', e)
+    } finally {
+      setLoadingMore(false)
+    }
+  }, [type, itemId, offset, loadingMore, hasMore])
+
+  // Infinite scroll handler
+  const handleScroll = useCallback(() => {
+    if (!scrollRef.current) return
+    const { scrollTop, scrollHeight, clientHeight } = scrollRef.current
+    if (scrollHeight - scrollTop - clientHeight < 200) {
+      loadMore()
+    }
+  }, [loadMore])
 
   const toggleReview = (reviewId: string) => {
     setExpandedReviews(prev => {
@@ -86,25 +132,29 @@ export function MentionPanel({ type, itemId, itemName, onClose }: MentionPanelPr
         </div>
 
         {/* Stats */}
-        {data && (
+        {stats && (
           <div className="flex gap-4 p-4 border-b border-border bg-card-hover">
             <div className="text-center">
-              <div className="text-2xl font-bold text-success">{data.matched_count}</div>
-              <div className="text-xs text-muted">Matched</div>
+              <div className="text-2xl font-bold text-success">{stats.matched}</div>
+              <div className="text-xs text-muted">Resolved</div>
             </div>
             <div className="text-center">
-              <div className="text-2xl font-bold text-warning">{data.below_threshold_count}</div>
-              <div className="text-xs text-muted">Below Threshold</div>
+              <div className="text-2xl font-bold text-warning">{stats.similar}</div>
+              <div className="text-xs text-muted">{stats.matched === 0 ? 'Discovered' : 'Near Match'}</div>
             </div>
             <div className="text-center">
-              <div className="text-2xl font-bold text-foreground">{data.total}</div>
+              <div className="text-2xl font-bold text-foreground">{stats.total}</div>
               <div className="text-xs text-muted">Total</div>
             </div>
           </div>
         )}
 
         {/* Content */}
-        <div className="flex-1 overflow-y-auto p-4 space-y-3">
+        <div
+          ref={scrollRef}
+          onScroll={handleScroll}
+          className="flex-1 overflow-y-auto p-4 space-y-3"
+        >
           {loading && (
             <div className="text-center py-8 text-muted">Loading mentions...</div>
           )}
@@ -113,11 +163,11 @@ export function MentionPanel({ type, itemId, itemName, onClose }: MentionPanelPr
             <div className="text-center py-8 text-destructive">{error}</div>
           )}
 
-          {data && data.mentions.length === 0 && (
+          {!loading && mentions.length === 0 && (
             <div className="text-center py-8 text-muted">No mentions found</div>
           )}
 
-          {data && data.mentions.map((mention) => (
+          {mentions.map((mention) => (
             <div
               key={mention.id}
               className={`p-3 rounded-lg border ${getSentimentBg(mention.sentiment)} ${
@@ -131,8 +181,7 @@ export function MentionPanel({ type, itemId, itemName, onClose }: MentionPanelPr
                   <span className="text-sm font-medium text-foreground">
                     "{mention.mention_text}"
                   </span>
-                  {/* BUG-014 FIX: Show actual similarity score for below-threshold mentions */}
-                  {mention.similarity_score != null && mention.similarity_score < 0.8 && (
+                  {mention.similarity_score != null && mention.similarity_score < 0.8 && mention.similarity_score > 0 && (
                     <span className={`text-xs px-1.5 py-0.5 rounded ${
                       mention.similarity_score >= 0.7
                         ? 'bg-warning/30 text-warning'
@@ -140,12 +189,12 @@ export function MentionPanel({ type, itemId, itemName, onClose }: MentionPanelPr
                           ? 'bg-warning/20 text-warning'
                           : 'bg-muted/20 text-muted'
                     }`}>
-                      {(mention.similarity_score * 100).toFixed(0)}% similar
+                      {(mention.similarity_score * 100).toFixed(0)}% match
                     </span>
                   )}
                   {mention.similarity_score === 1.0 && (
                     <span className="text-xs px-1.5 py-0.5 bg-success/20 text-success rounded">
-                      Matched
+                      Exact
                     </span>
                   )}
                 </div>
@@ -180,6 +229,20 @@ export function MentionPanel({ type, itemId, itemName, onClose }: MentionPanelPr
               </div>
             </div>
           ))}
+
+          {/* Loading more indicator */}
+          {loadingMore && (
+            <div className="flex justify-center py-4">
+              <Loader2 className="w-5 h-5 animate-spin text-muted" />
+            </div>
+          )}
+
+          {/* End of list */}
+          {!hasMore && mentions.length > 0 && (
+            <div className="text-center py-4 text-xs text-muted">
+              Showing all {mentions.length} mentions
+            </div>
+          )}
         </div>
       </div>
     </div>

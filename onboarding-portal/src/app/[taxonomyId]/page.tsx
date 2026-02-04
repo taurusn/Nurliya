@@ -9,10 +9,15 @@ import {
   approveCategory,
   rejectCategory,
   moveCategory,
+  renameCategory,
   approveProduct,
   rejectProduct,
   moveProduct,
   addProductVariant,
+  updateProduct,
+  mergeProducts,
+  deleteProduct,
+  deleteCategory,
   createCategory,
   createProduct,
   publishTaxonomy,
@@ -29,6 +34,9 @@ import { RejectModal } from '@/components/RejectModal'
 import { MoveModal } from '@/components/MoveModal'
 import { AddCategoryModal } from '@/components/AddCategoryModal'
 import { AddProductModal } from '@/components/AddProductModal'
+import { MergeProductModal } from '@/components/MergeProductModal'
+import { EditProductModal } from '@/components/EditProductModal'
+import { EditCategoryModal } from '@/components/EditCategoryModal'
 import {
   ArrowLeft,
   Check,
@@ -71,6 +79,16 @@ function TaxonomyEditor() {
   const [showAddCategory, setShowAddCategory] = useState(false)
   const [showAddProduct, setShowAddProduct] = useState(false)
   const [mentionPanel, setMentionPanel] = useState<{
+    type: 'product' | 'category'
+    id: string
+    name: string
+  } | null>(null)
+
+  // New editor modals
+  const [mergeModal, setMergeModal] = useState<TaxonomyProduct | null>(null)
+  const [editProductModal, setEditProductModal] = useState<TaxonomyProduct | null>(null)
+  const [editCategoryModal, setEditCategoryModal] = useState<TaxonomyCategory | null>(null)
+  const [deleteConfirm, setDeleteConfirm] = useState<{
     type: 'product' | 'category'
     id: string
     name: string
@@ -165,6 +183,73 @@ function TaxonomyEditor() {
       loadTaxonomy()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to add variant')
+    }
+  }
+
+  // Product editor actions
+  const handleMergeProducts = async (sourceId: string, targetId: string) => {
+    try {
+      await mergeProducts(sourceId, targetId)
+      setMergeModal(null)
+      loadTaxonomy()
+    } catch (err) {
+      throw err // Let the modal handle the error
+    }
+  }
+
+  const handleUpdateProduct = async (
+    productId: string,
+    updates: { display_name?: string; variants?: string[]; category_id?: string | null }
+  ) => {
+    try {
+      await updateProduct(productId, updates)
+      setEditProductModal(null)
+      loadTaxonomy()
+    } catch (err) {
+      throw err
+    }
+  }
+
+  const handleDeleteProduct = async () => {
+    if (!deleteConfirm || deleteConfirm.type !== 'product') return
+    try {
+      await deleteProduct(deleteConfirm.id)
+      setDeleteConfirm(null)
+      loadTaxonomy()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to delete product')
+    }
+  }
+
+  // Category editor actions
+  const handleUpdateCategory = async (
+    categoryId: string,
+    updates: { display_name_en?: string; display_name_ar?: string; parent_id?: string | null }
+  ) => {
+    try {
+      // Use rename for display names
+      if (updates.display_name_en || updates.display_name_ar) {
+        await renameCategory(categoryId, updates.display_name_en, updates.display_name_ar)
+      }
+      // Use move for parent change
+      if (updates.parent_id !== undefined) {
+        await moveCategory(categoryId, updates.parent_id)
+      }
+      setEditCategoryModal(null)
+      loadTaxonomy()
+    } catch (err) {
+      throw err
+    }
+  }
+
+  const handleDeleteCategory = async () => {
+    if (!deleteConfirm || deleteConfirm.type !== 'category') return
+    try {
+      await deleteCategory(deleteConfirm.id)
+      setDeleteConfirm(null)
+      loadTaxonomy()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to delete category')
     }
   }
 
@@ -318,9 +403,9 @@ function TaxonomyEditor() {
 
       {/* Main content */}
       <main className="max-w-7xl mx-auto px-4 py-6">
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
           {/* Categories panel */}
-          <Card className="lg:col-span-1">
+          <Card className="lg:col-span-2">
             <CardHeader className="flex flex-row items-center justify-between">
               <CardTitle className="text-base">
                 <FolderTree className="w-4 h-4 inline mr-2" />
@@ -356,12 +441,24 @@ function TaxonomyEditor() {
                 onShowMentions={(id, name) => {
                   setMentionPanel({ type: 'category', id, name })
                 }}
+                onEdit={(id) => {
+                  const cat = taxonomy.categories.find((c) => c.id === id)
+                  if (cat) setEditCategoryModal(cat)
+                }}
+                onDelete={(id) => {
+                  const cat = taxonomy.categories.find((c) => c.id === id)
+                  setDeleteConfirm({
+                    type: 'category',
+                    id,
+                    name: cat?.display_name_en || cat?.name || 'Category',
+                  })
+                }}
               />
             </CardContent>
           </Card>
 
           {/* Products panel */}
-          <Card className="lg:col-span-2">
+          <Card className="lg:col-span-3">
             <CardHeader className="flex flex-row items-center justify-between">
               <CardTitle className="text-base">
                 <Package className="w-4 h-4 inline mr-2" />
@@ -411,6 +508,22 @@ function TaxonomyEditor() {
                 }}
                 onShowMentions={(id, name) => {
                   setMentionPanel({ type: 'product', id, name })
+                }}
+                onMerge={(id) => {
+                  const prod = taxonomy.products.find((p) => p.id === id)
+                  if (prod) setMergeModal(prod)
+                }}
+                onEdit={(id) => {
+                  const prod = taxonomy.products.find((p) => p.id === id)
+                  if (prod) setEditProductModal(prod)
+                }}
+                onDelete={(id) => {
+                  const prod = taxonomy.products.find((p) => p.id === id)
+                  setDeleteConfirm({
+                    type: 'product',
+                    id,
+                    name: prod?.display_name || prod?.canonical_text || 'Product',
+                  })
                 }}
               />
             </CardContent>
@@ -497,6 +610,62 @@ function TaxonomyEditor() {
         onAdd={handleCreateProduct}
         categories={taxonomy.categories}
       />
+
+      {/* Editor Modals */}
+      {mergeModal && (
+        <MergeProductModal
+          isOpen={!!mergeModal}
+          onClose={() => setMergeModal(null)}
+          onMerge={handleMergeProducts}
+          sourceProduct={mergeModal}
+          products={taxonomy.products}
+        />
+      )}
+
+      {editProductModal && (
+        <EditProductModal
+          isOpen={!!editProductModal}
+          onClose={() => setEditProductModal(null)}
+          onSave={handleUpdateProduct}
+          product={editProductModal}
+          categories={taxonomy.categories}
+        />
+      )}
+
+      {editCategoryModal && (
+        <EditCategoryModal
+          isOpen={!!editCategoryModal}
+          onClose={() => setEditCategoryModal(null)}
+          onSave={handleUpdateCategory}
+          category={editCategoryModal}
+          categories={taxonomy.categories}
+        />
+      )}
+
+      {/* Delete Confirmation */}
+      {deleteConfirm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/50" onClick={() => setDeleteConfirm(null)} />
+          <div className="relative bg-card border border-border rounded-xl p-6 w-full max-w-md mx-4">
+            <h2 className="text-lg font-semibold mb-2">Delete {deleteConfirm.type}?</h2>
+            <p className="text-muted mb-4">
+              Are you sure you want to delete <span className="text-foreground font-medium">{deleteConfirm.name}</span>?
+              This action cannot be undone.
+            </p>
+            <div className="flex gap-3 justify-end">
+              <Button variant="outline" onClick={() => setDeleteConfirm(null)}>
+                Cancel
+              </Button>
+              <Button
+                variant="destructive"
+                onClick={deleteConfirm.type === 'product' ? handleDeleteProduct : handleDeleteCategory}
+              >
+                Delete
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

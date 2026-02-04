@@ -35,6 +35,85 @@ ENTITY_RESOLUTION_THRESHOLD = 0.85
 # Valid sentiment values for mentions
 VALID_SENTIMENTS = {"positive", "negative", "neutral"}
 
+# Sentiment to numeric mapping for averaging
+SENTIMENT_VALUES = {"positive": 1.0, "negative": 0.0, "neutral": 0.5}
+
+# Text matching minimum length (avoids false positives like "بن" matching "بنانا")
+TEXT_MATCH_MIN_LENGTH = 3
+
+
+def _text_matches_product(mention_text: str, canonical_text: str) -> bool:
+    """
+    Check if mention contains product name or vice versa.
+
+    Used as fast path before vector search to catch obvious matches
+    that vectors miss (e.g., "V60 جواتيمالا" contains "v60").
+    """
+    if not mention_text or not canonical_text:
+        return False
+    mention = mention_text.lower().strip()
+    canonical = canonical_text.lower().strip()
+    if len(canonical) >= TEXT_MATCH_MIN_LENGTH and canonical in mention:
+        return True
+    if len(mention) >= TEXT_MATCH_MIN_LENGTH and mention in canonical:
+        return True
+    return False
+
+
+def _update_product_stats(session, product_id: UUID, sentiment: str):
+    """
+    Update product mention_count and avg_sentiment when a new mention is resolved.
+    Uses incremental average formula: new_avg = old_avg + (new_value - old_avg) / new_count
+    """
+    product = session.query(TaxonomyProduct).filter_by(id=product_id).first()
+    if not product:
+        return
+
+    sentiment_value = SENTIMENT_VALUES.get(sentiment, 0.5)
+    old_count = product.mention_count or 0
+    old_avg = float(product.avg_sentiment) if product.avg_sentiment is not None else 0.5
+
+    new_count = old_count + 1
+    # Incremental average formula
+    new_avg = old_avg + (sentiment_value - old_avg) / new_count
+
+    product.mention_count = new_count
+    product.avg_sentiment = round(new_avg, 2)
+
+    logger.debug("Updated product stats",
+                extra={"extra_data": {
+                    "product_id": str(product_id),
+                    "mention_count": new_count,
+                    "avg_sentiment": new_avg
+                }})
+
+
+def _update_category_stats(session, category_id: UUID, sentiment: str):
+    """
+    Update category mention_count and avg_sentiment when a new mention is resolved.
+    Uses incremental average formula.
+    """
+    category = session.query(TaxonomyCategory).filter_by(id=category_id).first()
+    if not category:
+        return
+
+    sentiment_value = SENTIMENT_VALUES.get(sentiment, 0.5)
+    old_count = category.mention_count or 0
+    old_avg = float(category.avg_sentiment) if category.avg_sentiment is not None else 0.5
+
+    new_count = old_count + 1
+    new_avg = old_avg + (sentiment_value - old_avg) / new_count
+
+    category.mention_count = new_count
+    category.avg_sentiment = round(new_avg, 2)
+
+    logger.debug("Updated category stats",
+                extra={"extra_data": {
+                    "category_id": str(category_id),
+                    "mention_count": new_count,
+                    "avg_sentiment": new_avg
+                }})
+
 
 def get_active_taxonomy_for_place(session, place_id) -> PlaceTaxonomy:
     """Get the active (published) taxonomy for a place, if any."""
@@ -228,30 +307,53 @@ def process_mentions(review_id: str, place_id, review_text: str, analysis: dict)
                 # Resolve to active taxonomy if exists
                 resolved_product_id = None
                 resolved_category_id = None
+                resolution_method = None
 
-                if active_taxonomy_id and embedding is not None:
-                    result = vector_store.find_matching_product(
-                        text_embedding=embedding,
-                        place_id=str(place_id),
-                        mention_type=mention_type,
-                    )
+                if active_taxonomy_id:
+                    mention_sentiment = mention.get("sentiment", "neutral")
 
-                    if result:
-                        payload = result.payload
-                        if payload.entity_type == "product":
-                            resolved_product_id = UUID(payload.entity_id)
-                            if payload.category_id:
-                                resolved_category_id = UUID(payload.category_id)
-                            # BUG-004 FIX: Removed _increment_product_stats() call
-                            # Stats computed via _aggregate_taxonomy_analytics() on publish
-                            logger.debug("Resolved mention to product",
-                                       extra={"extra_data": {"text": mention["text"], "product_id": str(resolved_product_id)}})
-                        else:
-                            resolved_category_id = UUID(payload.entity_id)
-                            # BUG-004 FIX: Removed _increment_category_stats() call
-                            # Stats computed via _aggregate_taxonomy_analytics() on publish
-                            logger.debug("Resolved mention to category",
-                                       extra={"extra_data": {"text": mention["text"], "category_id": str(resolved_category_id)}})
+                    # FAST PATH: Try text matching first (catches "V60 جواتيمالا" → "V60")
+                    if mention_type == "product":
+                        taxonomy_products = session.query(TaxonomyProduct).filter_by(
+                            taxonomy_id=active_taxonomy_id
+                        ).all()
+                        for product in taxonomy_products:
+                            if _text_matches_product(mention["text"], product.canonical_text):
+                                resolved_product_id = product.id
+                                resolved_category_id = product.assigned_category_id
+                                resolution_method = "text"
+                                _update_product_stats(session, resolved_product_id, mention_sentiment)
+                                if resolved_category_id:
+                                    _update_category_stats(session, resolved_category_id, mention_sentiment)
+                                logger.debug("Text-matched mention to product",
+                                           extra={"extra_data": {"text": mention["text"], "product": product.canonical_text}})
+                                break
+
+                    # FALLBACK: Vector similarity search (handles synonyms, misspellings)
+                    if resolved_product_id is None and embedding is not None:
+                        result = vector_store.find_matching_product(
+                            text_embedding=embedding,
+                            place_id=str(place_id),
+                            mention_type=mention_type,
+                        )
+
+                        if result:
+                            payload = result.payload
+                            resolution_method = "vector"
+                            if payload.entity_type == "product":
+                                resolved_product_id = UUID(payload.entity_id)
+                                if payload.category_id:
+                                    resolved_category_id = UUID(payload.category_id)
+                                _update_product_stats(session, resolved_product_id, mention_sentiment)
+                                if resolved_category_id:
+                                    _update_category_stats(session, resolved_category_id, mention_sentiment)
+                                logger.debug("Vector-matched mention to product",
+                                           extra={"extra_data": {"text": mention["text"], "product_id": str(resolved_product_id)}})
+                            else:
+                                resolved_category_id = UUID(payload.entity_id)
+                                _update_category_stats(session, resolved_category_id, mention_sentiment)
+                                logger.debug("Vector-matched mention to category",
+                                           extra={"extra_data": {"text": mention["text"], "category_id": str(resolved_category_id)}})
 
                 # Save RawMention to database
                 raw_mention = RawMention(

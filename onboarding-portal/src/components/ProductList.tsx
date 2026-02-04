@@ -1,10 +1,12 @@
 'use client'
 
+import { useState, useMemo } from 'react'
 import { TaxonomyProduct, TaxonomyCategory } from '@/lib/api'
 import { ApprovalBadge } from '@/components/ApprovalBadge'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
-import { Check, X, Move, Plus, MessageSquare } from 'lucide-react'
+import { Check, X, Move, Plus, MessageSquare, GitMerge, Pencil, Trash2, Search } from 'lucide-react'
 
 interface ProductListProps {
   products: TaxonomyProduct[]
@@ -15,6 +17,9 @@ interface ProductListProps {
   onMove: (productId: string) => void
   onAddVariant: (productId: string) => void
   onShowMentions?: (productId: string, productName: string) => void
+  onMerge?: (productId: string) => void
+  onEdit?: (productId: string) => void
+  onDelete?: (productId: string) => void
 }
 
 export function ProductList({
@@ -26,16 +31,34 @@ export function ProductList({
   onMove,
   onAddVariant,
   onShowMentions,
+  onMerge,
+  onEdit,
+  onDelete,
 }: ProductListProps) {
-  // Filter products based on selected category
-  const filteredProducts =
-    selectedCategoryId === null
+  const [searchTerm, setSearchTerm] = useState('')
+
+  // Filter products based on selected category and search term
+  const filteredProducts = useMemo(() => {
+    let filtered = selectedCategoryId === null
       ? products
       : products.filter(
           (p) =>
             p.assigned_category_id === selectedCategoryId ||
             p.discovered_category_id === selectedCategoryId
         )
+
+    // Apply search filter
+    if (searchTerm.trim()) {
+      const search = searchTerm.toLowerCase()
+      filtered = filtered.filter((p) =>
+        p.display_name?.toLowerCase().includes(search) ||
+        p.canonical_text.toLowerCase().includes(search) ||
+        p.variants?.some((v) => v.toLowerCase().includes(search))
+      )
+    }
+
+    return filtered
+  }, [products, selectedCategoryId, searchTerm])
 
   // Group products by status for display
   const pendingProducts = filteredProducts.filter(
@@ -84,18 +107,28 @@ export function ProductList({
       <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
         {!product.is_approved && !product.rejection_reason && (
           <>
-            <Button size="sm" variant="ghost" onClick={() => onApprove(product.id)}>
+            <Button size="sm" variant="ghost" onClick={() => onApprove(product.id)} title="Approve">
               <Check className="w-4 h-4 text-success" />
             </Button>
-            <Button size="sm" variant="ghost" onClick={() => onReject(product.id)}>
+            <Button size="sm" variant="ghost" onClick={() => onReject(product.id)} title="Reject">
               <X className="w-4 h-4 text-destructive" />
             </Button>
           </>
         )}
-        <Button size="sm" variant="ghost" onClick={() => onMove(product.id)}>
+        {onEdit && (
+          <Button size="sm" variant="ghost" onClick={() => onEdit(product.id)} title="Edit">
+            <Pencil className="w-4 h-4 text-muted" />
+          </Button>
+        )}
+        {onMerge && (
+          <Button size="sm" variant="ghost" onClick={() => onMerge(product.id)} title="Merge into another">
+            <GitMerge className="w-4 h-4 text-muted" />
+          </Button>
+        )}
+        <Button size="sm" variant="ghost" onClick={() => onMove(product.id)} title="Move to category">
           <Move className="w-4 h-4 text-muted" />
         </Button>
-        <Button size="sm" variant="ghost" onClick={() => onAddVariant(product.id)}>
+        <Button size="sm" variant="ghost" onClick={() => onAddVariant(product.id)} title="Add variant">
           <Plus className="w-4 h-4 text-muted" />
         </Button>
         {onShowMentions && product.discovered_mention_count > 0 && (
@@ -103,24 +136,39 @@ export function ProductList({
             size="sm"
             variant="ghost"
             onClick={() => onShowMentions(product.id, product.display_name || product.canonical_text)}
+            title="View mentions"
           >
             <MessageSquare className="w-4 h-4 text-primary" />
+          </Button>
+        )}
+        {onDelete && (
+          <Button size="sm" variant="ghost" onClick={() => onDelete(product.id)} title="Delete">
+            <Trash2 className="w-4 h-4 text-muted hover:text-destructive" />
           </Button>
         )}
       </div>
     </div>
   )
 
-  if (filteredProducts.length === 0) {
-    return (
-      <div className="text-center py-8 text-muted">
-        No products in this category
-      </div>
-    )
-  }
-
   return (
     <div className="space-y-4">
+      {/* Search */}
+      <div className="relative">
+        <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted" />
+        <Input
+          value={searchTerm}
+          onChange={(e) => setSearchTerm(e.target.value)}
+          placeholder="Search products..."
+          className="pl-9"
+        />
+      </div>
+
+      {filteredProducts.length === 0 ? (
+        <div className="text-center py-8 text-muted">
+          {searchTerm ? 'No products match your search' : 'No products in this category'}
+        </div>
+      ) : (
+        <>
       {/* Pending */}
       {pendingProducts.length > 0 && (
         <div>
@@ -161,6 +209,8 @@ export function ProductList({
             ))}
           </div>
         </div>
+      )}
+        </>
       )}
     </div>
   )

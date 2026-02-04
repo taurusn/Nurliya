@@ -320,7 +320,8 @@ class TaxonomyProduct(Base):
 class RawMention(Base):
     """
     Raw mentions extracted from reviews.
-    Links to resolved products/categories once taxonomy is approved.
+    Links to discovered products/categories during clustering (draft),
+    and resolved products/categories after taxonomy is approved (published).
     """
     __tablename__ = "raw_mentions"
     __table_args__ = (
@@ -328,6 +329,8 @@ class RawMention(Base):
         Index('ix_raw_mentions_place', 'place_id'),
         Index('ix_raw_mentions_resolved_product', 'resolved_product_id'),
         Index('ix_raw_mentions_resolved_category', 'resolved_category_id'),
+        Index('ix_raw_mentions_discovered_product', 'discovered_product_id'),
+        Index('ix_raw_mentions_discovered_category', 'discovered_category_id'),
     )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -338,15 +341,21 @@ class RawMention(Base):
     sentiment = Column(String(20))  # 'positive', 'negative', 'neutral'
     qdrant_point_id = Column(String(100))  # Reference to embedding in Qdrant
 
-    # Resolution (populated after taxonomy approval)
+    # Discovery (populated during clustering, before approval)
+    discovered_product_id = Column(UUID(as_uuid=True), ForeignKey("taxonomy_products.id", ondelete="SET NULL"), nullable=True)
+    discovered_category_id = Column(UUID(as_uuid=True), ForeignKey("taxonomy_categories.id", ondelete="SET NULL"), nullable=True)
+
+    # Resolution (populated after taxonomy approval/publish)
     resolved_product_id = Column(UUID(as_uuid=True), ForeignKey("taxonomy_products.id", ondelete="SET NULL"), nullable=True)
     resolved_category_id = Column(UUID(as_uuid=True), ForeignKey("taxonomy_categories.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(TIMESTAMP, default=datetime.utcnow)
 
     review = relationship("Review")
     place = relationship("Place")
-    resolved_product = relationship("TaxonomyProduct")
-    resolved_category = relationship("TaxonomyCategory")
+    discovered_product = relationship("TaxonomyProduct", foreign_keys=[discovered_product_id])
+    discovered_category = relationship("TaxonomyCategory", foreign_keys=[discovered_category_id])
+    resolved_product = relationship("TaxonomyProduct", foreign_keys=[resolved_product_id])
+    resolved_category = relationship("TaxonomyCategory", foreign_keys=[resolved_category_id])
 
 
 class TaxonomyAuditLog(Base):

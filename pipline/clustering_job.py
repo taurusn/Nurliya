@@ -35,7 +35,35 @@ HDBSCAN_CONFIG = {
 # Thresholds
 MIN_MENTIONS_FOR_CLUSTERING = 10
 REDISCOVERY_THRESHOLD = 50  # New mentions needed to trigger re-discovery
-SUPER_CATEGORY_SIMILARITY_THRESHOLD = 0.7  # For grouping sub-categories
+SUPER_CATEGORY_SIMILARITY_THRESHOLD = 0.55  # For grouping sub-categories (lowered from 0.7)
+PRODUCT_SIMILARITY_THRESHOLD = 0.78  # For grouping product variants within a cluster
+TEXT_MATCH_MIN_LENGTH = 3  # Minimum chars for text matching to avoid false positives
+
+
+def _text_matches_product(mention_text: str, canonical_text: str, min_length: int = TEXT_MATCH_MIN_LENGTH) -> bool:
+    """
+    Check if mention contains product name or vice versa.
+
+    Used to rescue orphan mentions that vectors missed but clearly match.
+    E.g., "V60 جواتيمالا" contains "v60" → should match V60 product.
+
+    Args:
+        mention_text: The mention text to check
+        canonical_text: Product's canonical text
+        min_length: Minimum characters for match (avoids "بن" matching "بنانا")
+
+    Returns:
+        True if text match found
+    """
+    if not mention_text or not canonical_text:
+        return False
+    mention = mention_text.lower().strip()
+    canonical = canonical_text.lower().strip()
+    if len(canonical) >= min_length and canonical in mention:
+        return True
+    if len(mention) >= min_length and mention in canonical:
+        return True
+    return False
 
 
 @dataclass
@@ -49,6 +77,117 @@ class ClusterItem:
     mention_count: int
     cluster_id: int = -1
     confidence: float = 0.0
+
+
+def deduplicate_cluster_items(
+    items: List[ClusterItem],
+    similarity_threshold: float = PRODUCT_SIMILARITY_THRESHOLD
+) -> List[Dict]:
+    """
+    Sub-cluster items within an HDBSCAN cluster to identify distinct products.
+
+    Uses DBSCAN with cosine similarity on embeddings to group same-language
+    variants (Arabic-Arabic, English-English work well at 0.78+ threshold).
+
+    Args:
+        items: List of ClusterItem objects from one HDBSCAN cluster
+        similarity_threshold: Minimum cosine similarity to group items (default 0.78)
+
+    Returns:
+        List of product dictionaries with:
+        - canonical_text: Most frequent mention text (lowercase)
+        - display_name: Original casing of canonical text
+        - variants: List of other text variations
+        - total_mentions: Sum of mention_count
+        - avg_sentiment: Weighted average sentiment
+    """
+    from sklearn.cluster import DBSCAN
+
+    if not items:
+        return []
+
+    if len(items) == 1:
+        item = items[0]
+        return [{
+            "canonical_text": item.text.lower().strip(),
+            "display_name": item.text,
+            "variants": [],
+            "total_mentions": item.mention_count,
+            "avg_sentiment": item.sentiment_sum / max(item.mention_count, 1),
+            "vector_id": item.vector_id,
+            "mention_vector_ids": [item.vector_id],
+        }]
+
+    # Extract embeddings for sub-clustering
+    embeddings = np.array([item.embedding for item in items])
+
+    # DBSCAN with cosine distance (eps = 1 - similarity)
+    sub_clustering = DBSCAN(
+        eps=1 - similarity_threshold,
+        min_samples=1,
+        metric="cosine"
+    ).fit(embeddings)
+
+    # Group items by sub-cluster label
+    groups: Dict[int, List[ClusterItem]] = defaultdict(list)
+    for i, label in enumerate(sub_clustering.labels_):
+        groups[label].append(items[i])
+
+    # Convert groups to products
+    products = []
+    seen_canonical = set()  # Prevent exact duplicates
+
+    for group_items in groups.values():
+        # Sort by mention_count descending - highest frequency = canonical
+        sorted_items = sorted(group_items, key=lambda x: -x.mention_count)
+
+        canonical = sorted_items[0].text.lower().strip()
+
+        # Skip if we already have this exact canonical text
+        if canonical in seen_canonical:
+            # Merge into existing product
+            for p in products:
+                if p["canonical_text"] == canonical:
+                    for item in sorted_items:
+                        if item.text not in p["variants"] and item.text.lower().strip() != canonical:
+                            p["variants"].append(item.text)
+                        p["total_mentions"] += item.mention_count
+                    break
+            continue
+
+        seen_canonical.add(canonical)
+        display_name = sorted_items[0].text  # Preserve original casing
+
+        # Collect unique variants (excluding canonical)
+        variants = []
+        seen_variants = {canonical}
+        for item in sorted_items[1:]:
+            normalized = item.text.lower().strip()
+            if normalized not in seen_variants:
+                variants.append(item.text)
+                seen_variants.add(normalized)
+
+        # Calculate aggregated metrics
+        total_mentions = sum(item.mention_count for item in group_items)
+        total_sentiment = sum(item.sentiment_sum for item in group_items)
+
+        products.append({
+            "canonical_text": canonical,
+            "display_name": display_name,
+            "variants": variants,
+            "total_mentions": total_mentions,
+            "avg_sentiment": total_sentiment / max(total_mentions, 1),
+            "vector_id": sorted_items[0].vector_id,  # Use highest-mention item's vector
+            # Store ALL vector_ids to link mentions to this product
+            "mention_vector_ids": [item.vector_id for item in group_items],
+        })
+
+    logger.debug(
+        f"Deduplicated {len(items)} items into {len(products)} products",
+        extra={"extra_data": {"input": len(items), "output": len(products)}}
+    )
+
+    return products
 
 
 # LLM prompt for cluster labeling
@@ -562,25 +701,40 @@ def build_hierarchy(
 
         sub_id_map[cluster_id] = sub_cat
 
-    # Create products from items
+    # Create products from items WITH DEDUPLICATION
+    # Group items by cluster first
+    cluster_items: Dict[int, List[ClusterItem]] = defaultdict(list)
     for item in product_items:
-        if item.cluster_id < 0:
-            continue  # Skip noise
+        if item.cluster_id >= 0:  # Skip noise
+            cluster_items[item.cluster_id].append(item)
 
-        category = sub_id_map.get(item.cluster_id)
+    # Process each cluster with deduplication
+    for cluster_id, items in cluster_items.items():
+        category = sub_id_map.get(cluster_id)
         if not category:
             continue
 
-        product = {
-            "id": str(uuid.uuid4()),
-            "canonical_text": item.text.lower().strip(),
-            "display_name": item.text,
-            "discovered_category_id": category["id"],
-            "vector_id": item.vector_id,
-            "discovered_mention_count": item.mention_count,
-            "avg_sentiment": item.sentiment_sum / max(item.mention_count, 1),
-        }
-        hierarchy["products"].append(product)
+        # Deduplicate similar items within this cluster
+        product_groups = deduplicate_cluster_items(items)
+
+        logger.debug(
+            f"Cluster {cluster_id} ({category['name']}): {len(items)} items → {len(product_groups)} products"
+        )
+
+        for group in product_groups:
+            product = {
+                "id": str(uuid.uuid4()),
+                "canonical_text": group["canonical_text"],
+                "display_name": group["display_name"],
+                "variants": group["variants"],
+                "discovered_category_id": category["id"],
+                "vector_id": group["vector_id"],
+                "discovered_mention_count": group["total_mentions"],
+                "avg_sentiment": group["avg_sentiment"],
+                # Store vector_ids to link mentions to this product
+                "mention_vector_ids": group.get("mention_vector_ids", []),
+            }
+            hierarchy["products"].append(product)
 
     # Create aspect categories (flat, no products)
     aspect_clusters = defaultdict(list)
@@ -603,6 +757,8 @@ def build_hierarchy(
             "discovered_mention_count": sum(item.mention_count for item in items),
             # BUG-006 FIX: Include centroid embedding for later indexing
             "centroid_embedding": aspect_centroids.get(cluster_id),
+            # Store vector_ids to link mentions to this category
+            "mention_vector_ids": [item.vector_id for item in items],
         }
         hierarchy["aspect_categories"].append(aspect_cat)
 
@@ -795,7 +951,8 @@ def save_draft_taxonomy(
             session.flush()
             category_id_map[cat_data["id"]] = category
 
-        # Create products
+        # Create products and track mention links
+        product_mention_links = []  # (product_db_id, [vector_ids])
         for prod_data in hierarchy["products"]:
             discovered_cat = category_id_map.get(prod_data["discovered_category_id"])
             product = TaxonomyProduct(
@@ -803,13 +960,74 @@ def save_draft_taxonomy(
                 discovered_category_id=discovered_cat.id if discovered_cat else None,
                 canonical_text=prod_data["canonical_text"],
                 display_name=prod_data["display_name"],
+                variants=prod_data.get("variants", []),  # Save variants
                 vector_id=prod_data.get("vector_id"),
                 discovered_mention_count=prod_data.get("discovered_mention_count", 1),
                 avg_sentiment=prod_data.get("avg_sentiment"),
             )
             session.add(product)
+            session.flush()  # Get product.id
+
+            # Track mentions to link
+            if prod_data.get("mention_vector_ids"):
+                product_mention_links.append((product.id, discovered_cat.id if discovered_cat else None, prod_data["mention_vector_ids"]))
+
+        # Collect category mention links
+        category_mention_links = []  # (category_db_id, [vector_ids])
+        for cat_data in hierarchy.get("aspect_categories", []):
+            db_cat = category_id_map.get(cat_data["id"])
+            if db_cat and cat_data.get("mention_vector_ids"):
+                category_mention_links.append((db_cat.id, cat_data["mention_vector_ids"]))
 
         session.commit()
+
+        # Link mentions to discovered products/categories
+        linked_count = 0
+        for product_id, category_id, vector_ids in product_mention_links:
+            for vector_id in vector_ids:
+                updated = session.query(RawMention).filter_by(
+                    qdrant_point_id=vector_id
+                ).update({
+                    "discovered_product_id": product_id,
+                    "discovered_category_id": category_id,
+                }, synchronize_session=False)
+                linked_count += updated
+
+        for category_id, vector_ids in category_mention_links:
+            for vector_id in vector_ids:
+                updated = session.query(RawMention).filter_by(
+                    qdrant_point_id=vector_id
+                ).update({
+                    "discovered_category_id": category_id,
+                }, synchronize_session=False)
+                linked_count += updated
+
+        session.commit()
+        logger.info(f"Linked {linked_count} mentions to discovered products/categories")
+
+        # TEXT-BASED ORPHAN RESCUE
+        # Some mentions weren't linked during clustering because vectors didn't match,
+        # but they contain the product name (e.g., "V60 جواتيمالا" contains "v60")
+        text_rescued = 0
+        products = session.query(TaxonomyProduct).filter_by(taxonomy_id=taxonomy_id).all()
+        orphan_mentions = session.query(RawMention).filter(
+            RawMention.discovered_product_id.is_(None),
+            RawMention.mention_type == 'product',
+            RawMention.place_id.in_(place_uuids)
+        ).all()
+
+        for orphan in orphan_mentions:
+            for product in products:
+                if _text_matches_product(orphan.mention_text, product.canonical_text):
+                    orphan.discovered_product_id = product.id
+                    orphan.discovered_category_id = product.discovered_category_id
+                    text_rescued += 1
+                    break  # Stop after first match
+
+        if text_rescued > 0:
+            session.commit()
+            logger.info(f"Text matching rescued {text_rescued} orphan mentions",
+                       extra={"extra_data": {"rescued": text_rescued, "total_orphans": len(orphan_mentions)}})
 
         # PHASE 4: Log multi-place info
         place_desc = f"{len(place_ids)} places" if place_ids and len(place_ids) > 1 else f"place {place_id}"

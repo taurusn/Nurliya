@@ -180,6 +180,62 @@ export async function addProductVariant(productId: string, variant: string): Pro
   return res.json()
 }
 
+export async function updateProduct(
+  productId: string,
+  updates: {
+    display_name?: string
+    variants?: string[]
+    category_id?: string | null
+  }
+): Promise<{ success: boolean, message: string }> {
+  const res = await fetch(`${API_URL}/api/onboarding/products/${productId}`, {
+    method: 'PATCH',
+    headers: getAuthHeaders(),
+    body: JSON.stringify({
+      action: 'update',
+      display_name: updates.display_name,
+      variants: updates.variants,
+      assigned_category_id: updates.category_id,
+    }),
+  })
+  if (!res.ok) throw new Error('Failed to update product')
+  return res.json()
+}
+
+export async function mergeProducts(
+  sourceProductId: string,
+  targetProductId: string
+): Promise<{ success: boolean, message: string, product?: TaxonomyProduct }> {
+  const res = await fetch(`${API_URL}/api/onboarding/products/merge`, {
+    method: 'POST',
+    headers: getAuthHeaders(),
+    body: JSON.stringify({
+      source_product_id: sourceProductId,
+      target_product_id: targetProductId,
+    }),
+  })
+  if (!res.ok) throw new Error('Failed to merge products')
+  return res.json()
+}
+
+export async function deleteProduct(productId: string): Promise<{ success: boolean, message: string }> {
+  const res = await fetch(`${API_URL}/api/onboarding/products/${productId}`, {
+    method: 'DELETE',
+    headers: getAuthHeaders(),
+  })
+  if (!res.ok) throw new Error('Failed to delete product')
+  return res.json()
+}
+
+export async function deleteCategory(categoryId: string): Promise<{ success: boolean, message: string }> {
+  const res = await fetch(`${API_URL}/api/onboarding/categories/${categoryId}`, {
+    method: 'DELETE',
+    headers: getAuthHeaders(),
+  })
+  if (!res.ok) throw new Error('Failed to delete category')
+  return res.json()
+}
+
 export async function createCategory(
   taxonomyId: string,
   name: string,
@@ -264,10 +320,12 @@ export interface OrphanMentionsResponse {
 // Fetch mentions for a product
 export async function fetchProductMentions(
   productId: string,
-  includeBelow: boolean = true
+  includeBelow: boolean = true,
+  limit: number = 50,
+  offset: number = 0
 ): Promise<MentionListResponse> {
   const res = await fetch(
-    `${API_URL}/api/onboarding/products/${productId}/mentions?include_below_threshold=${includeBelow}`,
+    `${API_URL}/api/onboarding/products/${productId}/mentions?include_below_threshold=${includeBelow}&limit=${limit}&offset=${offset}`,
     { headers: getAuthHeaders() }
   )
   if (!res.ok) throw new Error('Failed to fetch product mentions')
@@ -277,10 +335,12 @@ export async function fetchProductMentions(
 // Fetch mentions for a category
 export async function fetchCategoryMentions(
   categoryId: string,
-  includeBelow: boolean = true
+  includeBelow: boolean = true,
+  limit: number = 50,
+  offset: number = 0
 ): Promise<MentionListResponse> {
   const res = await fetch(
-    `${API_URL}/api/onboarding/categories/${categoryId}/mentions?include_below_threshold=${includeBelow}`,
+    `${API_URL}/api/onboarding/categories/${categoryId}/mentions?include_below_threshold=${includeBelow}&limit=${limit}&offset=${offset}`,
     { headers: getAuthHeaders() }
   )
   if (!res.ok) throw new Error('Failed to fetch category mentions')

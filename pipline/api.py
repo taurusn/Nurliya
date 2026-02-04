@@ -1029,12 +1029,23 @@ async def get_product_mentions(
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
 
-        # Get mentions that resolved to this product
-        matched_mentions = session.query(RawMention, Review).join(
-            Review, RawMention.review_id == Review.id
-        ).filter(
-            RawMention.resolved_product_id == product_uuid
-        ).all()
+        # Check if taxonomy is draft (not yet published)
+        is_draft = product.taxonomy and product.taxonomy.status != 'active'
+
+        # For draft: use discovered_product_id (set during clustering)
+        # For published: use resolved_product_id (set during publish)
+        if is_draft:
+            matched_mentions = session.query(RawMention, Review).join(
+                Review, RawMention.review_id == Review.id
+            ).filter(
+                RawMention.discovered_product_id == product_uuid
+            ).all()
+        else:
+            matched_mentions = session.query(RawMention, Review).join(
+                Review, RawMention.review_id == Review.id
+            ).filter(
+                RawMention.resolved_product_id == product_uuid
+            ).all()
 
         # BUG-014 FIX: Get below-threshold mentions using vector similarity search
         # These are mentions SIMILAR to this product but didn't pass the 0.80 threshold
@@ -1165,6 +1176,9 @@ async def get_category_mentions(
 
     BUG-014 FIX: Now uses vector similarity search to find mentions SIMILAR to this
     specific category, instead of returning all unresolved mentions.
+
+    DRAFT FIX: For draft taxonomies, use centroid embedding to show potential matches
+    since resolved_category_id won't be set until publish.
     """
     session = get_session()
     try:
@@ -1173,16 +1187,27 @@ async def get_category_mentions(
         if not category:
             raise HTTPException(status_code=404, detail="Category not found")
 
-        # Get mentions that resolved to this category
-        matched_mentions = session.query(RawMention, Review).join(
-            Review, RawMention.review_id == Review.id
-        ).filter(
-            RawMention.resolved_category_id == category_uuid
-        ).all()
+        # Check if taxonomy is draft (not yet published)
+        is_draft = category.taxonomy and category.taxonomy.status != 'active'
 
-        # BUG-014 FIX: Get below-threshold mentions using vector similarity search
-        below_threshold_mentions = []
-        if include_below_threshold and category.taxonomy:
+        # For draft: use discovered_category_id (set during clustering)
+        # For published: use resolved_category_id (set during publish)
+        if is_draft:
+            matched_mentions = session.query(RawMention, Review).join(
+                Review, RawMention.review_id == Review.id
+            ).filter(
+                RawMention.discovered_category_id == category_uuid
+            ).all()
+        else:
+            matched_mentions = session.query(RawMention, Review).join(
+                Review, RawMention.review_id == Review.id
+            ).filter(
+                RawMention.resolved_category_id == category_uuid
+            ).all()
+
+        # For draft taxonomies OR below-threshold search: use vector similarity
+        similar_mentions = []
+        if category.taxonomy and (is_draft or include_below_threshold):
             # FEATURE-001: Use all_place_ids for multi-branch taxonomy support
             place_ids = [str(p) for p in category.taxonomy.all_place_ids]
 
@@ -1190,15 +1215,17 @@ async def get_category_mentions(
             category_embedding = _get_category_embedding(session, category)
 
             if category_embedding:
-                # Search MENTIONS_COLLECTION for similar unresolved mentions
-                # FEATURE-001: Search across ALL places in shared taxonomy
+                # Search MENTIONS_COLLECTION for similar mentions
+                # For draft: get all potential matches (>= 0.55)
+                # For published: get below-threshold near-misses (0.55-0.80)
+                search_limit = 100 if is_draft else 30
                 similar_results = vector_store.search_similar(
                     collection_name=vector_store.MENTIONS_COLLECTION,
                     query_vector=category_embedding,
-                    place_ids=place_ids,  # Multi-place support
+                    place_ids=place_ids,
                     mention_type='aspect',
-                    limit=30,
-                    score_threshold=0.55,  # Lower bound for "near miss"
+                    limit=search_limit,
+                    score_threshold=0.55,
                 )
 
                 if similar_results:
@@ -1206,44 +1233,47 @@ async def get_category_mentions(
                     matched_ids = {str(rm.id) for rm, _ in matched_mentions}
 
                     for result in similar_results:
-                        # Filter: below 0.80 threshold (these are "near misses")
-                        if result.score < 0.80:
+                        # For draft: include ALL similar mentions as potential matches
+                        # For published: only include below-threshold (< 0.80)
+                        if is_draft or result.score < 0.80:
                             # Find mention by qdrant_point_id
                             mention = session.query(RawMention).filter_by(
                                 qdrant_point_id=result.id
                             ).first()
 
                             if mention and str(mention.id) not in matched_ids:
-                                # Only include unresolved mentions
-                                if mention.resolved_category_id is None:
-                                    review = session.query(Review).filter_by(
-                                        id=mention.review_id
-                                    ).first()
-                                    if review:
-                                        below_threshold_mentions.append(
-                                            (mention, review, result.score)
-                                        )
+                                review = session.query(Review).filter_by(
+                                    id=mention.review_id
+                                ).first()
+                                if review:
+                                    similar_mentions.append(
+                                        (mention, review, result.score)
+                                    )
 
                 logger.debug(
-                    f"BUG-014: Category {category.name} - found {len(below_threshold_mentions)} similar below-threshold mentions",
+                    f"Category {category.name} - found {len(similar_mentions)} similar mentions (draft={is_draft})",
                     extra={"extra_data": {"category_id": category_id}}
                 )
             else:
-                # Fallback if no embedding available
+                # Fallback if no embedding available - use text search
                 logger.warning(
-                    f"BUG-014: No embedding for category {category_id}, using fallback query",
+                    f"No embedding for category {category_id}, using fallback text search",
                     extra={"extra_data": {"category_id": category_id}}
                 )
                 # FEATURE-001: Query across all places in shared taxonomy
                 place_uuids = [UUID(p) if isinstance(p, str) else p for p in place_ids]
-                unresolved = session.query(RawMention, Review).join(
+                # Search for mentions containing category name keywords
+                category_keywords = category.name.replace('_', ' ').replace('&', '').split()
+                fallback_query = session.query(RawMention, Review).join(
                     Review, RawMention.review_id == Review.id
                 ).filter(
                     RawMention.place_id.in_(place_uuids),
                     RawMention.mention_type == 'aspect',
-                    RawMention.resolved_category_id.is_(None)
-                ).limit(20).all()
-                below_threshold_mentions = [(rm, rev, 0.0) for rm, rev in unresolved]
+                )
+                if not is_draft:
+                    fallback_query = fallback_query.filter(RawMention.resolved_category_id.is_(None))
+                fallback_results = fallback_query.limit(50).all()
+                similar_mentions = [(rm, rev, 0.5) for rm, rev in fallback_results]
 
         # Build response
         mentions = []
@@ -1263,8 +1293,8 @@ async def get_category_mentions(
                 similarity_score=1.0  # Matched
             ))
 
-        # Add below-threshold mentions with actual similarity scores
-        for rm, review, score in below_threshold_mentions:
+        # Add similar mentions with actual similarity scores
+        for rm, review, score in similar_mentions:
             mentions.append(MentionResponse(
                 id=str(rm.id),
                 mention_text=rm.mention_text,
@@ -1289,7 +1319,7 @@ async def get_category_mentions(
             mentions=mentions,
             total=total,
             matched_count=len(matched_mentions),
-            below_threshold_count=len(below_threshold_mentions)
+            below_threshold_count=len(similar_mentions)
         )
     finally:
         session.close()
@@ -1328,38 +1358,70 @@ async def get_orphan_mentions(
         if not taxonomy:
             raise HTTPException(status_code=404, detail="Taxonomy not found")
 
-        place_id = taxonomy.place_id
+        # PHASE 4: Support multi-place taxonomies
+        place_ids = taxonomy.all_place_ids
 
-        # Get unresolved product mentions (orphans)
-        product_orphans_query = session.query(RawMention, Review).join(
-            Review, RawMention.review_id == Review.id
-        ).filter(
-            RawMention.place_id == place_id,
-            RawMention.mention_type == 'product',
-            RawMention.resolved_product_id.is_(None)
-        ).limit(limit).all()
+        # Check if draft (use discovered_*) or published (use resolved_*)
+        is_draft = taxonomy.status != 'active'
 
-        # Get unresolved category/aspect mentions (orphans)
-        category_orphans_query = session.query(RawMention, Review).join(
-            Review, RawMention.review_id == Review.id
-        ).filter(
-            RawMention.place_id == place_id,
-            RawMention.mention_type == 'aspect',
-            RawMention.resolved_category_id.is_(None)
-        ).limit(limit).all()
+        if is_draft:
+            # For DRAFT: orphans are those without discovered_product_id
+            product_orphans_query = session.query(RawMention, Review).join(
+                Review, RawMention.review_id == Review.id
+            ).filter(
+                RawMention.place_id.in_(place_ids),
+                RawMention.mention_type == 'product',
+                RawMention.discovered_product_id.is_(None)
+            ).limit(limit).all()
 
-        # Count totals
-        total_product_orphans = session.query(RawMention).filter(
-            RawMention.place_id == place_id,
-            RawMention.mention_type == 'product',
-            RawMention.resolved_product_id.is_(None)
-        ).count()
+            category_orphans_query = session.query(RawMention, Review).join(
+                Review, RawMention.review_id == Review.id
+            ).filter(
+                RawMention.place_id.in_(place_ids),
+                RawMention.mention_type == 'aspect',
+                RawMention.discovered_category_id.is_(None)
+            ).limit(limit).all()
 
-        total_category_orphans = session.query(RawMention).filter(
-            RawMention.place_id == place_id,
-            RawMention.mention_type == 'aspect',
-            RawMention.resolved_category_id.is_(None)
-        ).count()
+            total_product_orphans = session.query(RawMention).filter(
+                RawMention.place_id.in_(place_ids),
+                RawMention.mention_type == 'product',
+                RawMention.discovered_product_id.is_(None)
+            ).count()
+
+            total_category_orphans = session.query(RawMention).filter(
+                RawMention.place_id.in_(place_ids),
+                RawMention.mention_type == 'aspect',
+                RawMention.discovered_category_id.is_(None)
+            ).count()
+        else:
+            # For PUBLISHED: orphans are those without resolved_product_id
+            product_orphans_query = session.query(RawMention, Review).join(
+                Review, RawMention.review_id == Review.id
+            ).filter(
+                RawMention.place_id.in_(place_ids),
+                RawMention.mention_type == 'product',
+                RawMention.resolved_product_id.is_(None)
+            ).limit(limit).all()
+
+            category_orphans_query = session.query(RawMention, Review).join(
+                Review, RawMention.review_id == Review.id
+            ).filter(
+                RawMention.place_id.in_(place_ids),
+                RawMention.mention_type == 'aspect',
+                RawMention.resolved_category_id.is_(None)
+            ).limit(limit).all()
+
+            total_product_orphans = session.query(RawMention).filter(
+                RawMention.place_id.in_(place_ids),
+                RawMention.mention_type == 'product',
+                RawMention.resolved_product_id.is_(None)
+            ).count()
+
+            total_category_orphans = session.query(RawMention).filter(
+                RawMention.place_id.in_(place_ids),
+                RawMention.mention_type == 'aspect',
+                RawMention.resolved_category_id.is_(None)
+            ).count()
 
         # Build response
         product_orphans = []
