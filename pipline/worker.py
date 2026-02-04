@@ -680,6 +680,7 @@ def process_message(ch, method, properties, body):
             if not review:
                 logger.warning("Review not found, acknowledging", extra={"extra_data": {"review_id": review_id}})
                 ch.basic_ack(delivery_tag=method.delivery_tag)
+                update_job_progress(job_id)  # BUG FIX: Must update progress even for missing reviews
                 return
 
             review_text = review.text
@@ -782,6 +783,7 @@ def process_message(ch, method, properties, body):
                         logger.error("Max retries reached, dead-lettering", extra={"extra_data": {"review_id": review_id}})
                         log_system_error("worker", f"Max retries for review {review_id}", {"review_id": review_id})
                         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+                        update_job_progress(job_id)  # BUG FIX: Must update progress even for dead-lettered reviews
                         return
 
         # Save analysis

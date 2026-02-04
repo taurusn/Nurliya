@@ -334,6 +334,52 @@ existing = session.query(PlaceTaxonomy).filter(
 
 ---
 
+### 2026-02-04 - BUG FIX: Job Progress Counter Not Incremented
+
+**Issue Discovered:**
+During testing of multi-branch scrape (Specialty Bean Roastery), the Al Khobar job got stuck at 923/989 reviews (66 reviews missing). Manual intervention was required to complete the job.
+
+**Root Cause Analysis:**
+
+Investigated `worker.py` and found **two code paths** where messages are consumed but `update_job_progress()` is never called:
+
+| Location | Condition | Action | Bug |
+|----------|-----------|--------|-----|
+| Line 680-683 | Review not found in DB | `basic_ack()` + return | No progress update |
+| Line 784 | Max retries exceeded | `basic_nack(requeue=False)` + return | No progress update |
+
+Both paths permanently consume the message (either ACK or dead-letter) without incrementing `job.processed_reviews`. This causes the job to get stuck forever since `total_reviews` can never be reached.
+
+**Other paths (OK):**
+- Line 771: Rate limit → `basic_nack(requeue=True)` - OK, message will be reprocessed
+- Line 826: Generic exception → `basic_nack(requeue=True)` - OK, message will be reprocessed
+
+**Fix Applied:**
+
+```python
+# Fix 1: Line 683 - Review not found
+ch.basic_ack(delivery_tag=method.delivery_tag)
+update_job_progress(job_id)  # BUG FIX: Must update progress even for missing reviews
+return
+
+# Fix 2: Line 785 - Dead-letter after max retries
+ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+update_job_progress(job_id)  # BUG FIX: Must update progress even for dead-lettered reviews
+return
+```
+
+**Impact:**
+- Jobs will now complete correctly even if some reviews fail
+- 66 reviews (or any failed reviews) won't cause job to get stuck
+- Dead-lettered reviews are still logged for debugging but don't block job completion
+
+**Files Modified:**
+- `pipline/worker.py` - Added `update_job_progress()` calls to two error paths
+
+**Syntax verified:** `python3 -m py_compile worker.py` passed
+
+---
+
 ### 2026-02-04 - Analysis Complete
 
 **BUG-014 Root Cause Identified:**

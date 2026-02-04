@@ -18,6 +18,7 @@
 | P0 (Blocking) | 3 | **Fixed** (2026-02-03) |
 | P1 (High) | 3 | **Fixed** (2026-02-03) |
 | P1 (High) | 1 | **Implemented** - Mention Audit (BUG-014) - awaiting deploy |
+| P1 (High) | 1 | **Fixed** - Job Progress Counter (BUG-015) - awaiting deploy |
 | P2 (Medium) | 4 | **Fixed** (BUG-007,008,009,013) |
 | P2 (Medium) | 3 | **Open** - Extract-First Pipeline (BUG-010,011,012) |
 | Feature | 1 | **Implemented** - Multi-Branch Shared Taxonomy (FEATURE-001) - awaiting deploy |
@@ -795,6 +796,63 @@ The product must have an embedding stored or be able to generate one. Options:
 
 **Workaround** (until fixed):
 OS can manually search reviews for product names to find variants.
+
+---
+
+### BUG-015: Job Progress Counter Not Incremented on Error Paths
+
+**Severity**: P1 (High)
+**Status**: **FIXED** (2026-02-04)
+**File**: `pipline/worker.py:680-683, 784`
+**Discovered During**: Phase 4 testing (multi-branch scrape)
+
+**Description**:
+During multi-branch scrape testing, the Al Khobar job got stuck at 923/989 reviews. Investigation revealed two code paths in `process_message()` where messages are permanently consumed (ACK or dead-letter) but `update_job_progress()` is never called.
+
+**Symptoms**:
+- Job stuck at X/Y reviews forever
+- RabbitMQ queue is empty (all messages consumed)
+- Job status remains "processing" even though no work remains
+
+**Root Cause**:
+Two error paths in `worker.py` exit without updating progress:
+
+1. **Line 680-683** - Review not found in database:
+```python
+if not review:
+    ch.basic_ack(delivery_tag=method.delivery_tag)
+    return  # BUG: Never calls update_job_progress()
+```
+
+2. **Line 784** - Dead-letter after max retries:
+```python
+ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+return  # BUG: Never calls update_job_progress()
+```
+
+**Impact**:
+- Jobs with ANY failed reviews get stuck permanently
+- Manual database intervention required to complete jobs
+- Clustering never triggered (waits for job completion)
+- Multi-branch scrapes particularly affected (more reviews = more chances for failure)
+
+**Fix Applied**:
+Added `update_job_progress(job_id)` calls before returning in both error paths:
+
+```python
+# Fix 1: Review not found
+if not review:
+    ch.basic_ack(delivery_tag=method.delivery_tag)
+    update_job_progress(job_id)  # ADDED
+    return
+
+# Fix 2: Dead-letter after max retries
+ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+update_job_progress(job_id)  # ADDED
+return
+```
+
+**Note**: Other NACK paths (`requeue=True`) are OK because messages will be reprocessed.
 
 ---
 
