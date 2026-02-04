@@ -121,7 +121,7 @@ export function MentionPanel({ type, itemId, itemName, onClose }: MentionPanelPr
             <div
               key={mention.id}
               className={`p-3 rounded-lg border ${getSentimentBg(mention.sentiment)} ${
-                mention.similarity_score !== null && mention.similarity_score < 0.8 ? 'opacity-75' : ''
+                mention.similarity_score != null && mention.similarity_score < 0.8 ? 'opacity-75' : ''
               }`}
             >
               {/* Mention header */}
@@ -132,7 +132,7 @@ export function MentionPanel({ type, itemId, itemName, onClose }: MentionPanelPr
                     "{mention.mention_text}"
                   </span>
                   {/* BUG-014 FIX: Show actual similarity score for below-threshold mentions */}
-                  {mention.similarity_score !== null && mention.similarity_score < 0.8 && (
+                  {mention.similarity_score != null && mention.similarity_score < 0.8 && (
                     <span className={`text-xs px-1.5 py-0.5 rounded ${
                       mention.similarity_score >= 0.7
                         ? 'bg-warning/30 text-warning'
