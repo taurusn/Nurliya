@@ -12,6 +12,7 @@ import {
   Move,
   FolderTree,
   Package,
+  MessageSquare,
 } from 'lucide-react'
 
 interface CategoryTreeProps {
@@ -21,6 +22,7 @@ interface CategoryTreeProps {
   onApprove: (categoryId: string) => void
   onReject: (categoryId: string) => void
   onMove: (categoryId: string) => void
+  onShowMentions?: (categoryId: string, categoryName: string) => void
 }
 
 interface CategoryNodeProps {
@@ -33,6 +35,7 @@ interface CategoryNodeProps {
   onApprove: (categoryId: string) => void
   onReject: (categoryId: string) => void
   onMove: (categoryId: string) => void
+  onShowMentions?: (categoryId: string, categoryName: string) => void
 }
 
 function CategoryNode({
@@ -45,6 +48,7 @@ function CategoryNode({
   onApprove,
   onReject,
   onMove,
+  onShowMentions,
 }: CategoryNodeProps) {
   const [expanded, setExpanded] = useState(true)
   const hasChildren = children.length > 0
@@ -110,6 +114,15 @@ function CategoryNode({
             <Button size="sm" variant="ghost" onClick={() => onMove(category.id)}>
               <Move className="w-4 h-4 text-muted" />
             </Button>
+            {onShowMentions && category.discovered_mention_count > 0 && (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => onShowMentions(category.id, category.display_name_en || category.name)}
+              >
+                <MessageSquare className="w-4 h-4 text-primary" />
+              </Button>
+            )}
           </div>
         )}
       </div>
@@ -128,6 +141,7 @@ function CategoryNode({
               onApprove={onApprove}
               onReject={onReject}
               onMove={onMove}
+              onShowMentions={onShowMentions}
             />
           ))}
         </div>
@@ -143,6 +157,7 @@ export function CategoryTree({
   onApprove,
   onReject,
   onMove,
+  onShowMentions,
 }: CategoryTreeProps) {
   const mainCategories = categories.filter((c) => !c.parent_id)
 
@@ -173,6 +188,7 @@ export function CategoryTree({
           onApprove={onApprove}
           onReject={onReject}
           onMove={onMove}
+          onShowMentions={onShowMentions}
         />
       ))}
     </div>

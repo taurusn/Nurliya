@@ -38,7 +38,10 @@ import {
   Plus,
   RefreshCw,
   AlertCircle,
+  MessageSquare,
 } from 'lucide-react'
+import { MentionPanel } from '@/components/MentionPanel'
+import { OrphanPanel } from '@/components/OrphanPanel'
 
 function TaxonomyEditor() {
   const params = useParams()
@@ -67,6 +70,11 @@ function TaxonomyEditor() {
   const [variantModal, setVariantModal] = useState<{ id: string; name: string } | null>(null)
   const [showAddCategory, setShowAddCategory] = useState(false)
   const [showAddProduct, setShowAddProduct] = useState(false)
+  const [mentionPanel, setMentionPanel] = useState<{
+    type: 'product' | 'category'
+    id: string
+    name: string
+  } | null>(null)
 
   const loadTaxonomy = async () => {
     setLoading(true)
@@ -345,6 +353,9 @@ function TaxonomyEditor() {
                     currentCategoryId: cat?.parent_id,
                   })
                 }}
+                onShowMentions={(id, name) => {
+                  setMentionPanel({ type: 'category', id, name })
+                }}
               />
             </CardContent>
           </Card>
@@ -398,11 +409,29 @@ function TaxonomyEditor() {
                     name: prod?.display_name || prod?.canonical_text || 'Product',
                   })
                 }}
+                onShowMentions={(id, name) => {
+                  setMentionPanel({ type: 'product', id, name })
+                }}
               />
             </CardContent>
           </Card>
         </div>
+
+        {/* Orphan Mentions Panel */}
+        <div className="mt-6">
+          <OrphanPanel taxonomyId={taxonomyId} />
+        </div>
       </main>
+
+      {/* Mention Panel Modal */}
+      {mentionPanel && (
+        <MentionPanel
+          type={mentionPanel.type}
+          itemId={mentionPanel.id}
+          itemName={mentionPanel.name}
+          onClose={() => setMentionPanel(null)}
+        />
+      )}
 
       {/* Modals */}
       <RejectModal

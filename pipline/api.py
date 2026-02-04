@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
 from typing import Optional, List, Set
 from uuid import UUID
-from sqlalchemy import func, text, case
+from sqlalchemy import func, text, case, or_
 
 from logging_config import get_logger
 import embedding_client
@@ -928,6 +928,474 @@ async def create_product(
     except Exception as e:
         session.rollback()
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        session.close()
+
+
+# --- Mention Endpoints for Onboarding Audit ---
+
+# BUG-014 FIX: Helper functions to get embeddings for vector similarity search
+
+def _get_product_embedding(session, product: TaxonomyProduct) -> Optional[List[float]]:
+    """
+    Get embedding for a product from PRODUCTS_COLLECTION or generate from text.
+
+    BUG-014 FIX: Used for finding similar mentions below threshold.
+
+    Checks in order:
+    1. PRODUCTS_COLLECTION (indexed during publish)
+    2. Generate from canonical_text + variants
+    """
+    # Try to get from PRODUCTS_COLLECTION
+    if product.vector_id:
+        client = vector_store._get_client()
+        if client:
+            try:
+                points = client.retrieve(
+                    collection_name=vector_store.PRODUCTS_COLLECTION,
+                    ids=[product.vector_id],
+                    with_vectors=True
+                )
+                if points and points[0].vector:
+                    return points[0].vector
+            except Exception as e:
+                logger.debug(f"Could not retrieve product embedding from Qdrant: {e}")
+
+    # Fallback: Generate from canonical_text + variants
+    texts = [product.canonical_text] + (product.variants or [])[:2]
+    embeddings = embedding_client.generate_embeddings(texts, normalize=True)
+    if embeddings:
+        import numpy as np
+        # Average the embeddings for canonical + variants
+        avg_embedding = np.mean(embeddings, axis=0).tolist()
+        return avg_embedding
+
+    return None
+
+
+def _get_category_embedding(session, category: TaxonomyCategory) -> Optional[List[float]]:
+    """
+    Get embedding for a category from centroid_embedding or generate from name.
+
+    BUG-014 FIX: Used for finding similar mentions below threshold.
+    """
+    # Use stored centroid from clustering (BUG-006 fix)
+    if category.centroid_embedding:
+        return category.centroid_embedding
+
+    # Fallback: Generate from category name
+    embeddings = embedding_client.generate_embeddings([category.name], normalize=True)
+    return embeddings[0] if embeddings else None
+
+
+class MentionResponse(BaseModel):
+    id: str
+    mention_text: str
+    mention_type: str
+    sentiment: Optional[str]
+    review_id: str
+    review_text: str
+    review_author: Optional[str]
+    review_rating: Optional[float]
+    review_date: Optional[str]
+    similarity_score: Optional[float] = None
+
+
+class MentionListResponse(BaseModel):
+    mentions: List[MentionResponse]
+    total: int
+    matched_count: int
+    below_threshold_count: int
+
+
+@app.get("/api/onboarding/products/{product_id}/mentions", response_model=MentionListResponse)
+async def get_product_mentions(
+    product_id: str,
+    include_below_threshold: bool = True,
+    limit: int = 50,
+    offset: int = 0,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Get mentions linked to a specific product, including near-misses below threshold.
+
+    BUG-014 FIX: Now uses vector similarity search to find mentions SIMILAR to this
+    specific product, instead of returning all unresolved mentions.
+    """
+    session = get_session()
+    try:
+        product_uuid = UUID(product_id)
+        product = session.query(TaxonomyProduct).filter_by(id=product_uuid).first()
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found")
+
+        # Get mentions that resolved to this product
+        matched_mentions = session.query(RawMention, Review).join(
+            Review, RawMention.review_id == Review.id
+        ).filter(
+            RawMention.resolved_product_id == product_uuid
+        ).all()
+
+        # BUG-014 FIX: Get below-threshold mentions using vector similarity search
+        # These are mentions SIMILAR to this product but didn't pass the 0.80 threshold
+        below_threshold_mentions = []
+        if include_below_threshold and product.taxonomy:
+            # FEATURE-001: Use all_place_ids for multi-branch taxonomy support
+            place_ids = [str(p) for p in product.taxonomy.all_place_ids]
+
+            # Get product embedding for similarity search
+            product_embedding = _get_product_embedding(session, product)
+
+            if product_embedding:
+                # Search MENTIONS_COLLECTION for similar unresolved mentions
+                # FEATURE-001: Search across ALL places in shared taxonomy
+                similar_results = vector_store.search_similar(
+                    collection_name=vector_store.MENTIONS_COLLECTION,
+                    query_vector=product_embedding,
+                    place_ids=place_ids,  # Multi-place support
+                    mention_type='product',
+                    limit=30,
+                    score_threshold=0.55,  # Lower bound for "near miss"
+                )
+
+                if similar_results:
+                    # Get IDs of already-matched mentions to exclude
+                    matched_ids = {str(rm.id) for rm, _ in matched_mentions}
+
+                    for result in similar_results:
+                        # Filter: below 0.80 threshold (these are "near misses")
+                        if result.score < 0.80:
+                            # Find mention by qdrant_point_id
+                            mention = session.query(RawMention).filter_by(
+                                qdrant_point_id=result.id
+                            ).first()
+
+                            if mention and str(mention.id) not in matched_ids:
+                                # Only include unresolved mentions
+                                if mention.resolved_product_id is None:
+                                    review = session.query(Review).filter_by(
+                                        id=mention.review_id
+                                    ).first()
+                                    if review:
+                                        below_threshold_mentions.append(
+                                            (mention, review, result.score)
+                                        )
+
+                logger.debug(
+                    f"BUG-014: Product {product.canonical_text} - found {len(below_threshold_mentions)} similar below-threshold mentions",
+                    extra={"extra_data": {"product_id": product_id}}
+                )
+            else:
+                # Fallback if no embedding available (shouldn't happen normally)
+                logger.warning(
+                    f"BUG-014: No embedding for product {product_id}, using fallback query",
+                    extra={"extra_data": {"product_id": product_id}}
+                )
+                # FEATURE-001: Query across all places in shared taxonomy
+                place_uuids = [UUID(p) if isinstance(p, str) else p for p in place_ids]
+                unresolved = session.query(RawMention, Review).join(
+                    Review, RawMention.review_id == Review.id
+                ).filter(
+                    RawMention.place_id.in_(place_uuids),
+                    RawMention.mention_type == 'product',
+                    RawMention.resolved_product_id.is_(None)
+                ).limit(20).all()
+                below_threshold_mentions = [(rm, rev, 0.0) for rm, rev in unresolved]
+
+        # Build response
+        mentions = []
+
+        # Add matched mentions (similarity = 1.0)
+        for rm, review in matched_mentions:
+            mentions.append(MentionResponse(
+                id=str(rm.id),
+                mention_text=rm.mention_text,
+                mention_type=rm.mention_type,
+                sentiment=rm.sentiment,
+                review_id=str(review.id),
+                review_text=review.text or "",
+                review_author=review.author,
+                review_rating=float(review.rating) if review.rating else None,
+                review_date=review.review_date if isinstance(review.review_date, str) else (review.review_date.isoformat() if review.review_date else None),
+                similarity_score=1.0  # Matched
+            ))
+
+        # Add below-threshold mentions with actual similarity scores
+        for rm, review, score in below_threshold_mentions:
+            mentions.append(MentionResponse(
+                id=str(rm.id),
+                mention_text=rm.mention_text,
+                mention_type=rm.mention_type,
+                sentiment=rm.sentiment,
+                review_id=str(review.id),
+                review_text=review.text or "",
+                review_author=review.author,
+                review_rating=float(review.rating) if review.rating else None,
+                review_date=review.review_date if isinstance(review.review_date, str) else (review.review_date.isoformat() if review.review_date else None),
+                similarity_score=round(score, 3)  # Actual similarity score
+            ))
+
+        # Sort by similarity score descending (matched first, then by similarity)
+        mentions.sort(key=lambda x: x.similarity_score or 0, reverse=True)
+
+        # Apply pagination
+        total = len(mentions)
+        mentions = mentions[offset:offset + limit]
+
+        return MentionListResponse(
+            mentions=mentions,
+            total=total,
+            matched_count=len(matched_mentions),
+            below_threshold_count=len(below_threshold_mentions)
+        )
+    finally:
+        session.close()
+
+
+@app.get("/api/onboarding/categories/{category_id}/mentions", response_model=MentionListResponse)
+async def get_category_mentions(
+    category_id: str,
+    include_below_threshold: bool = True,
+    limit: int = 50,
+    offset: int = 0,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Get mentions linked to a specific category, including near-misses below threshold.
+
+    BUG-014 FIX: Now uses vector similarity search to find mentions SIMILAR to this
+    specific category, instead of returning all unresolved mentions.
+    """
+    session = get_session()
+    try:
+        category_uuid = UUID(category_id)
+        category = session.query(TaxonomyCategory).filter_by(id=category_uuid).first()
+        if not category:
+            raise HTTPException(status_code=404, detail="Category not found")
+
+        # Get mentions that resolved to this category
+        matched_mentions = session.query(RawMention, Review).join(
+            Review, RawMention.review_id == Review.id
+        ).filter(
+            RawMention.resolved_category_id == category_uuid
+        ).all()
+
+        # BUG-014 FIX: Get below-threshold mentions using vector similarity search
+        below_threshold_mentions = []
+        if include_below_threshold and category.taxonomy:
+            # FEATURE-001: Use all_place_ids for multi-branch taxonomy support
+            place_ids = [str(p) for p in category.taxonomy.all_place_ids]
+
+            # Get category embedding for similarity search
+            category_embedding = _get_category_embedding(session, category)
+
+            if category_embedding:
+                # Search MENTIONS_COLLECTION for similar unresolved mentions
+                # FEATURE-001: Search across ALL places in shared taxonomy
+                similar_results = vector_store.search_similar(
+                    collection_name=vector_store.MENTIONS_COLLECTION,
+                    query_vector=category_embedding,
+                    place_ids=place_ids,  # Multi-place support
+                    mention_type='aspect',
+                    limit=30,
+                    score_threshold=0.55,  # Lower bound for "near miss"
+                )
+
+                if similar_results:
+                    # Get IDs of already-matched mentions to exclude
+                    matched_ids = {str(rm.id) for rm, _ in matched_mentions}
+
+                    for result in similar_results:
+                        # Filter: below 0.80 threshold (these are "near misses")
+                        if result.score < 0.80:
+                            # Find mention by qdrant_point_id
+                            mention = session.query(RawMention).filter_by(
+                                qdrant_point_id=result.id
+                            ).first()
+
+                            if mention and str(mention.id) not in matched_ids:
+                                # Only include unresolved mentions
+                                if mention.resolved_category_id is None:
+                                    review = session.query(Review).filter_by(
+                                        id=mention.review_id
+                                    ).first()
+                                    if review:
+                                        below_threshold_mentions.append(
+                                            (mention, review, result.score)
+                                        )
+
+                logger.debug(
+                    f"BUG-014: Category {category.name} - found {len(below_threshold_mentions)} similar below-threshold mentions",
+                    extra={"extra_data": {"category_id": category_id}}
+                )
+            else:
+                # Fallback if no embedding available
+                logger.warning(
+                    f"BUG-014: No embedding for category {category_id}, using fallback query",
+                    extra={"extra_data": {"category_id": category_id}}
+                )
+                # FEATURE-001: Query across all places in shared taxonomy
+                place_uuids = [UUID(p) if isinstance(p, str) else p for p in place_ids]
+                unresolved = session.query(RawMention, Review).join(
+                    Review, RawMention.review_id == Review.id
+                ).filter(
+                    RawMention.place_id.in_(place_uuids),
+                    RawMention.mention_type == 'aspect',
+                    RawMention.resolved_category_id.is_(None)
+                ).limit(20).all()
+                below_threshold_mentions = [(rm, rev, 0.0) for rm, rev in unresolved]
+
+        # Build response
+        mentions = []
+
+        # Add matched mentions (similarity = 1.0)
+        for rm, review in matched_mentions:
+            mentions.append(MentionResponse(
+                id=str(rm.id),
+                mention_text=rm.mention_text,
+                mention_type=rm.mention_type,
+                sentiment=rm.sentiment,
+                review_id=str(review.id),
+                review_text=review.text or "",
+                review_author=review.author,
+                review_rating=float(review.rating) if review.rating else None,
+                review_date=review.review_date if isinstance(review.review_date, str) else (review.review_date.isoformat() if review.review_date else None),
+                similarity_score=1.0  # Matched
+            ))
+
+        # Add below-threshold mentions with actual similarity scores
+        for rm, review, score in below_threshold_mentions:
+            mentions.append(MentionResponse(
+                id=str(rm.id),
+                mention_text=rm.mention_text,
+                mention_type=rm.mention_type,
+                sentiment=rm.sentiment,
+                review_id=str(review.id),
+                review_text=review.text or "",
+                review_author=review.author,
+                review_rating=float(review.rating) if review.rating else None,
+                review_date=review.review_date if isinstance(review.review_date, str) else (review.review_date.isoformat() if review.review_date else None),
+                similarity_score=round(score, 3)  # Actual similarity score
+            ))
+
+        # Sort by similarity score descending (matched first, then by similarity)
+        mentions.sort(key=lambda x: x.similarity_score or 0, reverse=True)
+
+        # Apply pagination
+        total = len(mentions)
+        mentions = mentions[offset:offset + limit]
+
+        return MentionListResponse(
+            mentions=mentions,
+            total=total,
+            matched_count=len(matched_mentions),
+            below_threshold_count=len(below_threshold_mentions)
+        )
+    finally:
+        session.close()
+
+
+class OrphanMentionResponse(BaseModel):
+    id: str
+    mention_text: str
+    mention_type: str
+    sentiment: Optional[str]
+    review_id: str
+    review_text: str
+    review_author: Optional[str]
+    review_rating: Optional[float]
+    review_date: Optional[str]
+
+
+class OrphanMentionsResponse(BaseModel):
+    product_orphans: List[OrphanMentionResponse]
+    category_orphans: List[OrphanMentionResponse]
+    total_product_orphans: int
+    total_category_orphans: int
+
+
+@app.get("/api/onboarding/taxonomies/{taxonomy_id}/orphan-mentions", response_model=OrphanMentionsResponse)
+async def get_orphan_mentions(
+    taxonomy_id: str,
+    limit: int = 50,
+    current_user: User = Depends(get_current_user)
+):
+    """Get orphan mentions that didn't cluster or resolve to any product/category."""
+    session = get_session()
+    try:
+        taxonomy_uuid = UUID(taxonomy_id)
+        taxonomy = session.query(PlaceTaxonomy).filter_by(id=taxonomy_uuid).first()
+        if not taxonomy:
+            raise HTTPException(status_code=404, detail="Taxonomy not found")
+
+        place_id = taxonomy.place_id
+
+        # Get unresolved product mentions (orphans)
+        product_orphans_query = session.query(RawMention, Review).join(
+            Review, RawMention.review_id == Review.id
+        ).filter(
+            RawMention.place_id == place_id,
+            RawMention.mention_type == 'product',
+            RawMention.resolved_product_id.is_(None)
+        ).limit(limit).all()
+
+        # Get unresolved category/aspect mentions (orphans)
+        category_orphans_query = session.query(RawMention, Review).join(
+            Review, RawMention.review_id == Review.id
+        ).filter(
+            RawMention.place_id == place_id,
+            RawMention.mention_type == 'aspect',
+            RawMention.resolved_category_id.is_(None)
+        ).limit(limit).all()
+
+        # Count totals
+        total_product_orphans = session.query(RawMention).filter(
+            RawMention.place_id == place_id,
+            RawMention.mention_type == 'product',
+            RawMention.resolved_product_id.is_(None)
+        ).count()
+
+        total_category_orphans = session.query(RawMention).filter(
+            RawMention.place_id == place_id,
+            RawMention.mention_type == 'aspect',
+            RawMention.resolved_category_id.is_(None)
+        ).count()
+
+        # Build response
+        product_orphans = []
+        for rm, review in product_orphans_query:
+            product_orphans.append(OrphanMentionResponse(
+                id=str(rm.id),
+                mention_text=rm.mention_text,
+                mention_type=rm.mention_type,
+                sentiment=rm.sentiment,
+                review_id=str(review.id),
+                review_text=review.text or "",
+                review_author=review.author,
+                review_rating=float(review.rating) if review.rating else None,
+                review_date=review.review_date if isinstance(review.review_date, str) else (review.review_date.isoformat() if review.review_date else None),
+            ))
+
+        category_orphans = []
+        for rm, review in category_orphans_query:
+            category_orphans.append(OrphanMentionResponse(
+                id=str(rm.id),
+                mention_text=rm.mention_text,
+                mention_type=rm.mention_type,
+                sentiment=rm.sentiment,
+                review_id=str(review.id),
+                review_text=review.text or "",
+                review_author=review.author,
+                review_rating=float(review.rating) if review.rating else None,
+                review_date=review.review_date if isinstance(review.review_date, str) else (review.review_date.isoformat() if review.review_date else None),
+            ))
+
+        return OrphanMentionsResponse(
+            product_orphans=product_orphans,
+            category_orphans=category_orphans,
+            total_product_orphans=total_product_orphans,
+            total_category_orphans=total_category_orphans,
+        )
     finally:
         session.close()
 
@@ -1904,8 +2372,12 @@ def _get_place_pipeline_status(session, place) -> dict:
     mentions_count = session.query(RawMention).filter(RawMention.place_id == place_id).count()
 
     # Check taxonomy status
+    # FEATURE-001: Check both place_id (legacy) and place_ids array (multi-branch)
     taxonomy = session.query(PlaceTaxonomy).filter(
-        PlaceTaxonomy.place_id == place_id
+        or_(
+            PlaceTaxonomy.place_id == place_id,
+            PlaceTaxonomy.place_ids.any(place_id)
+        )
     ).order_by(PlaceTaxonomy.created_at.desc()).first()
 
     taxonomy_status = taxonomy.status if taxonomy else None

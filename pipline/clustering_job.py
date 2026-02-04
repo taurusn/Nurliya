@@ -14,9 +14,10 @@ import numpy as np
 
 from logging_config import get_logger
 from config import VLLM_MODEL
+from sqlalchemy import or_
 from database import (
     PlaceTaxonomy, TaxonomyCategory, TaxonomyProduct, RawMention,
-    Job, Place, get_session,
+    Job, Place, ScrapeJob, get_session,
 )
 import vector_store
 from vector_store import MENTIONS_COLLECTION, VectorPayload
@@ -88,6 +89,32 @@ def is_clustering_needed(place_id: str, job_id: str = None) -> Tuple[bool, str]:
     """
     session = get_session()
     try:
+        # BUG-013 FIX: Check if ALL pipeline jobs for this place are complete
+        # Don't start clustering while other jobs are still processing
+        if job_id:
+            job = session.query(Job).filter_by(id=job_id).first()
+            if job:
+                # Find the parent scrape job
+                scrape_job = (
+                    session.query(ScrapeJob)
+                    .filter(ScrapeJob.pipeline_job_ids.any(job.id))
+                    .first()
+                )
+
+                if scrape_job and scrape_job.pipeline_job_ids:
+                    # Check if all pipeline jobs are complete
+                    incomplete_jobs = session.query(Job).filter(
+                        Job.id.in_(scrape_job.pipeline_job_ids),
+                        Job.status != 'completed'
+                    ).count()
+
+                    if incomplete_jobs > 0:
+                        logger.info(
+                            f"Clustering deferred: {incomplete_jobs} jobs still processing",
+                            extra={"extra_data": {"place_id": place_id, "job_id": job_id}}
+                        )
+                        return False, f"Waiting for {incomplete_jobs} other jobs to complete"
+
         # BUG-001 FIX: Verify mention extraction completed successfully
         # If job_id provided, check that mentions were actually extracted
         if job_id:
@@ -117,7 +144,14 @@ def is_clustering_needed(place_id: str, job_id: str = None) -> Tuple[bool, str]:
                         return False, f"Extraction incomplete: only {extraction_rate:.1%} of reviews have mentions"
 
         # Check existing taxonomy
-        existing = session.query(PlaceTaxonomy).filter_by(place_id=place_id).first()
+        # FEATURE-001: Check both place_id (legacy) and place_ids array (multi-branch)
+        place_uuid = uuid.UUID(place_id) if isinstance(place_id, str) else place_id
+        existing = session.query(PlaceTaxonomy).filter(
+            or_(
+                PlaceTaxonomy.place_id == place_uuid,
+                PlaceTaxonomy.place_ids.any(place_uuid)
+            )
+        ).first()
 
         if existing:
             if existing.status == "draft":
@@ -126,8 +160,10 @@ def is_clustering_needed(place_id: str, job_id: str = None) -> Tuple[bool, str]:
                 return False, "Taxonomy in review, cannot create new draft"
 
             # Active taxonomy exists - check for re-discovery threshold
+            # FEATURE-001: Count unresolved mentions across ALL places in shared taxonomy
+            all_place_ids = existing.all_place_ids
             unresolved_count = session.query(RawMention).filter(
-                RawMention.place_id == place_id,
+                RawMention.place_id.in_(all_place_ids),
                 RawMention.resolved_product_id.is_(None),
                 RawMention.resolved_category_id.is_(None),
             ).count()
@@ -135,7 +171,7 @@ def is_clustering_needed(place_id: str, job_id: str = None) -> Tuple[bool, str]:
             if unresolved_count < REDISCOVERY_THRESHOLD:
                 return False, f"Only {unresolved_count} unresolved mentions (need {REDISCOVERY_THRESHOLD})"
 
-            return True, f"Re-discovery triggered: {unresolved_count} unresolved mentions"
+            return True, f"Re-discovery triggered: {unresolved_count} unresolved mentions across {len(all_place_ids)} places"
 
         # No taxonomy exists - check minimum mentions
         mention_count = vector_store.count_vectors(
@@ -158,6 +194,9 @@ def trigger_taxonomy_clustering(job_id: str) -> bool:
     Evaluate if clustering should be triggered for a completed job.
     Queues clustering task to RabbitMQ if conditions are met.
 
+    PHASE 4: For multi-branch scrapes, detects all places and queues
+    combined clustering with all place_ids.
+
     Returns:
         True if clustering was queued, False otherwise.
     """
@@ -173,7 +212,31 @@ def trigger_taxonomy_clustering(job_id: str) -> bool:
 
         place_id = str(job.place_id)
 
+        # PHASE 4: Check if this is part of a multi-place scrape
+        scrape_job = (
+            session.query(ScrapeJob)
+            .filter(ScrapeJob.pipeline_job_ids.any(job.id))
+            .first()
+        )
+
+        place_ids = [place_id]  # Default: single place
+        scrape_job_id = None
+
+        if scrape_job and scrape_job.pipeline_job_ids:
+            # Get all place_ids from sibling jobs
+            sibling_jobs = session.query(Job).filter(
+                Job.id.in_(scrape_job.pipeline_job_ids)
+            ).all()
+
+            all_place_ids = list(set(str(j.place_id) for j in sibling_jobs if j.place_id))
+            if len(all_place_ids) > 1:
+                place_ids = all_place_ids
+                scrape_job_id = str(scrape_job.id)
+                logger.info(f"Multi-branch scrape detected: {len(place_ids)} places",
+                           extra={"extra_data": {"scrape_job_id": scrape_job_id, "place_ids": place_ids}})
+
         # Check if clustering is needed (pass job_id for extraction verification)
+        # For multi-place, we still check with primary place_id but clustering will gather all
         should_cluster, reason = is_clustering_needed(place_id, job_id=job_id)
 
         if not should_cluster:
@@ -182,9 +245,12 @@ def trigger_taxonomy_clustering(job_id: str) -> bool:
             return False
 
         # Queue clustering task
+        # PHASE 4: Include place_ids array and scrape_job_id for multi-branch
         task_data = {
             "type": "taxonomy_clustering",
-            "place_id": place_id,
+            "place_id": place_id,  # Primary place (backward compat)
+            "place_ids": place_ids,  # PHASE 4: All places for combined clustering
+            "scrape_job_id": scrape_job_id,  # PHASE 4: Link to parent scrape
             "job_id": str(job_id),
             "trigger": "job_completion",
             "timestamp": datetime.utcnow().isoformat(),
@@ -197,8 +263,9 @@ def trigger_taxonomy_clustering(job_id: str) -> bool:
                 routing_key=TAXONOMY_CLUSTERING_QUEUE,
                 body=json.dumps(task_data),
             )
-            logger.info(f"Queued taxonomy clustering: {reason}",
-                       extra={"extra_data": {"place_id": place_id, "job_id": job_id}})
+            place_desc = f"{len(place_ids)} places" if len(place_ids) > 1 else f"place {place_id}"
+            logger.info(f"Queued taxonomy clustering for {place_desc}: {reason}",
+                       extra={"extra_data": {"place_ids": place_ids, "job_id": job_id}})
             return True
         except Exception as e:
             logger.error(f"Failed to queue taxonomy clustering: {e}",
@@ -610,23 +677,47 @@ def _derive_main_category_name(child_names_en: List[str], child_names_ar: List[s
         }
 
 
-def save_draft_taxonomy(place_id: str, hierarchy: dict, reviews_sampled: int) -> Optional[str]:
+def save_draft_taxonomy(
+    place_id: str,
+    hierarchy: dict,
+    reviews_sampled: int,
+    place_ids: Optional[List[str]] = None,  # PHASE 4: Multi-place support
+    scrape_job_id: Optional[str] = None,    # PHASE 4: Link to parent scrape
+) -> Optional[str]:
     """
     Save draft taxonomy to database.
+
+    Args:
+        place_id: Primary place UUID (backward compat)
+        hierarchy: Taxonomy hierarchy dict
+        reviews_sampled: Number of reviews used for clustering
+        place_ids: All place UUIDs for multi-branch shared taxonomy (PHASE 4)
+        scrape_job_id: Parent scrape job UUID (PHASE 4)
 
     Returns:
         taxonomy_id if successful, None otherwise
     """
     session = get_session()
     try:
-        # Check for existing draft (shouldn't happen, but be safe)
-        existing = session.query(PlaceTaxonomy).filter_by(
-            place_id=place_id,
-            status="draft",
+        # PHASE 4: Check for existing draft across ALL places
+        place_uuid = uuid.UUID(place_id) if isinstance(place_id, str) else place_id
+        place_uuids = [uuid.UUID(p) if isinstance(p, str) else p for p in (place_ids or [place_id])]
+
+        # Build conditions: check if ANY of our place_uuids conflicts with existing taxonomy
+        # - Either matches place_id directly
+        # - Or is contained in the place_ids array
+        overlap_conditions = [PlaceTaxonomy.place_id.in_(place_uuids)]
+        for p_uuid in place_uuids:
+            overlap_conditions.append(PlaceTaxonomy.place_ids.any(p_uuid))
+
+        existing = session.query(PlaceTaxonomy).filter(
+            or_(*overlap_conditions),
+            PlaceTaxonomy.status == "draft",
         ).first()
 
         if existing:
-            logger.warning(f"Draft taxonomy already exists for place {place_id}, skipping")
+            place_desc = f"{len(place_ids)} places" if place_ids and len(place_ids) > 1 else f"place {place_id}"
+            logger.warning(f"Draft taxonomy already exists for {place_desc}, skipping")
             return str(existing.id)
 
         # Count entities
@@ -638,8 +729,11 @@ def save_draft_taxonomy(place_id: str, hierarchy: dict, reviews_sampled: int) ->
         total_products = len(hierarchy["products"])
 
         # Create taxonomy
+        # PHASE 4: Set place_ids and scrape_job_id for multi-branch support
         taxonomy = PlaceTaxonomy(
-            place_id=place_id,
+            place_id=place_uuid,  # Primary place (backward compat)
+            place_ids=place_uuids if place_ids and len(place_ids) > 1 else None,  # PHASE 4
+            scrape_job_id=uuid.UUID(scrape_job_id) if scrape_job_id else None,    # PHASE 4
             status="draft",
             discovered_at=datetime.utcnow(),
             reviews_sampled=reviews_sampled,
@@ -717,9 +811,12 @@ def save_draft_taxonomy(place_id: str, hierarchy: dict, reviews_sampled: int) ->
 
         session.commit()
 
-        logger.info(f"Saved draft taxonomy for place {place_id}",
+        # PHASE 4: Log multi-place info
+        place_desc = f"{len(place_ids)} places" if place_ids and len(place_ids) > 1 else f"place {place_id}"
+        logger.info(f"Saved draft taxonomy for {place_desc}",
                    extra={"extra_data": {
                        "taxonomy_id": str(taxonomy_id),
+                       "place_ids": [str(p) for p in place_uuids],
                        "categories": total_categories,
                        "products": total_products,
                    }})
@@ -734,21 +831,33 @@ def save_draft_taxonomy(place_id: str, hierarchy: dict, reviews_sampled: int) ->
         session.close()
 
 
-def run_clustering_job(place_id: str, job_id: Optional[str] = None) -> Optional[str]:
+def run_clustering_job(
+    place_id: str,
+    job_id: Optional[str] = None,
+    place_ids: Optional[List[str]] = None,  # PHASE 4: Multi-place support
+    scrape_job_id: Optional[str] = None,    # PHASE 4: Link to parent scrape
+) -> Optional[str]:
     """
     Main clustering entry point.
 
     Args:
-        place_id: UUID of place to cluster
+        place_id: UUID of primary place to cluster (backward compat)
         job_id: Optional triggering job ID (for logging)
+        place_ids: All place UUIDs for combined clustering (PHASE 4)
+        scrape_job_id: Parent scrape job UUID (PHASE 4)
 
     Returns:
         taxonomy_id if successful, None if failed/skipped
     """
-    logger.info(f"Starting clustering job for place {place_id}",
-               extra={"extra_data": {"place_id": place_id, "job_id": job_id}})
+    # PHASE 4: Use place_ids if provided, otherwise single place
+    effective_place_ids = place_ids if place_ids else [place_id]
+    is_multi_place = len(effective_place_ids) > 1
 
-    # Fetch business type from Place record
+    place_desc = f"{len(effective_place_ids)} places" if is_multi_place else f"place {place_id}"
+    logger.info(f"Starting clustering job for {place_desc}",
+               extra={"extra_data": {"place_ids": effective_place_ids, "job_id": job_id}})
+
+    # Fetch business type from Place record (use primary place)
     session = get_session()
     try:
         place = session.query(Place).filter_by(id=place_id).first()
@@ -757,15 +866,16 @@ def run_clustering_job(place_id: str, job_id: Optional[str] = None) -> Optional[
         session.close()
 
     # Step 1: Fetch vectors from Qdrant
+    # PHASE 4: Gather from ALL places for combined clustering
     all_vectors = vector_store.scroll_all_vectors(
         collection_name=MENTIONS_COLLECTION,
-        place_id=place_id,
+        place_ids=effective_place_ids,  # PHASE 4: Multi-place
         is_canonical=True,
     )
 
     if len(all_vectors) < MIN_MENTIONS_FOR_CLUSTERING:
         logger.warning(f"Not enough vectors for clustering: {len(all_vectors)}",
-                      extra={"extra_data": {"place_id": place_id}})
+                      extra={"extra_data": {"place_ids": effective_place_ids}})
         return None
 
     # Step 2: Separate products and aspects
@@ -863,25 +973,35 @@ def run_clustering_job(place_id: str, job_id: Optional[str] = None) -> Optional[
     )
     if total_entities == 0:
         logger.warning("Clustering produced empty hierarchy (all noise), skipping taxonomy creation",
-                      extra={"extra_data": {"place_id": place_id}})
+                      extra={"extra_data": {"place_ids": effective_place_ids}})
         return None
 
     # Count reviews sampled (estimate from RawMention table)
+    # PHASE 4: Count across ALL places for multi-branch
     session = get_session()
     try:
-        reviews_sampled = session.query(RawMention.review_id).filter_by(
-            place_id=place_id
+        place_uuids = [uuid.UUID(p) if isinstance(p, str) else p for p in effective_place_ids]
+        reviews_sampled = session.query(RawMention.review_id).filter(
+            RawMention.place_id.in_(place_uuids)
         ).distinct().count()
     finally:
         session.close()
 
     # Step 6: Save draft taxonomy
-    taxonomy_id = save_draft_taxonomy(place_id, hierarchy, reviews_sampled)
+    # PHASE 4: Pass place_ids and scrape_job_id for multi-branch support
+    taxonomy_id = save_draft_taxonomy(
+        place_id=place_id,
+        hierarchy=hierarchy,
+        reviews_sampled=reviews_sampled,
+        place_ids=effective_place_ids if is_multi_place else None,
+        scrape_job_id=scrape_job_id,
+    )
 
     if taxonomy_id:
-        logger.info(f"Clustering job completed for place {place_id}",
+        logger.info(f"Clustering job completed for {place_desc}",
                    extra={"extra_data": {
                        "taxonomy_id": taxonomy_id,
+                       "place_ids": effective_place_ids,
                        "product_clusters": len(product_labels),
                        "aspect_clusters": len(aspect_labels),
                    }})
@@ -895,22 +1015,34 @@ def process_clustering_message(ch, method, properties, body):
         message = json.loads(body)
         place_id = message.get("place_id")
         job_id = message.get("job_id")
+        # PHASE 4: Read multi-place parameters
+        place_ids = message.get("place_ids")
+        scrape_job_id = message.get("scrape_job_id")
 
         if not place_id:
             logger.error("Clustering message missing place_id")
             ch.basic_ack(delivery_tag=method.delivery_tag)
             return
 
-        logger.info(f"Processing clustering message for place {place_id}",
-                   extra={"extra_data": {"place_id": place_id, "job_id": job_id}})
+        # PHASE 4: Log multi-place info
+        is_multi_place = place_ids and len(place_ids) > 1
+        place_desc = f"{len(place_ids)} places" if is_multi_place else f"place {place_id}"
+        logger.info(f"Processing clustering message for {place_desc}",
+                   extra={"extra_data": {"place_ids": place_ids or [place_id], "job_id": job_id}})
 
         # Run clustering
-        taxonomy_id = run_clustering_job(place_id, job_id)
+        # PHASE 4: Pass place_ids and scrape_job_id
+        taxonomy_id = run_clustering_job(
+            place_id=place_id,
+            job_id=job_id,
+            place_ids=place_ids,
+            scrape_job_id=scrape_job_id,
+        )
 
         if taxonomy_id:
             logger.info(f"Clustering completed: taxonomy {taxonomy_id}")
         else:
-            logger.warning(f"Clustering produced no taxonomy for place {place_id}")
+            logger.warning(f"Clustering produced no taxonomy for {place_desc}")
 
         ch.basic_ack(delivery_tag=method.delivery_tag)
 

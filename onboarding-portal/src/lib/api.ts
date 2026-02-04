@@ -232,3 +232,67 @@ export async function publishTaxonomy(taxonomyId: string): Promise<{ success: bo
   if (!res.ok) throw new Error('Failed to publish taxonomy')
   return res.json()
 }
+
+// Mention types
+export interface Mention {
+  id: string
+  mention_text: string
+  mention_type: string
+  sentiment: string | null
+  review_id: string
+  review_text: string
+  review_author: string | null
+  review_rating: number | null
+  review_date: string | null
+  similarity_score?: number | null
+}
+
+export interface MentionListResponse {
+  mentions: Mention[]
+  total: number
+  matched_count: number
+  below_threshold_count: number
+}
+
+export interface OrphanMentionsResponse {
+  product_orphans: Mention[]
+  category_orphans: Mention[]
+  total_product_orphans: number
+  total_category_orphans: number
+}
+
+// Fetch mentions for a product
+export async function fetchProductMentions(
+  productId: string,
+  includeBelow: boolean = true
+): Promise<MentionListResponse> {
+  const res = await fetch(
+    `${API_URL}/api/onboarding/products/${productId}/mentions?include_below_threshold=${includeBelow}`,
+    { headers: getAuthHeaders() }
+  )
+  if (!res.ok) throw new Error('Failed to fetch product mentions')
+  return res.json()
+}
+
+// Fetch mentions for a category
+export async function fetchCategoryMentions(
+  categoryId: string,
+  includeBelow: boolean = true
+): Promise<MentionListResponse> {
+  const res = await fetch(
+    `${API_URL}/api/onboarding/categories/${categoryId}/mentions?include_below_threshold=${includeBelow}`,
+    { headers: getAuthHeaders() }
+  )
+  if (!res.ok) throw new Error('Failed to fetch category mentions')
+  return res.json()
+}
+
+// Fetch orphan mentions for a taxonomy
+export async function fetchOrphanMentions(taxonomyId: string): Promise<OrphanMentionsResponse> {
+  const res = await fetch(
+    `${API_URL}/api/onboarding/taxonomies/${taxonomyId}/orphan-mentions`,
+    { headers: getAuthHeaders() }
+  )
+  if (!res.ok) throw new Error('Failed to fetch orphan mentions')
+  return res.json()
+}

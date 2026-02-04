@@ -339,6 +339,7 @@ def search_similar(
     collection_name: str,
     query_vector: List[float],
     place_id: Optional[str] = None,
+    place_ids: Optional[List[str]] = None,  # FEATURE-001: Multi-place support
     mention_type: Optional[str] = None,
     limit: int = 5,
     score_threshold: float = 0.0,
@@ -349,7 +350,8 @@ def search_similar(
     Args:
         collection_name: Collection to search
         query_vector: Query embedding
-        place_id: Filter by place (optional)
+        place_id: Filter by single place (optional, use place_ids for multi-place)
+        place_ids: Filter by multiple places (FEATURE-001: multi-branch support)
         mention_type: Filter by mention type (optional)
         limit: Maximum results to return
         score_threshold: Minimum similarity score
@@ -363,14 +365,28 @@ def search_similar(
         return []
 
     try:
-        from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+        from qdrant_client.http.models import Filter, FieldCondition, MatchValue, MatchAny
 
         # Build filter conditions
         conditions = []
-        if place_id:
+
+        # FEATURE-001: Support both single place_id and multiple place_ids
+        if place_ids and len(place_ids) > 1:
+            # Multiple places - use MatchAny for OR condition
+            conditions.append(
+                FieldCondition(key="place_id", match=MatchAny(any=place_ids))
+            )
+        elif place_ids and len(place_ids) == 1:
+            # Single place in array - use MatchValue
+            conditions.append(
+                FieldCondition(key="place_id", match=MatchValue(value=place_ids[0]))
+            )
+        elif place_id:
+            # Legacy single place_id parameter
             conditions.append(
                 FieldCondition(key="place_id", match=MatchValue(value=place_id))
             )
+
         if mention_type:
             conditions.append(
                 FieldCondition(key="mention_type", match=MatchValue(value=mention_type))
@@ -692,17 +708,19 @@ def get_collection_stats(collection_name: str) -> Optional[Dict[str, Any]]:
 
 def scroll_all_vectors(
     collection_name: str,
-    place_id: str,
+    place_id: Optional[str] = None,
+    place_ids: Optional[List[str]] = None,  # PHASE 4: Multi-place support
     mention_type: Optional[str] = None,
     is_canonical: bool = True,
     batch_size: int = 100,
 ) -> List[Tuple[str, List[float], VectorPayload]]:
     """
-    Retrieve all vectors for a place using Qdrant scroll API.
+    Retrieve all vectors for a place (or multiple places) using Qdrant scroll API.
 
     Args:
         collection_name: Collection to scroll
-        place_id: Filter by place_id
+        place_id: Filter by single place_id (backward compat)
+        place_ids: Filter by multiple places (PHASE 4: multi-branch support)
         mention_type: Optional filter ('product' or 'aspect')
         is_canonical: Only retrieve canonical mentions (default: True)
         batch_size: Points per scroll request
@@ -715,13 +733,33 @@ def scroll_all_vectors(
         logger.warning("Qdrant unavailable, returning empty results")
         return []
 
+    # Validate: at least one place filter required
+    if not place_id and not place_ids:
+        logger.error("scroll_all_vectors requires place_id or place_ids")
+        return []
+
     try:
-        from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+        from qdrant_client.http.models import Filter, FieldCondition, MatchValue, MatchAny
 
         # Build filter conditions
-        conditions = [
-            FieldCondition(key="place_id", match=MatchValue(value=place_id))
-        ]
+        conditions = []
+
+        # PHASE 4: Support both single place_id and multiple place_ids
+        if place_ids and len(place_ids) > 1:
+            # Multiple places - use MatchAny for OR condition
+            conditions.append(
+                FieldCondition(key="place_id", match=MatchAny(any=place_ids))
+            )
+        elif place_ids and len(place_ids) == 1:
+            # Single place in array - use MatchValue
+            conditions.append(
+                FieldCondition(key="place_id", match=MatchValue(value=place_ids[0]))
+            )
+        elif place_id:
+            # Legacy single place_id parameter
+            conditions.append(
+                FieldCondition(key="place_id", match=MatchValue(value=place_id))
+            )
         if mention_type:
             conditions.append(
                 FieldCondition(key="mention_type", match=MatchValue(value=mention_type))
@@ -757,17 +795,20 @@ def scroll_all_vectors(
                 break
             offset = next_offset
 
-        logger.debug(f"Scrolled {len(all_points)} vectors for place {place_id}")
+        place_desc = f"places {place_ids}" if place_ids and len(place_ids) > 1 else f"place {place_id or place_ids[0] if place_ids else 'unknown'}"
+        logger.debug(f"Scrolled {len(all_points)} vectors for {place_desc}")
         return all_points
 
     except Exception as e:
-        logger.error(f"Failed to scroll vectors for place {place_id}: {e}")
+        place_desc = f"places {place_ids}" if place_ids and len(place_ids) > 1 else f"place {place_id or (place_ids[0] if place_ids else 'unknown')}"
+        logger.error(f"Failed to scroll vectors for {place_desc}: {e}")
         return []
 
 
 def count_vectors(
     collection_name: str,
-    place_id: str,
+    place_id: Optional[str] = None,
+    place_ids: Optional[List[str]] = None,  # PHASE 4: Multi-place support
     mention_type: Optional[str] = None,
     is_canonical: bool = True,
 ) -> int:
@@ -776,7 +817,8 @@ def count_vectors(
 
     Args:
         collection_name: Collection to count in
-        place_id: Filter by place_id
+        place_id: Filter by single place_id (backward compat)
+        place_ids: Filter by multiple places (PHASE 4: multi-branch support)
         mention_type: Optional filter ('product' or 'aspect')
         is_canonical: Only count canonical mentions (default: True)
 
@@ -787,13 +829,33 @@ def count_vectors(
     if client is None:
         return 0
 
+    # Validate: at least one place filter required
+    if not place_id and not place_ids:
+        logger.error("count_vectors requires place_id or place_ids")
+        return 0
+
     try:
-        from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+        from qdrant_client.http.models import Filter, FieldCondition, MatchValue, MatchAny
 
         # Build filter conditions
-        conditions = [
-            FieldCondition(key="place_id", match=MatchValue(value=place_id))
-        ]
+        conditions = []
+
+        # PHASE 4: Support both single place_id and multiple place_ids
+        if place_ids and len(place_ids) > 1:
+            # Multiple places - use MatchAny for OR condition
+            conditions.append(
+                FieldCondition(key="place_id", match=MatchAny(any=place_ids))
+            )
+        elif place_ids and len(place_ids) == 1:
+            # Single place in array - use MatchValue
+            conditions.append(
+                FieldCondition(key="place_id", match=MatchValue(value=place_ids[0]))
+            )
+        elif place_id:
+            # Legacy single place_id parameter
+            conditions.append(
+                FieldCondition(key="place_id", match=MatchValue(value=place_id))
+            )
         if mention_type:
             conditions.append(
                 FieldCondition(key="mention_type", match=MatchValue(value=mention_type))
@@ -813,7 +875,8 @@ def count_vectors(
         return result.count
 
     except Exception as e:
-        logger.error(f"Failed to count vectors for place {place_id}: {e}")
+        place_desc = f"places {place_ids}" if place_ids and len(place_ids) > 1 else f"place {place_id or (place_ids[0] if place_ids else 'unknown')}"
+        logger.error(f"Failed to count vectors for {place_desc}: {e}")
         return 0
 
 

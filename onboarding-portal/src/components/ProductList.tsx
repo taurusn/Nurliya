@@ -4,7 +4,7 @@ import { TaxonomyProduct, TaxonomyCategory } from '@/lib/api'
 import { ApprovalBadge } from '@/components/ApprovalBadge'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { Check, X, Move, Plus } from 'lucide-react'
+import { Check, X, Move, Plus, MessageSquare } from 'lucide-react'
 
 interface ProductListProps {
   products: TaxonomyProduct[]
@@ -14,6 +14,7 @@ interface ProductListProps {
   onReject: (productId: string) => void
   onMove: (productId: string) => void
   onAddVariant: (productId: string) => void
+  onShowMentions?: (productId: string, productName: string) => void
 }
 
 export function ProductList({
@@ -24,6 +25,7 @@ export function ProductList({
   onReject,
   onMove,
   onAddVariant,
+  onShowMentions,
 }: ProductListProps) {
   // Filter products based on selected category
   const filteredProducts =
@@ -96,6 +98,15 @@ export function ProductList({
         <Button size="sm" variant="ghost" onClick={() => onAddVariant(product.id)}>
           <Plus className="w-4 h-4 text-muted" />
         </Button>
+        {onShowMentions && product.discovered_mention_count > 0 && (
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => onShowMentions(product.id, product.display_name || product.canonical_text)}
+          >
+            <MessageSquare className="w-4 h-4 text-primary" />
+          </Button>
+        )}
       </div>
     </div>
   )

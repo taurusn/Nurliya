@@ -195,11 +195,21 @@ class PlaceTaxonomy(Base):
     """
     Per-place taxonomy container.
     Each place has its own taxonomy that goes through discovery → review → active lifecycle.
+
+    FEATURE-001: Multi-branch support
+    - place_id: Primary place (backward compatibility)
+    - place_ids: All places sharing this taxonomy (for multi-branch businesses)
+    - scrape_job_id: Link to parent scrape job that triggered discovery
     """
     __tablename__ = "place_taxonomies"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     place_id = Column(UUID(as_uuid=True), ForeignKey("places.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    # FEATURE-001: Multi-branch shared taxonomy support
+    place_ids = Column(ARRAY(UUID(as_uuid=True)))  # All places sharing this taxonomy (NULL = single place, use place_id)
+    scrape_job_id = Column(UUID(as_uuid=True), ForeignKey("scrape_jobs.id", ondelete="SET NULL"), nullable=True)
+
     status = Column(String(20), default="draft")  # draft, review, active
     discovered_at = Column(TIMESTAMP)
     reviews_sampled = Column(Integer, default=0)  # Number of reviews used for discovery
@@ -209,9 +219,23 @@ class PlaceTaxonomy(Base):
     created_at = Column(TIMESTAMP, default=datetime.utcnow)
 
     place = relationship("Place")
+    scrape_job = relationship("ScrapeJob")  # FEATURE-001: Link to parent scrape
     publisher = relationship("User")
     categories = relationship("TaxonomyCategory", back_populates="taxonomy", cascade="all, delete-orphan")
     products = relationship("TaxonomyProduct", back_populates="taxonomy", cascade="all, delete-orphan")
+
+    @property
+    def all_place_ids(self):
+        """
+        Get all place IDs for this taxonomy (FEATURE-001 helper).
+
+        Returns place_ids array if set, otherwise falls back to [place_id].
+        Use this for queries that need to work with both single-place and
+        multi-branch taxonomies.
+        """
+        if self.place_ids:
+            return self.place_ids
+        return [self.place_id] if self.place_id else []
 
 
 class TaxonomyCategory(Base):

@@ -1,10 +1,13 @@
 # Taxonomy System - Known Bugs & Issues
 
 **Created**: 2026-02-03
+**Updated**: 2026-02-04
 **Related Documents**:
 - Plan: `/home/42group/nurliya/TAXONOMY_PLAN.md`
 - Progress: `/home/42group/nurliya/TAXONOMY_PROGRESS.md`
 - Phase 4 Plan: `/home/42group/nurliya/PHASE4_PLAN.md`
+- **BUG-014 & FEATURE-001 Plan**: `/home/42group/nurliya/MENTION_AUDIT_PLAN.md`
+- **BUG-014 & FEATURE-001 Progress**: `/home/42group/nurliya/MENTION_AUDIT_PROGRESS.md`
 
 ---
 
@@ -14,8 +17,10 @@
 |----------|-------|--------|
 | P0 (Blocking) | 3 | **Fixed** (2026-02-03) |
 | P1 (High) | 3 | **Fixed** (2026-02-03) |
-| P2 (Medium) | 3 | **Fixed** (2026-02-03) |
-| P2 (Medium) | 3 | **Open** - Extract-First Pipeline (2026-02-03) |
+| P1 (High) | 1 | **Implemented** - Mention Audit (BUG-014) - awaiting deploy |
+| P2 (Medium) | 4 | **Fixed** (BUG-007,008,009,013) |
+| P2 (Medium) | 3 | **Open** - Extract-First Pipeline (BUG-010,011,012) |
+| Feature | 1 | **Implemented** - Multi-Branch Shared Taxonomy (FEATURE-001) - awaiting deploy |
 
 ---
 
@@ -618,6 +623,282 @@ if mode == "extraction":
 
 ---
 
+### BUG-013: Premature Clustering - Triggered Before All Jobs Complete
+
+**Severity**: P2 (Medium)
+**Status**: **FIXED** (2026-02-04)
+**File**: `pipline/clustering_job.py:89-115`
+**Related**: Multi-branch scrapes
+
+**Description**:
+When a scrape finds multiple places (e.g., 2 branches of "Specialty Bean Roastery"), each place gets its own Job. When the first job completes, it triggers clustering while the second job is still extracting.
+
+**Example**:
+```
+Scrape: "Specialty Bean Roastery"
+  → Place A (Riyadh): 201 reviews → Job A
+  → Place B (Dammam): 911 reviews → Job B
+
+Timeline:
+  Job A completes (201 done) → triggers clustering ← BUG: Job B still has 900 reviews to extract!
+  Job B still processing...
+```
+
+**Impact**:
+- Clustering runs with incomplete data (only ~20% of mentions)
+- Poor cluster quality due to insufficient data points
+- Products/categories may be missed or misclassified
+
+**Fix Applied**:
+Added check in `is_clustering_needed()` to verify ALL sibling jobs are complete:
+
+```python
+# clustering_job.py:89-115
+# BUG-013 FIX: Check if ALL pipeline jobs for this place are complete
+if job_id:
+    job = session.query(Job).filter_by(id=job_id).first()
+    if job:
+        # Find the parent scrape job
+        scrape_job = session.query(ScrapeJob).filter(
+            ScrapeJob.pipeline_job_ids.any(job.id)
+        ).first()
+
+        if scrape_job and scrape_job.pipeline_job_ids:
+            # Check if all pipeline jobs are complete
+            incomplete_jobs = session.query(Job).filter(
+                Job.id.in_(scrape_job.pipeline_job_ids),
+                Job.status != 'completed'
+            ).count()
+
+            if incomplete_jobs > 0:
+                return False, f"Waiting for {incomplete_jobs} other jobs to complete"
+```
+
+**Result**:
+- Clustering now waits for ALL jobs from the same scrape to complete
+- Better cluster quality with full data set
+
+---
+
+### BUG-014: Mention Audit Shows Same Data for All Products/Categories
+
+**Severity**: P1 (High)
+**Status**: **Implemented** (2026-02-04) - Awaiting deployment
+**File**: `pipline/api.py:1011-1148` (products), `pipline/api.py:1151-1275` (categories)
+**Related**: Onboarding Portal Audit Feature
+**Implementation Plan**: `/home/42group/nurliya/MENTION_AUDIT_PLAN.md` (Phase 1)
+
+**Description**:
+When OS clicks the mentions button on a product or category in the onboarding portal, the "Below Threshold" section shows the SAME data for every product/category instead of showing mentions similar to THAT specific item.
+
+**Purpose of the Feature**:
+The mentions audit feature serves two purposes during taxonomy review:
+
+1. **Passed/Matched Mentions**: Show reviews that mention THIS specific product/category
+   - Helps OS verify the product is real
+   - Shows context of how customers describe it
+   - Example: "السبانش لاتيه was amazing" → matched to "Spanish Latte"
+
+2. **Below Threshold Mentions**: Show mentions that ALMOST matched but didn't pass similarity threshold
+   - Helps OS identify missing variants/spellings
+   - Reveals if threshold is too strict
+   - Example: "سبانش" (0.75 similarity) didn't match "Spanish Latte" (threshold 0.80)
+   - OS can then add "سبانش" as a variant → mention will resolve on re-publish
+
+**Current Behavior (Wrong)**:
+```python
+# api.py:986-993 - Same query for ALL products
+below_threshold_mentions = session.query(RawMention).filter(
+    RawMention.place_id == place_id,
+    RawMention.mention_type == 'product',
+    RawMention.resolved_product_id.is_(None)  # Just gets ALL unresolved
+).limit(20).all()
+```
+
+Result: Every product shows the same 20 unresolved mentions regardless of similarity.
+
+**Expected Behavior**:
+```
+Product: "Spanish Latte"
+
+✅ Passed (similarity > 0.80):
+   - "السبانش لاتيه was amazing" (0.92)
+   - "spanish latte is the best" (0.88)
+
+⚠️ Below Threshold (0.60-0.80) - SIMILAR to this product:
+   - "سبانش" (0.75) ← Close but below threshold
+   - "spanich late" (0.72) ← Typo, should match
+
+Product: "V60"
+
+✅ Passed (similarity > 0.80):
+   - "V60 pour over" (0.95)
+
+⚠️ Below Threshold (0.60-0.80) - SIMILAR to this product:
+   - "v 60" (0.78) ← Different results than Spanish Latte!
+   - "vee sixty" (0.65)
+```
+
+**Root Cause**:
+Two issues:
+
+1. **No vector similarity search**: Below threshold query doesn't use Qdrant to find similar mentions
+2. **No product embedding to compare**: Need to compare mention embeddings against product embedding
+
+**Proposed Fix**:
+
+```python
+# api.py - get_product_mentions()
+async def get_product_mentions(product_id: str, ...):
+    # 1. Get matched mentions (already correct)
+    matched_mentions = session.query(RawMention).filter(
+        RawMention.resolved_product_id == product_uuid
+    ).all()
+
+    # 2. Get below-threshold mentions using vector similarity
+    below_threshold_mentions = []
+    if include_below_threshold:
+        # Get product embedding (from PRODUCTS_COLLECTION or generate)
+        product_embedding = get_product_embedding(product_id)
+
+        if product_embedding:
+            # Search MENTIONS_COLLECTION for similar but unresolved mentions
+            similar = vector_store.search_similar(
+                collection_name=MENTIONS_COLLECTION,
+                query_vector=product_embedding,
+                limit=20,
+                score_threshold=0.60,  # Lower bound
+                filter_conditions={
+                    "place_id": str(place_id),
+                    "mention_type": "product",
+                }
+            )
+
+            # Filter out already-matched (above 0.80) and get "near misses"
+            for result in similar:
+                if result.score < 0.80:  # Below threshold
+                    mention = get_mention_by_id(result.payload["mention_id"])
+                    if mention and mention.resolved_product_id is None:
+                        below_threshold_mentions.append((mention, result.score))
+```
+
+**Additional Requirement**:
+The product must have an embedding stored or be able to generate one. Options:
+- Use `centroid_embedding` from TaxonomyProduct (if stored during clustering)
+- Generate embedding from `canonical_text + variants`
+- Search PRODUCTS_COLLECTION for the product's indexed vectors
+
+**Impact**:
+- OS cannot effectively audit taxonomy during review
+- Missing variants not discoverable
+- Poor UX - same data everywhere looks broken
+
+**Workaround** (until fixed):
+OS can manually search reviews for product names to find variants.
+
+---
+
+## Future Enhancements
+
+### FEATURE-001: Multi-Branch Shared Taxonomy
+
+**Priority**: High
+**Status**: **Implemented** (2026-02-04) - Awaiting deployment and testing
+**Related Files**: `pipline/database.py`, `pipline/clustering_job.py`, `pipline/api.py`, `pipline/vector_store.py`
+**Migration**: `pipline/migrations/001_add_multi_branch_taxonomy.sql`
+**Implementation Plan**: `/home/42group/nurliya/MENTION_AUDIT_PLAN.md` (Phases 2-4)
+
+**Description**:
+When scraping a business with multiple branches (e.g., "Specialty Bean Roastery" with Riyadh + Dammam locations), the system should:
+1. Cluster mentions from ALL branches together (better cluster quality)
+2. Create ONE shared taxonomy (same menu across branches)
+3. Link all places to the shared taxonomy
+
+**Current Behavior**:
+```
+Scrape finds 2 branches
+  → Place A (Riyadh) → Taxonomy A
+  → Place B (Dammam) → Taxonomy B
+  (Separate taxonomies, separate clustering)
+```
+
+**Desired Behavior**:
+```
+Scrape finds 2 branches
+  → Combined clustering (all mentions from both branches)
+  → ONE shared taxonomy
+  → Place A & Place B both link to shared taxonomy
+```
+
+**Benefits**:
+- Better clustering: More data points = more robust clusters
+- Consistent taxonomy: Same products/categories across all branches
+- Easier management: One taxonomy to review/approve instead of multiple
+
+**Required Changes**:
+
+1. **Database Schema** (`database.py`):
+```python
+class PlaceTaxonomy(Base):
+    place_id = Column(UUID)           # Primary place (backward compat)
+    place_ids = Column(ARRAY(UUID))   # NEW: All places sharing this taxonomy
+    scrape_job_id = Column(UUID)      # NEW: Link to parent scrape job
+```
+
+2. **Clustering Job** (`clustering_job.py`):
+```python
+def run_clustering_job(place_ids: List[str], scrape_job_id: str):
+    # Gather mentions from ALL places
+    all_mentions = []
+    for place_id in place_ids:
+        mentions = get_mentions_for_place(place_id)
+        all_mentions.extend(mentions)
+
+    # Cluster combined data
+    clusters = cluster_mentions(all_mentions)
+
+    # Create ONE taxonomy linked to all places
+    taxonomy = PlaceTaxonomy(
+        place_id=place_ids[0],        # Primary
+        place_ids=place_ids,          # All places
+        scrape_job_id=scrape_job_id,
+    )
+```
+
+3. **API Queries** (`api.py`):
+```python
+# When fetching taxonomy for a place, check both place_id and place_ids
+def get_taxonomy_for_place(place_id):
+    return session.query(PlaceTaxonomy).filter(
+        or_(
+            PlaceTaxonomy.place_id == place_id,
+            PlaceTaxonomy.place_ids.any(place_id)
+        )
+    ).first()
+```
+
+4. **Trigger Logic** (`clustering_job.py`):
+```python
+def trigger_taxonomy_clustering(job_id):
+    # Get ALL place_ids from the parent scrape job
+    scrape_job = get_scrape_job_for_pipeline_job(job_id)
+    place_ids = [str(p.id) for p in scrape_job.places]
+
+    # Trigger combined clustering
+    queue_clustering_task({
+        "place_ids": place_ids,
+        "scrape_job_id": str(scrape_job.id)
+    })
+```
+
+**Migration Path**:
+1. Add new columns to PlaceTaxonomy (nullable for backward compat)
+2. Update clustering to support multi-place mode
+3. Update API queries to check place_ids array
+4. Backfill existing taxonomies (set place_ids = [place_id])
+
+---
+
 ## Design Issues (Not Bugs)
 
 ### DESIGN-001: No Re-indexing Command for Disaster Recovery
@@ -670,3 +951,6 @@ Consider syncing collections or using single collection with status flags.
 | BUG-010 | api.py | 1383-1408 | Extract-First Pipeline |
 | BUG-011 | llm_client.py | 545-549 | Extract-First Pipeline |
 | BUG-012 | worker.py, database.py | - | Extract-First Pipeline |
+| BUG-013 | clustering_job.py | 89-115 | Multi-branch scrapes |
+| BUG-014 | api.py | 957-1036, 1039-1116 | Onboarding Portal Audit |
+| FEATURE-001 | database.py, clustering_job.py, api.py | - | Multi-Branch Shared Taxonomy |
