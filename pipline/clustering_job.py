@@ -839,6 +839,7 @@ def save_draft_taxonomy(
     reviews_sampled: int,
     place_ids: Optional[List[str]] = None,  # PHASE 4: Multi-place support
     scrape_job_id: Optional[str] = None,    # PHASE 4: Link to parent scrape
+    is_recluster: bool = False,             # Skip existing draft guard for re-clustering
 ) -> Optional[str]:
     """
     Save draft taxonomy to database.
@@ -849,6 +850,7 @@ def save_draft_taxonomy(
         reviews_sampled: Number of reviews used for clustering
         place_ids: All place UUIDs for multi-branch shared taxonomy (PHASE 4)
         scrape_job_id: Parent scrape job UUID (PHASE 4)
+        is_recluster: If True, delete existing draft and create new one
 
     Returns:
         taxonomy_id if successful, None otherwise
@@ -872,9 +874,18 @@ def save_draft_taxonomy(
         ).first()
 
         if existing:
-            place_desc = f"{len(place_ids)} places" if place_ids and len(place_ids) > 1 else f"place {place_id}"
-            logger.warning(f"Draft taxonomy already exists for {place_desc}, skipping")
-            return str(existing.id)
+            if is_recluster:
+                # Re-clustering: delete old draft to replace with new one
+                logger.info(f"Re-clustering: deleting old draft taxonomy {existing.id}")
+                # Delete associated products, categories, and mention links
+                session.query(TaxonomyProduct).filter_by(taxonomy_id=existing.id).delete()
+                session.query(TaxonomyCategory).filter_by(taxonomy_id=existing.id).delete()
+                session.delete(existing)
+                session.flush()
+            else:
+                place_desc = f"{len(place_ids)} places" if place_ids and len(place_ids) > 1 else f"place {place_id}"
+                logger.warning(f"Draft taxonomy already exists for {place_desc}, skipping")
+                return str(existing.id)
 
         # Count entities
         total_categories = (
@@ -1049,20 +1060,166 @@ def save_draft_taxonomy(
         session.close()
 
 
+def build_anchor_matched_hierarchy(matched_items: List[Dict]) -> dict:
+    """
+    Build hierarchy entries from anchor-matched items.
+
+    Groups matched items by anchor category, deduplicates products within
+    each category, and returns the same format as build_hierarchy().
+    Anchor centroids are stored in PostgreSQL (JSONB, 384-dim MiniLM);
+    this function computes per-place centroids from actual matched embeddings.
+
+    Args:
+        matched_items: Items with 'anchor_match' (AnchorMatch), 'anchor_category',
+                       plus standard fields (vector_id, text, embedding, etc.)
+
+    Returns:
+        Hierarchy dict with main_categories, sub_categories, products, aspect_categories
+    """
+    hierarchy = {
+        "main_categories": [],
+        "sub_categories": [],
+        "products": [],
+        "aspect_categories": [],
+    }
+
+    if not matched_items:
+        return hierarchy
+
+    # Group by anchor category name
+    by_anchor = defaultdict(list)
+    for item in matched_items:
+        by_anchor[item["anchor_category"]].append(item)
+
+    for anchor_cat_name, items in by_anchor.items():
+        match = items[0]["anchor_match"]  # AnchorMatch dataclass
+        cat_id = str(uuid.uuid4())
+        total_mentions = sum(item.get("mention_count", 1) for item in items)
+
+        if match.is_aspect:
+            # Aspect category — flat, no products underneath
+            embeddings = [item["embedding"] for item in items if item.get("embedding")]
+            centroid = np.mean(embeddings, axis=0).tolist() if embeddings else None
+
+            hierarchy["aspect_categories"].append({
+                "id": cat_id,
+                "name": match.category_name,
+                "display_name_en": match.display_name_en,
+                "display_name_ar": match.display_name_ar,
+                "has_products": False,
+                "parent_id": None,
+                "discovered_mention_count": total_mentions,
+                "centroid_embedding": centroid,
+                "mention_vector_ids": [item["vector_id"] for item in items],
+            })
+        else:
+            # Product category — create category + deduplicated products
+            hierarchy["main_categories"].append({
+                "id": cat_id,
+                "name": match.category_name,
+                "display_name_en": match.display_name_en,
+                "display_name_ar": match.display_name_ar,
+                "has_products": True,
+                "parent_id": None,
+                "discovered_mention_count": total_mentions,
+            })
+
+            # Convert dicts back to ClusterItems for deduplication
+            cluster_items = [
+                ClusterItem(
+                    vector_id=item["vector_id"],
+                    text=item["text"],
+                    embedding=item["embedding"],
+                    mention_type=item["mention_type"],
+                    sentiment_sum=item.get("sentiment_sum", 0),
+                    mention_count=item.get("mention_count", 1),
+                    cluster_id=0,
+                    confidence=item["anchor_match"].confidence,
+                )
+                for item in items
+            ]
+
+            product_groups = deduplicate_cluster_items(cluster_items)
+
+            for group in product_groups:
+                hierarchy["products"].append({
+                    "id": str(uuid.uuid4()),
+                    "canonical_text": group["canonical_text"],
+                    "display_name": group["display_name"],
+                    "variants": group["variants"],
+                    "discovered_category_id": cat_id,
+                    "vector_id": group["vector_id"],
+                    "discovered_mention_count": group["total_mentions"],
+                    "avg_sentiment": group["avg_sentiment"],
+                    "mention_vector_ids": group.get("mention_vector_ids", []),
+                })
+
+    logger.info(f"Built anchor hierarchy: {len(hierarchy['main_categories'])} product categories, "
+                f"{len(hierarchy['aspect_categories'])} aspect categories, "
+                f"{len(hierarchy['products'])} products")
+
+    return hierarchy
+
+
+def _merge_hierarchies(anchor_hierarchy: dict, discovery_hierarchy: dict) -> dict:
+    """
+    Merge anchor-matched and HDBSCAN-discovered hierarchies.
+
+    Anchor categories take priority — discovery categories with the same name
+    are skipped to avoid duplicates. All discovery products are included since
+    they come from unmatched items.
+    """
+    # Collect anchor category names to avoid duplicates
+    anchor_cat_names = set()
+    for cat_list_key in ("main_categories", "sub_categories", "aspect_categories"):
+        for cat in anchor_hierarchy.get(cat_list_key, []):
+            anchor_cat_names.add(cat["name"])
+
+    merged = {
+        "main_categories": list(anchor_hierarchy.get("main_categories", [])),
+        "sub_categories": list(anchor_hierarchy.get("sub_categories", [])),
+        "products": list(anchor_hierarchy.get("products", [])),
+        "aspect_categories": list(anchor_hierarchy.get("aspect_categories", [])),
+    }
+
+    # Add discovery categories that don't conflict with anchor names
+    for cat_list_key in ("main_categories", "sub_categories", "aspect_categories"):
+        for cat in discovery_hierarchy.get(cat_list_key, []):
+            if cat["name"] not in anchor_cat_names:
+                merged[cat_list_key].append(cat)
+
+    # Add all discovery products (from unmatched items, no overlap possible)
+    merged["products"].extend(discovery_hierarchy.get("products", []))
+
+    return merged
+
+
 def run_clustering_job(
     place_id: str,
     job_id: Optional[str] = None,
     place_ids: Optional[List[str]] = None,  # PHASE 4: Multi-place support
     scrape_job_id: Optional[str] = None,    # PHASE 4: Link to parent scrape
+    import_anchors: Optional[List[Dict]] = None,  # OS-imported anchors for re-clustering
+    is_recluster: bool = False,             # Skip guards when re-clustering after import
 ) -> Optional[str]:
     """
     Main clustering entry point.
+
+    Implements "Learn, Discover" architecture:
+    1. Load learned anchors (from category_anchors table, 384-dim centroids in PostgreSQL)
+    2. Classify mentions against anchors (cosine similarity, threshold 0.85-0.88)
+    3. Unmatched mentions go through HDBSCAN discovery
+    4. Merge anchor-matched + discovered hierarchies
 
     Args:
         place_id: UUID of primary place to cluster (backward compat)
         job_id: Optional triggering job ID (for logging)
         place_ids: All place UUIDs for combined clustering (PHASE 4)
         scrape_job_id: Parent scrape job UUID (PHASE 4)
+        import_anchors: OS-imported anchors for re-clustering (same format as
+                        load_anchors_for_business output). Merged with learned anchors.
+        is_recluster: If True, skip is_clustering_needed() check and existing-draft guard.
+                      Used when re-clustering after OS JSON import.
 
     Returns:
         taxonomy_id if successful, None if failed/skipped
@@ -1116,7 +1273,59 @@ def run_clustering_job(
 
     logger.debug(f"Fetched {len(product_items)} products, {len(aspect_items)} aspects")
 
-    # Step 3: Cluster products
+    # Step 2.5: Anchor pre-classification
+    # Load learned anchors from PostgreSQL (384-dim centroids stored as JSONB),
+    # merge with any OS-imported anchors, and classify mentions.
+    # Matched items go directly into the hierarchy; unmatched go to HDBSCAN.
+    from anchor_manager import classify_mentions_to_anchors, load_anchors_for_business
+
+    db_anchors = load_anchors_for_business(business_type)
+    all_anchors = db_anchors + (import_anchors or [])
+
+    anchor_matched = []
+    if all_anchors:
+        # Convert ClusterItems to dicts for anchor_manager interface
+        all_item_dicts = [
+            {
+                "vector_id": item.vector_id,
+                "text": item.text,
+                "embedding": item.embedding,
+                "mention_type": item.mention_type,
+                "sentiment_sum": item.sentiment_sum,
+                "mention_count": item.mention_count,
+            }
+            for item in product_items + aspect_items
+        ]
+
+        anchor_matched, unmatched_dicts = classify_mentions_to_anchors(
+            items=all_item_dicts,
+            business_type=business_type,
+            anchors=all_anchors,
+        )
+
+        # Rebuild ClusterItem lists from unmatched dicts only
+        product_items = []
+        aspect_items = []
+        for d in unmatched_dicts:
+            ci = ClusterItem(
+                vector_id=d["vector_id"],
+                text=d["text"],
+                embedding=d["embedding"],
+                mention_type=d["mention_type"],
+                sentiment_sum=d.get("sentiment_sum", 0),
+                mention_count=d.get("mention_count", 1),
+            )
+            if d["mention_type"] == "product":
+                product_items.append(ci)
+            else:
+                aspect_items.append(ci)
+
+        logger.info(f"Anchor classification: {len(anchor_matched)} matched, "
+                    f"{len(product_items)} unmatched products, {len(aspect_items)} unmatched aspects")
+    else:
+        logger.info("No anchors available, all items go to HDBSCAN discovery")
+
+    # Step 3: Cluster unmatched products
     product_labels = {}
     product_centroids = {}
 
@@ -1143,7 +1352,7 @@ def run_clustering_job(
             cluster_embeddings = [item.embedding for item in items]
             product_centroids[cluster_id] = compute_cluster_centroid(cluster_embeddings)
 
-    # Step 4: Cluster aspects
+    # Step 4: Cluster unmatched aspects
     aspect_labels = {}
     aspect_centroids = {}  # BUG-006 FIX: Store aspect centroids
 
@@ -1172,7 +1381,8 @@ def run_clustering_job(
             aspect_centroids[cluster_id] = compute_cluster_centroid(cluster_embeddings)
 
     # Step 5: Build hierarchy
-    hierarchy = build_hierarchy(
+    # Build HDBSCAN-discovered hierarchy from unmatched items
+    discovery_hierarchy = build_hierarchy(
         product_items=product_items,
         aspect_items=aspect_items,
         product_labels=product_labels,
@@ -1181,6 +1391,13 @@ def run_clustering_job(
         aspect_centroids=aspect_centroids,  # BUG-006 FIX: Pass aspect centroids
         business_type=business_type,
     )
+
+    # Build anchor-matched hierarchy and merge with discovery
+    if anchor_matched:
+        anchor_hierarchy = build_anchor_matched_hierarchy(anchor_matched)
+        hierarchy = _merge_hierarchies(anchor_hierarchy, discovery_hierarchy)
+    else:
+        hierarchy = discovery_hierarchy
 
     # Check if hierarchy has any content
     total_entities = (
@@ -1213,6 +1430,7 @@ def run_clustering_job(
         reviews_sampled=reviews_sampled,
         place_ids=effective_place_ids if is_multi_place else None,
         scrape_job_id=scrape_job_id,
+        is_recluster=is_recluster,
     )
 
     if taxonomy_id:
@@ -1220,8 +1438,10 @@ def run_clustering_job(
                    extra={"extra_data": {
                        "taxonomy_id": taxonomy_id,
                        "place_ids": effective_place_ids,
+                       "anchor_matched": len(anchor_matched),
                        "product_clusters": len(product_labels),
                        "aspect_clusters": len(aspect_labels),
+                       "is_recluster": is_recluster,
                    }})
 
     return taxonomy_id

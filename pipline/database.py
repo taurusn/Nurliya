@@ -383,6 +383,88 @@ class TaxonomyAuditLog(Base):
     user = relationship("User")
 
 
+# =============================================================================
+# HYBRID DISCOVERY ENGINE - ANCHOR SYSTEM
+# =============================================================================
+
+class CategoryAnchor(Base):
+    """
+    Category anchors for the Hybrid Discovery Engine (Seed, Learn, Discover).
+
+    Anchors provide predefined category definitions that guide clustering.
+    - Seeds: Manually created or from Onboarding Specialist (OS)
+    - Learned: Automatically extracted from approved taxonomies
+
+    Used for both aspect categories (Service, Quality, Price) and
+    product categories (Hot Drinks, Pastries, etc.).
+    """
+    __tablename__ = "category_anchors"
+    __table_args__ = (
+        Index('ix_category_anchors_business_type', 'business_type'),
+        Index('ix_category_anchors_unique', 'business_type', 'category_name', unique=True),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    business_type = Column(String(100), nullable=False)  # 'coffee_shop', 'restaurant', 'hotel'
+    category_name = Column(String(255), nullable=False)  # 'service', 'quality', 'hot_drinks'
+    display_name_en = Column(String(255))
+    display_name_ar = Column(String(255))
+    is_aspect = Column(Boolean, default=True)  # True for aspects, False for product categories
+
+    # Embedding data - centroid of all examples
+    centroid_embedding = Column(JSONB)  # List[float] - 384-dim vector (MiniLM-L12-v2)
+
+    # Sample terms for reference (top examples)
+    sample_terms = Column(ARRAY(Text))  # ['الخدمة', 'التعامل', 'شباب']
+
+    # Learning metadata
+    source = Column(String(50), default='seed')  # 'seed' (manual/OS) or 'learned' (from approved taxonomies)
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+
+    # Statistics
+    example_count = Column(Integer, default=0)  # Number of examples
+    match_count = Column(Integer, default=0)  # How many mentions matched to this anchor
+    avg_confidence = Column(DECIMAL(4, 3))  # Average match confidence (0.000 to 1.000)
+
+    created_at = Column(TIMESTAMP, default=datetime.utcnow)
+    updated_at = Column(TIMESTAMP, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    creator = relationship("User")
+    examples = relationship("AnchorExample", back_populates="anchor", cascade="all, delete-orphan")
+
+
+class AnchorExample(Base):
+    """
+    Individual examples for category anchors.
+
+    Each anchor has multiple example terms that help define its semantic space.
+    Examples can come from OS imports or be learned from approved taxonomies.
+    """
+    __tablename__ = "anchor_examples"
+    __table_args__ = (
+        Index('ix_anchor_examples_anchor', 'anchor_id'),
+        Index('ix_anchor_examples_source_taxonomy', 'source_taxonomy_id'),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    anchor_id = Column(UUID(as_uuid=True), ForeignKey("category_anchors.id", ondelete="CASCADE"), nullable=False)
+    text = Column(String(500), nullable=False)  # 'الخدمة ممتازة'
+    embedding = Column(JSONB, nullable=False)  # List[float] - 384-dim vector (MiniLM-L12-v2)
+
+    # Learning metadata
+    source = Column(String(50), default='seed')  # 'seed' or 'learned'
+    source_taxonomy_id = Column(UUID(as_uuid=True), ForeignKey("place_taxonomies.id", ondelete="SET NULL"), nullable=True)
+
+    # Statistics
+    mention_count = Column(Integer, default=1)  # How many times this exact text appeared
+    sentiment_avg = Column(DECIMAL(3, 2))  # Average sentiment when mentioned (0.00 to 1.00)
+
+    created_at = Column(TIMESTAMP, default=datetime.utcnow)
+
+    anchor = relationship("CategoryAnchor", back_populates="examples")
+    source_taxonomy = relationship("PlaceTaxonomy")
+
+
 def get_session():
     return SessionLocal()
 
