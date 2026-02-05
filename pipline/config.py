@@ -138,6 +138,13 @@ QDRANT_API_KEY = get_secret("QDRANT_API_KEY", "")  # Optional, for Qdrant Cloud
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "paraphrase-multilingual-MiniLM-L12-v2")
 EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "384"))  # MiniLM dimension
 
+# MinIO Object Storage (menu images)
+MINIO_ENDPOINT = get_secret("MINIO_ENDPOINT", "minio:9000")
+MINIO_ACCESS_KEY = get_secret("MINIO_ROOT_USER", "nurliya")
+MINIO_SECRET_KEY = get_secret("MINIO_ROOT_PASSWORD", "nurliya123")
+MINIO_BUCKET = os.getenv("MINIO_BUCKET", "menu-images")
+MINIO_PUBLIC_URL = os.getenv("MINIO_PUBLIC_URL", "https://storage.nurliya.com")
+
 # Deprecated - kept for backwards compatibility
 GEMINI_API_KEY = get_secret("GEMINI_API_KEY", "")
 GEMINI_MODEL = "gemini-2.0-flash-lite"
