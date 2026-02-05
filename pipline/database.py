@@ -211,6 +211,7 @@ class PlaceTaxonomy(Base):
     scrape_job_id = Column(UUID(as_uuid=True), ForeignKey("scrape_jobs.id", ondelete="SET NULL"), nullable=True)
 
     status = Column(String(20), default="draft")  # draft, review, active
+    is_reclustering = Column(Boolean, default=False)  # True while re-clustering after import
     discovered_at = Column(TIMESTAMP)
     reviews_sampled = Column(Integer, default=0)  # Number of reviews used for discovery
     entities_discovered = Column(Integer, default=0)  # Total categories + products discovered
@@ -256,6 +257,7 @@ class TaxonomyCategory(Base):
     display_name_en = Column(String(100))
     display_name_ar = Column(String(100))
     has_products = Column(Boolean, default=False)  # Whether this category contains products
+    source = Column(String(20), default="discovered")  # discovered, imported, manual
     vector_id = Column(String(100))  # Reference to Qdrant point ID for category centroid
     # BUG-006 FIX: Store cluster centroid embedding computed during discovery
     # This preserves the semantic center of all mentions in this category
@@ -295,6 +297,7 @@ class TaxonomyProduct(Base):
     discovered_category_id = Column(UUID(as_uuid=True), ForeignKey("taxonomy_categories.id", ondelete="SET NULL"), nullable=True)  # System suggestion
     assigned_category_id = Column(UUID(as_uuid=True), ForeignKey("taxonomy_categories.id", ondelete="SET NULL"), nullable=True)  # Human decision
     canonical_text = Column(String(200), nullable=False)  # Normalized product name
+    source = Column(String(20), default="discovered")  # discovered, imported, manual
     display_name = Column(String(200))  # Human-readable name
     variants = Column(JSONB, default=list)  # Alternative spellings: ["spanish latté", "سبانش لاتيه"]
     vector_id = Column(String(100))  # Reference to Qdrant point ID

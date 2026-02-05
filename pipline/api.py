@@ -508,6 +508,28 @@ class ActionResponse(BaseModel):
     message: str
 
 
+class ImportProductItem(BaseModel):
+    """A product within an imported category."""
+    name: str = Field(..., min_length=1, max_length=200)
+    display_name: str = Field(..., min_length=1, max_length=200)
+    variants: List[str] = Field(default_factory=list)
+
+
+class ImportCategoryItem(BaseModel):
+    """A category in a taxonomy import."""
+    name: str = Field(..., min_length=1, max_length=100)
+    display_name_en: str = Field(..., min_length=1, max_length=100)
+    display_name_ar: Optional[str] = Field(None, max_length=100)
+    is_aspect: bool = True
+    examples: List[str] = Field(default_factory=list)
+    products: List[ImportProductItem] = Field(default_factory=list)
+
+
+class TaxonomyImportRequest(BaseModel):
+    """Request body for importing a taxonomy."""
+    categories: List[ImportCategoryItem] = Field(..., min_length=1)
+
+
 # --- Audit Logging Helper ---
 
 def log_taxonomy_action(
@@ -1823,6 +1845,148 @@ def _aggregate_taxonomy_analytics(session, taxonomy_id: UUID):
                     category.avg_sentiment = 0.5  # Neutral default
 
 
+@app.post("/api/onboarding/taxonomies/{taxonomy_id}/import", response_model=ActionResponse)
+async def import_taxonomy(
+    taxonomy_id: UUID,
+    request: TaxonomyImportRequest,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Import categories/products into a draft taxonomy and trigger re-clustering.
+
+    This will:
+    1. Validate taxonomy exists and is in draft status
+    2. Create imported categories/products in the taxonomy
+    3. Delete old discovered (non-imported) categories/products
+    4. Clear mention links (discovered_product_id, discovered_category_id -> NULL)
+    5. Generate anchors from import data
+    6. Queue re-clustering in background
+    """
+    from anchor_manager import generate_anchors_from_import
+    from clustering_job import run_clustering_job
+
+    session = get_session()
+    try:
+        taxonomy = session.query(PlaceTaxonomy).filter_by(id=taxonomy_id).first()
+        if not taxonomy:
+            raise HTTPException(status_code=404, detail="Taxonomy not found")
+
+        if taxonomy.status != "draft":
+            raise HTTPException(status_code=400, detail="Can only import into draft taxonomies")
+
+        place_id = str(taxonomy.place_id)
+
+        # Step 1: Delete all existing categories and products for this taxonomy
+        session.query(TaxonomyProduct).filter_by(
+            taxonomy_id=taxonomy_id
+        ).delete(synchronize_session=False)
+        session.query(TaxonomyCategory).filter_by(
+            taxonomy_id=taxonomy_id
+        ).delete(synchronize_session=False)
+
+        # Step 2: Clear mention links for this place
+        session.query(RawMention).filter(
+            RawMention.place_id == taxonomy.place_id
+        ).update({
+            RawMention.discovered_product_id: None,
+            RawMention.discovered_category_id: None,
+        }, synchronize_session=False)
+
+        # Step 3: Create imported categories and products
+        imported_count = 0
+        product_count = 0
+        for cat_data in request.categories:
+            category = TaxonomyCategory(
+                taxonomy_id=taxonomy_id,
+                name=cat_data.name,
+                display_name_en=cat_data.display_name_en,
+                display_name_ar=cat_data.display_name_ar,
+                has_products=not cat_data.is_aspect and len(cat_data.products) > 0,
+                source="imported",
+                is_approved=True,
+            )
+            session.add(category)
+            session.flush()  # Get category.id for products
+            imported_count += 1
+
+            # Create products for this category
+            for prod_data in cat_data.products:
+                product = TaxonomyProduct(
+                    taxonomy_id=taxonomy_id,
+                    assigned_category_id=category.id,
+                    canonical_text=prod_data.name,
+                    display_name=prod_data.display_name,
+                    variants=prod_data.variants,
+                    source="imported",
+                    is_approved=True,
+                )
+                session.add(product)
+                product_count += 1
+
+        # Step 4: Mark taxonomy as re-clustering
+        taxonomy.is_reclustering = True
+
+        # Log import action
+        log_taxonomy_action(
+            session, taxonomy_id, current_user.id,
+            "import", "taxonomy", taxonomy_id,
+            None,
+            {
+                "categories_imported": imported_count,
+                "products_imported": product_count,
+            }
+        )
+
+        session.commit()
+
+        # Step 5: Generate anchors and queue re-clustering in background
+        import_dicts = [cat.model_dump() for cat in request.categories]
+        import_anchors = generate_anchors_from_import(import_dicts)
+
+        def run_recluster():
+            try:
+                run_clustering_job(
+                    place_id=place_id,
+                    import_anchors=import_anchors,
+                    is_recluster=True,
+                )
+            except Exception as e:
+                logger.error(f"Re-clustering failed after import: {e}", exc_info=True)
+            finally:
+                # Clear re-clustering flag
+                # NOTE: save_draft_taxonomy(is_recluster=True) deletes the old
+                # PlaceTaxonomy and creates a new one with a new UUID, so we look
+                # up by place_id rather than taxonomy_id.
+                s = get_session()
+                try:
+                    t = s.query(PlaceTaxonomy).filter_by(
+                        place_id=place_id
+                    ).order_by(PlaceTaxonomy.created_at.desc()).first()
+                    if t and t.is_reclustering:
+                        t.is_reclustering = False
+                        s.commit()
+                except Exception:
+                    s.rollback()
+                finally:
+                    s.close()
+
+        background_tasks.add_task(run_recluster)
+
+        return ActionResponse(
+            success=True,
+            message=f"Imported {imported_count} categories and {product_count} products. Re-clustering started."
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Failed to import taxonomy: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        session.close()
+
+
 @app.post("/api/onboarding/taxonomies/{taxonomy_id}/publish", response_model=ActionResponse)
 async def publish_taxonomy(
     taxonomy_id: UUID,
@@ -1909,6 +2073,16 @@ async def publish_taxonomy(
         )
 
         session.commit()
+
+        # Auto-learn anchors from approved categories (non-blocking)
+        from anchor_manager import learn_from_approved_taxonomy
+        try:
+            learned_count = learn_from_approved_taxonomy(str(taxonomy_id))
+            logger.info(f"Auto-learned {learned_count} examples from taxonomy {taxonomy_id}",
+                       extra={"extra_data": {"taxonomy_id": str(taxonomy_id), "place_id": place_id}})
+        except Exception as e:
+            logger.warning(f"Auto-learning failed (non-blocking): {e}",
+                         extra={"extra_data": {"taxonomy_id": str(taxonomy_id)}})
 
         # Queue reviews for sentiment analysis now that taxonomy is active
         # Fetch all reviews for this place that don't have analysis yet
