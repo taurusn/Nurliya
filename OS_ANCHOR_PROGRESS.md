@@ -14,7 +14,7 @@
 | Phase 2 | Wire anchors into clustering pipeline | **Done** |
 | Phase 3 | Auto-learn on publish | **Done** |
 | Phase 4 | JSON import API + re-clustering | **Done** |
-| Phase 5 | Import UI in onboarding portal | **Pending** |
+| Phase 5 | Import UI in onboarding portal | **Done** |
 
 ---
 
@@ -106,23 +106,24 @@ Mentions fetched from Qdrant MENTIONS_COLLECTION, classified against anchors in-
 
 ## Phase 5: Import UI in Onboarding Portal
 
-**Status**: Pending
+**Status**: Done (2026-02-05)
 **Files**: `onboarding-portal/src/`
 
 ### 5A: api.ts
-- [ ] Add `ImportCategory`, `ImportProduct`, `TaxonomyImportData` types
-- [ ] Add `importTaxonomy()` API function
+- [x] Add `ImportProduct`, `ImportCategory`, `TaxonomyImportData` types
+- [x] Add `importTaxonomy()` API function (POST to `/import` endpoint)
 
 ### 5B: ImportModal.tsx
-- [ ] Create modal component with file upload
-- [ ] JSON validation and schema checking
-- [ ] Preview (category count, product count)
-- [ ] "Import & Re-cluster" button with warning
+- [x] Create modal component with file upload (`<input type="file" accept=".json">`)
+- [x] JSON validation and schema checking (`validateImportData()` — checks categories array, required fields)
+- [x] Preview: category count (aspect vs product breakdown), product count, category listing with types
+- [x] "Import & Re-cluster" button with warning ("This will replace all existing discovered categories and trigger re-clustering")
+- [x] Loading state, error display, file reset on close
 
 ### 5C: page.tsx
-- [ ] Add Import button (visible only for draft taxonomies)
-- [ ] Wire ImportModal open/close state
-- [ ] Handle import success + re-clustering indicator
+- [x] Add Import button in header (visible when `taxonomy.status !== 'active'`)
+- [x] Add `showImportModal` state, `handleImport` handler
+- [x] Wire `ImportModal` open/close with data refresh on success
 
 ---
 
@@ -136,3 +137,4 @@ Mentions fetched from Qdrant MENTIONS_COLLECTION, classified against anchors in-
 | 2026-02-05 | 2 | Wired anchor classification into clustering pipeline, added build_anchor_matched_hierarchy, _merge_hierarchies, is_recluster support |
 | 2026-02-05 | 3 | Hooked auto-learn into publish_taxonomy (non-blocking), fixed mention query (or_ for both category IDs), added product text collection for product categories |
 | 2026-02-05 | 4 | Added generate_anchors_from_import(), import endpoint with Pydantic models, background re-clustering, source column on TaxonomyCategory/Product, is_reclustering on PlaceTaxonomy |
+| 2026-02-05 | 5 | Added ImportModal component (file upload, JSON validation, preview), importTaxonomy API function, Import button in taxonomy editor header |

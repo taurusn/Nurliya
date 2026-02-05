@@ -21,9 +21,11 @@ import {
   createCategory,
   createProduct,
   publishTaxonomy,
+  importTaxonomy,
   TaxonomyDetail,
   TaxonomyCategory,
   TaxonomyProduct,
+  TaxonomyImportData,
 } from '@/lib/api'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -37,6 +39,7 @@ import { AddProductModal } from '@/components/AddProductModal'
 import { MergeProductModal } from '@/components/MergeProductModal'
 import { EditProductModal } from '@/components/EditProductModal'
 import { EditCategoryModal } from '@/components/EditCategoryModal'
+import { ImportModal } from '@/components/ImportModal'
 import {
   ArrowLeft,
   Check,
@@ -47,6 +50,7 @@ import {
   RefreshCw,
   AlertCircle,
   MessageSquare,
+  Upload,
 } from 'lucide-react'
 import { MentionPanel } from '@/components/MentionPanel'
 import { OrphanPanel } from '@/components/OrphanPanel'
@@ -78,6 +82,7 @@ function TaxonomyEditor() {
   const [variantModal, setVariantModal] = useState<{ id: string; name: string } | null>(null)
   const [showAddCategory, setShowAddCategory] = useState(false)
   const [showAddProduct, setShowAddProduct] = useState(false)
+  const [showImportModal, setShowImportModal] = useState(false)
   const [mentionPanel, setMentionPanel] = useState<{
     type: 'product' | 'category'
     id: string
@@ -296,6 +301,16 @@ function TaxonomyEditor() {
     }
   }
 
+  // Import
+  const handleImport = async (data: TaxonomyImportData) => {
+    try {
+      await importTaxonomy(taxonomyId, data)
+      loadTaxonomy()
+    } catch (err) {
+      throw err // Let the modal handle the error
+    }
+  }
+
   if (loading) {
     return (
       <div className="min-h-screen bg-background flex items-center justify-center">
@@ -355,6 +370,12 @@ function TaxonomyEditor() {
                 <RefreshCw className="w-4 h-4 mr-2" />
                 Refresh
               </Button>
+              {taxonomy.status !== 'active' && (
+                <Button variant="outline" size="sm" onClick={() => setShowImportModal(true)}>
+                  <Upload className="w-4 h-4 mr-2" />
+                  Import
+                </Button>
+              )}
               {canPublish && (
                 <Button onClick={handlePublish} disabled={publishing}>
                   <Send className="w-4 h-4 mr-2" />
@@ -602,6 +623,14 @@ function TaxonomyEditor() {
         onClose={() => setShowAddCategory(false)}
         onAdd={handleCreateCategory}
         categories={taxonomy.categories}
+      />
+
+      <ImportModal
+        isOpen={showImportModal}
+        onClose={() => setShowImportModal(false)}
+        onImport={handleImport}
+        categories={taxonomy.categories}
+        products={taxonomy.products}
       />
 
       <AddProductModal

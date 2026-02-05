@@ -289,6 +289,39 @@ export async function publishTaxonomy(taxonomyId: string): Promise<{ success: bo
   return res.json()
 }
 
+// Import types
+export interface ImportProduct {
+  name: string
+  display_name: string
+  variants: string[]
+}
+
+export interface ImportCategory {
+  name: string
+  display_name_en: string
+  display_name_ar?: string
+  is_aspect: boolean
+  examples: string[]
+  products: ImportProduct[]
+}
+
+export interface TaxonomyImportData {
+  categories: ImportCategory[]
+}
+
+export async function importTaxonomy(
+  taxonomyId: string,
+  data: TaxonomyImportData
+): Promise<{ success: boolean, message: string }> {
+  const res = await fetch(`${API_URL}/api/onboarding/taxonomies/${taxonomyId}/import`, {
+    method: 'POST',
+    headers: getAuthHeaders(),
+    body: JSON.stringify(data),
+  })
+  if (!res.ok) throw new Error('Failed to import taxonomy')
+  return res.json()
+}
+
 // Mention types
 export interface Mention {
   id: string
