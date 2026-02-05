@@ -35,6 +35,13 @@ Thumbs.db
 # Docker
 *.log
 
+# Node
+node_modules/
+.next/
+
+# Lab experiments
+lab/
+
 # Credentials
 credentials.json
 *.pem
