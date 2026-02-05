@@ -97,17 +97,25 @@ function buildTemplateFromDraft(
   categories: TaxonomyCategory[],
   products: TaxonomyProduct[]
 ): TaxonomyImportData {
-  const mainCats = categories.filter((c) => !c.parent_id)
+  const parentCats = categories.filter((c) => !c.parent_id)
+  const childCats = categories.filter((c) => c.parent_id)
 
   return {
-    categories: mainCats.map((cat) => {
-      const catProducts = products.filter((p) => p.assigned_category_id === cat.id)
+    categories: parentCats.map((parent) => {
+      // Collect products from this parent and all its children
+      // Products may be linked via assigned_category_id or discovered_category_id
+      const children = childCats.filter((c) => c.parent_id === parent.id)
+      const relevantCatIds = [parent.id, ...children.map((c) => c.id)]
+      const catProducts = products.filter((p) => {
+        const catId = p.assigned_category_id || p.discovered_category_id
+        return catId && relevantCatIds.includes(catId)
+      })
 
       return {
-        name: cat.name,
-        display_name_en: cat.display_name_en || cat.name,
-        display_name_ar: cat.display_name_ar || undefined,
-        is_aspect: !cat.has_products,
+        name: parent.name,
+        display_name_en: parent.display_name_en || parent.name,
+        display_name_ar: parent.display_name_ar || undefined,
+        is_aspect: !parent.has_products,
         examples: [],
         products: catProducts.map((p) => ({
           name: p.canonical_text,

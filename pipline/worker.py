@@ -590,9 +590,16 @@ def update_job_progress(job_id: str):
     place_name = None
     total_reviews = 0
     try:
+        # Atomic increment to avoid race condition with multiple workers
+        session.query(Job).filter_by(id=job_id).update(
+            {Job.processed_reviews: Job.processed_reviews + 1},
+            synchronize_session=False
+        )
+        session.commit()
+
+        # Re-read to check completion
         job = session.query(Job).filter_by(id=job_id).first()
         if job:
-            job.processed_reviews += 1
             total_reviews = job.total_reviews
             # Get place name for logging
             if job.place_id:
@@ -608,7 +615,7 @@ def update_job_progress(job_id: str):
                     "Job completed",
                     extra={"extra_data": {"job_id": job_id, "total_reviews": job.total_reviews}}
                 )
-            else:
+            elif job.status != "processing":
                 job.status = "processing"
             session.commit()
     finally:
