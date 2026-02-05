@@ -94,6 +94,21 @@ func (j *PlaceJob) Process(_ context.Context, resp *scrapemate.Response) (any, [
 		entry.UserReviewsExtended = append(entry.UserReviewsExtended, convertedReviews...)
 	}
 
+	// Merge browser-extracted menu images with data-extracted ones
+	if browserMenuImages, ok := resp.Meta["menu_images"].([]string); ok && len(browserMenuImages) > 0 {
+		seen := make(map[string]bool)
+		for _, u := range entry.MenuImages {
+			seen[normalizePhotoURL(u)] = true
+		}
+		for _, u := range browserMenuImages {
+			key := normalizePhotoURL(u)
+			if !seen[key] {
+				seen[key] = true
+				entry.MenuImages = append(entry.MenuImages, u)
+			}
+		}
+	}
+
 	if j.ExtractEmail && entry.IsWebsiteValidForEmail() {
 		opts := []EmailExtractJobOptions{}
 		if j.ExitMonitor != nil {
@@ -149,6 +164,11 @@ func (j *PlaceJob) BrowserActions(ctx context.Context, page scrapemate.BrowserPa
 	}
 
 	resp.Meta["json"] = raw
+
+	// Extract menu photos from the browser carousel
+	if menuPhotos := extractMenuPhotos(page); len(menuPhotos) > 0 {
+		resp.Meta["menu_images"] = menuPhotos
+	}
 
 	if j.ExtractExtraReviews {
 		reviewCount := j.getReviewCount(raw)
@@ -265,6 +285,137 @@ func (j *PlaceJob) getReviewCount(data []byte) int {
 
 func (j *PlaceJob) UseInResults() bool {
 	return j.UsageInResultststs
+}
+
+// extractMenuPhotos clicks the "Menu" photo tab and scrolls through the carousel
+// collecting all unique menu image URLs. It parses the total from aria-label
+// and scrolls the carousel container horizontally to force all items to render.
+func extractMenuPhotos(page scrapemate.BrowserPage) []string {
+	// Step 1: Scroll down to reveal photo category tabs, then click "Menu"
+	clicked, err := page.Eval(`async () => {
+		const sc = document.querySelector('.m6QErb.DxyBCb.kA9KIf.dS8AEf')
+			|| document.querySelector('.m6QErb.DxyBCb.kA9KIf')
+			|| document.querySelector('.m6QErb');
+		if (sc) {
+			for (let i = 0; i < 5; i++) {
+				sc.scrollBy(0, 300);
+				await new Promise(r => setTimeout(r, 400));
+			}
+		}
+		await new Promise(r => setTimeout(r, 800));
+
+		const tabs = document.querySelectorAll('div.Gpq6kf.NlVald, div.Gpq6kf');
+		for (const tab of tabs) {
+			if (tab.textContent.trim() === 'Menu') {
+				const parent = tab.closest('div.LRkQ2');
+				if (parent) { parent.click(); return true; }
+				tab.click();
+				return true;
+			}
+		}
+		return false;
+	}`)
+	if err != nil || clicked == nil {
+		return nil
+	}
+
+	clickedBool, _ := clicked.(bool)
+	if !clickedBool {
+		return nil // No menu tab — not an error, just no menu photos for this place
+	}
+
+	time.Sleep(3 * time.Second)
+
+	// Step 2: Collect all menu photo URLs from all carousels on the page.
+	// After clicking the Menu tab, Google Maps shows menu photos across multiple
+	// carousel sections. Each carousel renders ~4 items in headless viewport,
+	// but collecting from all of them gives us the full set.
+	result, err := page.Eval(`async () => {
+		const allUrls = new Set();
+
+		function collectUrls() {
+			document.querySelectorAll('button.K4UgGe img.DaSXdd').forEach(img => {
+				const src = img.src || img.getAttribute('data-src') || '';
+				if (src && src.includes('googleusercontent.com')) {
+					allUrls.add(src);
+				}
+			});
+		}
+
+		// Get expected total from first aria-label "Photo X of Y"
+		let total = 0;
+		const firstBtn = document.querySelector('button.K4UgGe[aria-label]');
+		if (firstBtn) {
+			const match = firstBtn.getAttribute('aria-label').match(/of\s+(\d+)/);
+			if (match) total = parseInt(match[1]);
+		}
+
+		collectUrls();
+		const initialCount = allUrls.size;
+
+		// Scroll each carousel container to reveal more items
+		const carousels = document.querySelectorAll('div.fp2VUc');
+		for (const carousel of carousels) {
+			const scrollable = carousel.querySelector('div.dryRY')
+				|| carousel.querySelector('div.cRLbXd');
+			if (scrollable) {
+				for (let i = 0; i < 20; i++) {
+					scrollable.scrollBy(400, 0);
+					await new Promise(r => setTimeout(r, 200));
+					collectUrls();
+				}
+			}
+			// Also try the Next button in each carousel
+			for (let i = 0; i < 20; i++) {
+				const nextBtn = carousel.querySelector('button.XMkGfe');
+				if (!nextBtn) break;
+				const prev = allUrls.size;
+				nextBtn.click();
+				await new Promise(r => setTimeout(r, 400));
+				collectUrls();
+				if (allUrls.size === prev && i > 3) break;
+			}
+		}
+
+		// Upscale thumbnail URLs to full size
+		const fullUrls = Array.from(allUrls).map(u =>
+			u.replace(/=w\d+-h\d+-[^\s"]*/, '=w1200-h1200-p-k-no')
+		);
+
+		return {
+			urls: fullUrls,
+			debug: 'expected=' + total + ',initial=' + initialCount + ',final=' + allUrls.size
+		};
+	}`)
+	if err != nil {
+		fmt.Printf("Warning: menu photo extraction failed: %v\n", err)
+		return nil
+	}
+
+	resultMap, ok := result.(map[string]any)
+	if !ok {
+		return nil
+	}
+
+	if debugStr, ok := resultMap["debug"].(string); ok {
+		fmt.Printf("Menu photo debug: %s\n", debugStr)
+	}
+
+	rawURLs, ok := resultMap["urls"].([]any)
+	if !ok || len(rawURLs) == 0 {
+		return nil
+	}
+
+	urls := make([]string, 0, len(rawURLs))
+	for _, u := range rawURLs {
+		if s, ok := u.(string); ok && s != "" {
+			urls = append(urls, s)
+		}
+	}
+
+	fmt.Printf("Menu photos extracted: %d\n", len(urls))
+
+	return urls
 }
 
 const js = `

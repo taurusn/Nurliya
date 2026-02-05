@@ -95,6 +95,7 @@ type Entry struct {
 	UserReviews         []Review               `json:"user_reviews"`
 	UserReviewsExtended []Review               `json:"user_reviews_extended"`
 	Emails              []string               `json:"emails"`
+	MenuImages          []string               `json:"menu_images"`
 }
 
 func (e *Entry) haversineDistance(lat, lon float64) float64 {
@@ -192,6 +193,7 @@ func (e *Entry) CsvHeaders() []string {
 		"user_reviews",
 		"user_reviews_extended",
 		"emails",
+		"menu_images",
 	}
 }
 
@@ -231,6 +233,7 @@ func (e *Entry) CsvRow() []string {
 		stringify(e.UserReviews),
 		stringify(e.UserReviewsExtended),
 		stringSliceToString(e.Emails),
+		stringify(e.MenuImages),
 	}
 }
 
@@ -358,6 +361,17 @@ func EntryFromJSON(raw []byte, reviewCountOnly ...bool) (entry Entry, err error)
 		entry.Images[i] = Image{
 			Title: items[i].Source,
 			Image: items[i].Link,
+		}
+	}
+
+	// Extract menu images by searching the "Menu" photo category for all photo URLs
+	photoCategories := getNthElementAndCast[[]any](darray, 171, 0)
+	for i := range photoCategories {
+		catItem := getNthElementAndCast[[]any](photoCategories, i)
+		catTitle := getNthElementAndCast[string](catItem, 2)
+		if catTitle == "Menu" {
+			entry.MenuImages = findGooglePhotoURLs(catItem)
+			break
 		}
 	}
 
@@ -729,6 +743,41 @@ func getNthElementAndCast[T any](arr []any, indexes ...int) T {
 	}
 
 	return ans
+}
+
+// findGooglePhotoURLs recursively searches nested arrays for Google photo URLs
+func findGooglePhotoURLs(data any) []string {
+	seen := make(map[string]bool)
+	var urls []string
+
+	var walk func(v any)
+	walk = func(v any) {
+		switch val := v.(type) {
+		case string:
+			if strings.Contains(val, "googleusercontent.com/p/") && !seen[val] {
+				seen[val] = true
+				urls = append(urls, val)
+			}
+		case []any:
+			for _, item := range val {
+				walk(item)
+			}
+		}
+	}
+	walk(data)
+
+	return urls
+}
+
+// normalizePhotoURL strips the size suffix from a Google photo URL for deduplication
+func normalizePhotoURL(u string) string {
+	if idx := strings.LastIndex(u, "=w"); idx != -1 {
+		return u[:idx]
+	}
+	if idx := strings.LastIndex(u, "=s"); idx != -1 {
+		return u[:idx]
+	}
+	return u
 }
 
 func stringSliceToString(s []string) string {
