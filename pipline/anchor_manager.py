@@ -32,9 +32,12 @@ logger = get_logger(__name__, service="anchor_manager")
 
 # Thresholds for anchor matching
 # All embeddings are 384-dim (paraphrase-multilingual-MiniLM-L12-v2)
-LEARNED_MATCH_THRESHOLD = 0.88   # Learned from approved taxonomies
-IMPORT_MATCH_THRESHOLD = 0.85    # OS-imported anchors (slightly relaxed)
+LEARNED_MATCH_THRESHOLD = 0.80   # Learned from approved taxonomies
+IMPORT_MATCH_THRESHOLD = 0.70    # OS-imported anchors (relaxed for Arabic/multilingual)
 DEFAULT_MATCH_THRESHOLD = 0.85
+
+# Learning weights
+CORRECTION_WEIGHT = 2.0  # Human corrections count 2x vs auto-discovered mentions
 
 
 @dataclass
@@ -390,13 +393,16 @@ def learn_from_approved_taxonomy(taxonomy_id: str) -> int:
         session.close()
 
 
-def generate_anchors_from_import(import_categories: List[Dict]) -> List[Dict]:
+def generate_anchors_from_import(import_categories: List[Dict]) -> Tuple[List[Dict], Dict]:
     """
     Convert imported JSON categories into anchor-format dicts for clustering.
 
-    Generates embeddings from example texts and product names/variants,
-    computes centroids, and returns dicts in the same format as
-    load_anchors_for_business() output.
+    For ASPECT categories: Creates one anchor per category (centroid of all examples).
+    For PRODUCT categories: Creates one anchor per PRODUCT (centroid of product variants).
+
+    This product-level granularity prevents centroid dilution when a category has
+    many diverse products (e.g., espresso_drinks with Latte, Cappuccino, Americano).
+    Each product anchor still carries the parent category name for category creation.
 
     Args:
         import_categories: List of category dicts from the import request, each with:
@@ -404,61 +410,121 @@ def generate_anchors_from_import(import_categories: List[Dict]) -> List[Dict]:
             - display_name_en: str
             - display_name_ar: str
             - is_aspect: bool
+            - parent: str (optional, parent category name for hierarchy)
             - examples: List[str] (example texts for aspect categories)
             - products: List[dict] (for product categories, each with name, variants)
 
     Returns:
-        List of anchor dicts compatible with classify_mentions_to_anchors()
+        Tuple of:
+        - List of anchor dicts compatible with classify_mentions_to_anchors()
+        - Dict of category hierarchy info: {cat_name: {parent, display_name_en, display_name_ar, is_aspect}}
     """
     anchors = []
+    hierarchy_info = {}  # cat_name -> {parent, display_names, is_aspect}
 
     for cat in import_categories:
-        # Collect all texts for this category
-        texts = []
+        is_aspect = cat.get("is_aspect", True)
+        cat_name = cat.get("name", "")
+        parent_name = cat.get("parent")  # Optional parent category
 
-        # Example texts (aspects and products)
-        if cat.get("examples"):
-            texts.extend(cat["examples"])
-
-        # Product names and variants
-        if cat.get("products"):
-            for product in cat["products"]:
-                if product.get("name"):
-                    texts.append(product["name"])
-                if product.get("variants"):
-                    texts.extend(product["variants"])
-
-        if not texts:
-            logger.warning(f"Import category '{cat.get('name')}' has no texts, skipping")
-            continue
-
-        # Generate embeddings
-        embeddings = embedding_client.generate_embeddings(texts)
-        if not embeddings:
-            logger.warning(f"Failed to generate embeddings for import category '{cat.get('name')}'")
-            continue
-
-        valid_embeddings = [emb for emb in embeddings if emb]
-        if not valid_embeddings:
-            continue
-
-        # Compute centroid
-        centroid = np.mean(valid_embeddings, axis=0).tolist()
-
-        anchors.append({
-            "id": str(uuid.uuid4()),  # Temporary ID for classification
-            "category_name": cat["name"],
+        # Store hierarchy info for all categories
+        hierarchy_info[cat_name] = {
+            "parent": parent_name,
             "display_name_en": cat.get("display_name_en", ""),
             "display_name_ar": cat.get("display_name_ar", ""),
-            "is_aspect": cat.get("is_aspect", True),
-            "centroid_embedding": centroid,
-            "source": "import",
-            "example_count": len(valid_embeddings),
-            "match_count": 0,
-        })
+            "is_aspect": is_aspect,
+            "has_products": not is_aspect,
+        }
 
-    logger.info(f"Generated {len(anchors)} anchors from import data")
-    return anchors
+        if is_aspect:
+            # ASPECT CATEGORIES: One anchor per category
+            texts = cat.get("examples", [])
+            if not texts:
+                logger.warning(f"Import aspect category '{cat_name}' has no examples, skipping")
+                continue
+
+            embeddings = embedding_client.generate_embeddings(texts)
+            if not embeddings:
+                continue
+
+            valid_embeddings = [emb for emb in embeddings if emb]
+            if not valid_embeddings:
+                continue
+
+            centroid = np.mean(valid_embeddings, axis=0).tolist()
+            anchors.append({
+                "id": str(uuid.uuid4()),
+                "category_name": cat_name,
+                "parent_name": parent_name,
+                "display_name_en": cat.get("display_name_en", ""),
+                "display_name_ar": cat.get("display_name_ar", ""),
+                "is_aspect": True,
+                "centroid_embedding": centroid,
+                "source": "import",
+                "example_count": len(valid_embeddings),
+                "match_count": 0,
+            })
+        else:
+            # PRODUCT CATEGORIES: One anchor per product
+            products = cat.get("products", [])
+            if not products:
+                logger.warning(f"Import product category '{cat_name}' has no products, skipping")
+                continue
+
+            for product in products:
+                # Collect texts for this product: variants only (skip English name)
+                # Use ONLY non-ASCII variants for centroid to avoid language mixing
+                # English and Arabic embeddings are very different in multilingual models
+                product_name = product.get("name", "")
+                display_name = product.get("display_name", product_name)
+                variants = product.get("variants", [])
+
+                # Filter to non-ASCII variants (Arabic text)
+                # ASCII check: if any char is A-Za-z, it's English
+                def is_arabic(text: str) -> bool:
+                    return not any(c.isascii() and c.isalpha() for c in text)
+
+                arabic_variants = [v for v in variants if is_arabic(v)]
+
+                # Fallback: if no Arabic variants, use all variants
+                texts = arabic_variants if arabic_variants else variants
+                if not texts:
+                    # Last resort: use display_name (Arabic) or product name
+                    texts = [display_name] if display_name else [product_name] if product_name else []
+
+                if not texts:
+                    continue
+
+                embeddings = embedding_client.generate_embeddings(texts)
+                if not embeddings:
+                    continue
+
+                valid_embeddings = [emb for emb in embeddings if emb]
+                if not valid_embeddings:
+                    continue
+
+                # Centroid from Arabic variants only (avoids language mixing)
+                centroid = np.mean(valid_embeddings, axis=0).tolist()
+
+                anchors.append({
+                    "id": str(uuid.uuid4()),
+                    "category_name": cat_name,  # Category name
+                    "parent_name": parent_name,  # Parent category (for hierarchy)
+                    "product_name": product_name,  # Specific product
+                    "display_name_en": cat.get("display_name_en", ""),
+                    "display_name_ar": cat.get("display_name_ar", ""),
+                    "product_display_name": display_name,  # Product display name
+                    "is_aspect": False,
+                    "centroid_embedding": centroid,
+                    "source": "import",
+                    "example_count": len(valid_embeddings),
+                    "match_count": 0,
+                })
+
+    logger.info(f"Generated {len(anchors)} anchors from import data "
+                f"({sum(1 for a in anchors if a.get('is_aspect'))} aspects, "
+                f"{sum(1 for a in anchors if not a.get('is_aspect'))} products)")
+    return anchors, hierarchy_info
 
 
 def create_seed_anchors(business_type: str, seeds: List[Dict]) -> int:
@@ -616,6 +682,158 @@ def _recompute_anchor_centroid(session, anchor: CategoryAnchor):
     anchor.centroid_embedding = centroid
     anchor.example_count = len(examples)
     anchor.updated_at = datetime.utcnow()
+
+
+def _recompute_anchor_centroid_weighted(session, anchor: CategoryAnchor):
+    """
+    Recompute anchor centroid with higher weight for corrections.
+
+    Corrections (source='correction') count 2x more than other examples,
+    reflecting that human corrections are more reliable than auto-discovery.
+    """
+    examples = session.query(AnchorExample).filter_by(anchor_id=anchor.id).all()
+
+    if not examples:
+        return
+
+    weighted_embeddings = []
+    for ex in examples:
+        if ex.embedding:
+            weight = CORRECTION_WEIGHT if ex.source == 'correction' else 1.0
+            # Add embedding weighted times (integer approximation)
+            for _ in range(int(weight)):
+                weighted_embeddings.append(ex.embedding)
+
+    if not weighted_embeddings:
+        return
+
+    centroid = np.mean(weighted_embeddings, axis=0).tolist()
+    anchor.centroid_embedding = centroid
+    anchor.example_count = len(examples)
+    anchor.updated_at = datetime.utcnow()
+
+
+def learn_from_corrections(
+    session,
+    mention_ids: List,
+    target_type: str,
+    target_id,
+    taxonomy,
+) -> int:
+    """
+    Learn from user corrections by adding mention texts as anchor examples.
+
+    This enables immediate anchor improvement without waiting for publish.
+    Called from bulk_move_mentions endpoint.
+
+    Args:
+        session: Database session
+        mention_ids: List of RawMention UUIDs that were moved
+        target_type: 'product' or 'category'
+        target_id: UUID of target product or category
+        taxonomy: PlaceTaxonomy object
+
+    Returns:
+        Number of new examples added
+    """
+    from database import TaxonomyProduct, TaxonomyCategory, RawMention, CategoryAnchor, AnchorExample
+
+    # Get the target category
+    if target_type == 'product':
+        target = session.query(TaxonomyProduct).filter_by(id=target_id).first()
+        if not target or not target.assigned_category_id:
+            return 0
+        category = session.query(TaxonomyCategory).filter_by(id=target.assigned_category_id).first()
+    else:
+        category = session.query(TaxonomyCategory).filter_by(id=target_id).first()
+
+    if not category:
+        return 0
+
+    # Determine business_type from place
+    place = taxonomy.place
+    business_type = place.category if place and place.category else 'general'
+
+    # Find existing anchor for this category
+    anchor = session.query(CategoryAnchor).filter_by(
+        business_type=business_type,
+        category_name=category.name,
+    ).first()
+
+    # If no anchor exists, create one
+    if not anchor:
+        anchor = CategoryAnchor(
+            business_type=business_type,
+            category_name=category.name,
+            display_name_en=category.display_name_en or category.name,
+            display_name_ar=category.display_name_ar,
+            is_aspect=not category.has_products,
+            source='correction',
+            example_count=0,
+            match_count=0,
+        )
+        session.add(anchor)
+        session.flush()  # Get the anchor ID
+
+    # Get mention texts
+    mentions = session.query(RawMention).filter(RawMention.id.in_(mention_ids)).all()
+
+    # Collect unique texts
+    unique_texts = list(set(m.mention_text for m in mentions if m.mention_text))
+    if not unique_texts:
+        return 0
+
+    # Generate embeddings for all texts
+    embeddings = embedding_client.generate_embeddings(unique_texts)
+    if not embeddings:
+        return 0
+
+    # Add as examples
+    new_count = 0
+    for text, embedding in zip(unique_texts, embeddings):
+        if not embedding:
+            continue
+
+        # Check for existing example
+        existing = session.query(AnchorExample).filter_by(
+            anchor_id=anchor.id,
+            text=text,
+        ).first()
+
+        if existing:
+            # Update existing - increment count and mark as correction
+            existing.mention_count = (existing.mention_count or 0) + 1
+            if existing.source != 'correction':
+                existing.source = 'correction'  # Upgrade source
+        else:
+            # Create new example
+            example = AnchorExample(
+                anchor_id=anchor.id,
+                text=text,
+                embedding=embedding,
+                source='correction',
+                source_taxonomy_id=taxonomy.id,
+                mention_count=1,
+            )
+            session.add(example)
+            new_count += 1
+
+    # Recompute centroid with correction weighting
+    if new_count > 0:
+        _recompute_anchor_centroid_weighted(session, anchor)
+
+    logger.info(
+        f"Learned from corrections: {new_count} new examples added to anchor '{anchor.category_name}'",
+        extra={"data": {
+            "anchor_id": str(anchor.id),
+            "category_name": anchor.category_name,
+            "business_type": business_type,
+            "new_examples": new_count,
+            "total_mentions": len(mentions),
+        }}
+    )
+
+    return new_count
 
 
 def _create_anchor_from_category(

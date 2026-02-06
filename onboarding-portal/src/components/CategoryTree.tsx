@@ -15,6 +15,7 @@ import {
   MessageSquare,
   Pencil,
   Trash2,
+  GitMerge,
 } from 'lucide-react'
 
 interface CategoryTreeProps {
@@ -27,6 +28,7 @@ interface CategoryTreeProps {
   onShowMentions?: (categoryId: string, categoryName: string) => void
   onEdit?: (categoryId: string) => void
   onDelete?: (categoryId: string) => void
+  onMerge?: (categoryId: string) => void
 }
 
 interface CategoryNodeProps {
@@ -42,6 +44,7 @@ interface CategoryNodeProps {
   onShowMentions?: (categoryId: string, categoryName: string) => void
   onEdit?: (categoryId: string) => void
   onDelete?: (categoryId: string) => void
+  onMerge?: (categoryId: string) => void
 }
 
 function CategoryNode({
@@ -57,6 +60,7 @@ function CategoryNode({
   onShowMentions,
   onEdit,
   onDelete,
+  onMerge,
 }: CategoryNodeProps) {
   const [expanded, setExpanded] = useState(true)
   const hasChildren = children.length > 0
@@ -127,6 +131,11 @@ function CategoryNode({
             <Button size="icon" variant="ghost" className="h-7 w-7" onClick={() => onMove(category.id)} title="Move">
               <Move className="w-3.5 h-3.5 text-muted" />
             </Button>
+            {onMerge && (
+              <Button size="icon" variant="ghost" className="h-7 w-7" onClick={() => onMerge(category.id)} title="Merge into another category">
+                <GitMerge className="w-3.5 h-3.5 text-muted" />
+              </Button>
+            )}
             {onShowMentions && category.discovered_mention_count > 0 && (
               <Button
                 size="icon"
@@ -164,6 +173,7 @@ function CategoryNode({
               onShowMentions={onShowMentions}
               onEdit={onEdit}
               onDelete={onDelete}
+              onMerge={onMerge}
             />
           ))}
         </div>
@@ -182,6 +192,7 @@ export function CategoryTree({
   onShowMentions,
   onEdit,
   onDelete,
+  onMerge,
 }: CategoryTreeProps) {
   const mainCategories = categories.filter((c) => !c.parent_id)
 
@@ -215,6 +226,7 @@ export function CategoryTree({
           onShowMentions={onShowMentions}
           onEdit={onEdit}
           onDelete={onDelete}
+          onMerge={onMerge}
         />
       ))}
     </div>

@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
-from typing import Optional, List, Set
+from typing import Optional, List, Set, Dict
 from uuid import UUID
 from sqlalchemy import func, text, case, or_
 
@@ -19,6 +19,7 @@ import vector_store
 from database import (
     Place, Review, ReviewAnalysis, Job, ScrapeJob, ActivityLog, User, AnomalyInsight,
     PlaceTaxonomy, TaxonomyCategory, TaxonomyProduct, RawMention, TaxonomyAuditLog,
+    PlaceMenuImage, TaxonomyArchive,
     get_session, create_tables
 )
 from datetime import datetime
@@ -30,6 +31,7 @@ from auth import (
     register_user, authenticate_user, create_access_token,
     get_current_user, get_optional_user
 )
+from mention_grouping import MentionData, group_mentions
 
 logger = get_logger(__name__, service="api")
 
@@ -508,6 +510,21 @@ class ActionResponse(BaseModel):
     message: str
 
 
+class MergeRequest(BaseModel):
+    """Request to merge one item into another (source absorbed into target)."""
+    source_id: UUID = Field(..., description="ID of item to be absorbed and deleted")
+    target_id: UUID = Field(..., description="ID of item that survives and absorbs source")
+
+
+class MergeResponse(BaseModel):
+    """Response for merge operations."""
+    success: bool
+    message: str
+    target_id: str  # ID of the surviving item
+    merged_mention_count: int = 0
+    merged_variant_count: int = 0
+
+
 class ImportProductItem(BaseModel):
     """A product within an imported category."""
     name: str = Field(..., min_length=1, max_length=200)
@@ -521,6 +538,8 @@ class ImportCategoryItem(BaseModel):
     display_name_en: str = Field(..., min_length=1, max_length=100)
     display_name_ar: Optional[str] = Field(None, max_length=100)
     is_aspect: bool = True
+    is_parent: Optional[bool] = Field(None, description="True for parent/container categories")
+    parent: Optional[str] = Field(None, description="Parent category name for hierarchy")
     examples: List[str] = Field(default_factory=list)
     products: List[ImportProductItem] = Field(default_factory=list)
 
@@ -528,6 +547,14 @@ class ImportCategoryItem(BaseModel):
 class TaxonomyImportRequest(BaseModel):
     """Request body for importing a taxonomy."""
     categories: List[ImportCategoryItem] = Field(..., min_length=1)
+
+
+class TaxonomyImportResponse(BaseModel):
+    """Response for taxonomy import with new taxonomy ID."""
+    success: bool
+    message: str
+    new_taxonomy_id: Optional[str] = None  # New taxonomy ID after re-clustering
+    archived_taxonomy_id: Optional[str] = None  # ID of archived old taxonomy
 
 
 # --- Audit Logging Helper ---
@@ -954,6 +981,210 @@ async def create_product(
         session.close()
 
 
+# --- Merge Endpoints ---
+
+@app.post("/api/onboarding/products/merge", response_model=MergeResponse)
+async def merge_products(
+    request: MergeRequest,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Merge one product into another (source -> target).
+
+    - Target product survives (keeps its name, display_name)
+    - Source product's variants are added to target
+    - Source product's mentions are reassigned to target
+    - Source product is deleted
+    """
+    session = get_session()
+    try:
+        source = session.query(TaxonomyProduct).filter_by(id=request.source_id).first()
+        target = session.query(TaxonomyProduct).filter_by(id=request.target_id).first()
+
+        if not source:
+            raise HTTPException(status_code=404, detail="Source product not found")
+        if not target:
+            raise HTTPException(status_code=404, detail="Target product not found")
+        if source.taxonomy_id != target.taxonomy_id:
+            raise HTTPException(status_code=400, detail="Products must be in the same taxonomy")
+        if source.id == target.id:
+            raise HTTPException(status_code=400, detail="Cannot merge product into itself")
+
+        # Merge variants (deduplicate)
+        source_variants = source.variants or []
+        target_variants = target.variants or []
+        # Add source canonical_text as variant too
+        merged_variants = list(set(target_variants + source_variants + [source.canonical_text]))
+        # Remove target's canonical_text from variants if present
+        merged_variants = [v for v in merged_variants if v != target.canonical_text]
+        merged_variant_count = len(merged_variants) - len(target_variants)
+        target.variants = merged_variants
+
+        # Reassign mentions from source to target
+        merged_mention_count = session.query(RawMention).filter(
+            RawMention.resolved_product_id == source.id
+        ).update(
+            {RawMention.resolved_product_id: target.id},
+            synchronize_session=False
+        )
+
+        # Also update discovered_product_id references
+        session.query(RawMention).filter(
+            RawMention.discovered_product_id == source.id
+        ).update(
+            {RawMention.discovered_product_id: target.id},
+            synchronize_session=False
+        )
+
+        # Update mention counts
+        target.discovered_mention_count = (target.discovered_mention_count or 0) + (source.discovered_mention_count or 0)
+        target.mention_count = (target.mention_count or 0) + (source.mention_count or 0)
+
+        # Log the merge
+        log_taxonomy_action(
+            session, target.taxonomy_id, current_user.id,
+            "merge", "product", target.id,
+            {"source_id": str(source.id), "source_name": source.display_name or source.canonical_text},
+            {"merged_variants": merged_variant_count, "merged_mentions": merged_mention_count}
+        )
+
+        # Delete source product
+        session.delete(source)
+        session.commit()
+
+        return MergeResponse(
+            success=True,
+            message=f"Merged '{source.display_name or source.canonical_text}' into '{target.display_name or target.canonical_text}'",
+            target_id=str(target.id),
+            merged_mention_count=merged_mention_count,
+            merged_variant_count=merged_variant_count,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Failed to merge products: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        session.close()
+
+
+@app.post("/api/onboarding/categories/merge", response_model=MergeResponse)
+async def merge_categories(
+    request: MergeRequest,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Merge one category into another (source -> target).
+
+    - Target category survives (keeps its name, display_names, parent)
+    - Source category's products are moved to target
+    - Source category's mentions are reassigned to target
+    - Child categories of source are reparented to target
+    - Source category is deleted
+    """
+    session = get_session()
+    try:
+        source = session.query(TaxonomyCategory).filter_by(id=request.source_id).first()
+        target = session.query(TaxonomyCategory).filter_by(id=request.target_id).first()
+
+        if not source:
+            raise HTTPException(status_code=404, detail="Source category not found")
+        if not target:
+            raise HTTPException(status_code=404, detail="Target category not found")
+        if source.taxonomy_id != target.taxonomy_id:
+            raise HTTPException(status_code=400, detail="Categories must be in the same taxonomy")
+        if source.id == target.id:
+            raise HTTPException(status_code=400, detail="Cannot merge category into itself")
+
+        # Check for circular reference (target is child of source)
+        if target.parent_id == source.id:
+            raise HTTPException(status_code=400, detail="Cannot merge parent into its child")
+
+        merged_mention_count = 0
+        merged_product_count = 0
+
+        # Move products from source to target
+        products_moved = session.query(TaxonomyProduct).filter(
+            TaxonomyProduct.assigned_category_id == source.id
+        ).update(
+            {TaxonomyProduct.assigned_category_id: target.id},
+            synchronize_session=False
+        )
+        merged_product_count += products_moved
+
+        # Also update discovered_category_id references
+        session.query(TaxonomyProduct).filter(
+            TaxonomyProduct.discovered_category_id == source.id
+        ).update(
+            {TaxonomyProduct.discovered_category_id: target.id},
+            synchronize_session=False
+        )
+
+        # Reassign mentions from source to target
+        merged_mention_count += session.query(RawMention).filter(
+            RawMention.resolved_category_id == source.id
+        ).update(
+            {RawMention.resolved_category_id: target.id},
+            synchronize_session=False
+        )
+
+        # Also update discovered_category_id references in mentions
+        session.query(RawMention).filter(
+            RawMention.discovered_category_id == source.id
+        ).update(
+            {RawMention.discovered_category_id: target.id},
+            synchronize_session=False
+        )
+
+        # Reparent child categories of source to target
+        children_reparented = session.query(TaxonomyCategory).filter(
+            TaxonomyCategory.parent_id == source.id
+        ).update(
+            {TaxonomyCategory.parent_id: target.id},
+            synchronize_session=False
+        )
+
+        # Update mention counts
+        target.discovered_mention_count = (target.discovered_mention_count or 0) + (source.discovered_mention_count or 0)
+        target.mention_count = (target.mention_count or 0) + (source.mention_count or 0)
+
+        # If target didn't have products but source did, update has_products
+        if source.has_products and not target.has_products:
+            target.has_products = True
+
+        # Log the merge
+        log_taxonomy_action(
+            session, target.taxonomy_id, current_user.id,
+            "merge", "category", target.id,
+            {"source_id": str(source.id), "source_name": source.display_name_en or source.name},
+            {"merged_products": merged_product_count, "merged_mentions": merged_mention_count, "children_reparented": children_reparented}
+        )
+
+        source_name = source.display_name_en or source.name
+        target_name = target.display_name_en or target.name
+
+        # Delete source category
+        session.delete(source)
+        session.commit()
+
+        return MergeResponse(
+            success=True,
+            message=f"Merged '{source_name}' into '{target_name}' ({merged_product_count} products, {merged_mention_count} mentions)",
+            target_id=str(target.id),
+            merged_mention_count=merged_mention_count,
+            merged_variant_count=merged_product_count,  # Using variant_count field for products
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Failed to merge categories: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        session.close()
+
+
 # --- Mention Endpoints for Onboarding Audit ---
 
 # BUG-014 FIX: Helper functions to get embeddings for vector similarity search
@@ -1366,6 +1597,47 @@ class OrphanMentionsResponse(BaseModel):
     total_category_orphans: int
 
 
+# --- Grouped Mentions Models ---
+
+class MentionGroupResponse(BaseModel):
+    normalized_text: str
+    display_text: str
+    mention_ids: List[str]
+    count: int
+    sentiments: Dict[str, int]
+    avg_similarity: Optional[float]
+    sample_reviews: List[str]
+
+
+class GroupedMentionsResponse(BaseModel):
+    groups: List[MentionGroupResponse]
+    total_mentions: int
+    total_groups: int
+    entity_id: str
+    entity_name: str
+
+
+class GroupedOrphansResponse(BaseModel):
+    product_groups: List[MentionGroupResponse]
+    category_groups: List[MentionGroupResponse]
+    total_product_mentions: int
+    total_category_mentions: int
+    total_product_groups: int
+    total_category_groups: int
+
+
+class BulkMoveMentionsRequest(BaseModel):
+    mention_ids: List[UUID]
+    target_type: str = Field(..., description="'product' or 'category'")
+    target_id: UUID
+
+
+class BulkMoveMentionsResponse(BaseModel):
+    success: bool
+    moved_count: int
+    message: str
+
+
 @app.get("/api/onboarding/taxonomies/{taxonomy_id}/orphan-mentions", response_model=OrphanMentionsResponse)
 async def get_orphan_mentions(
     taxonomy_id: str,
@@ -1480,6 +1752,317 @@ async def get_orphan_mentions(
             total_product_orphans=total_product_orphans,
             total_category_orphans=total_category_orphans,
         )
+    finally:
+        session.close()
+
+
+# --- Grouped Mentions Endpoints ---
+
+def _mentions_to_mention_data(mentions_with_reviews) -> List[MentionData]:
+    """Convert query results to MentionData objects for grouping."""
+    return [
+        MentionData(
+            id=str(rm.id),
+            mention_text=rm.mention_text,
+            sentiment=rm.sentiment,
+            review_text=review.text or "",
+            similarity_score=getattr(rm, '_similarity_score', None)
+        )
+        for rm, review in mentions_with_reviews
+    ]
+
+
+@app.get("/api/onboarding/products/{product_id}/mentions/grouped", response_model=GroupedMentionsResponse)
+async def get_grouped_product_mentions(
+    product_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    """Get mentions for a product, grouped by normalized text with fuzzy merging."""
+    session = get_session()
+    try:
+        product_uuid = UUID(product_id)
+        product = session.query(TaxonomyProduct).filter_by(id=product_uuid).first()
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found")
+
+        # Get taxonomy to determine draft vs published
+        taxonomy = session.query(PlaceTaxonomy).filter_by(id=product.taxonomy_id).first()
+        if not taxonomy:
+            raise HTTPException(status_code=404, detail="Taxonomy not found")
+
+        place_ids = taxonomy.all_place_ids
+        is_draft = taxonomy.status != 'active'
+
+        # Query mentions for this product
+        if is_draft:
+            mentions_query = session.query(RawMention, Review).join(
+                Review, RawMention.review_id == Review.id
+            ).filter(
+                RawMention.place_id.in_(place_ids),
+                RawMention.discovered_product_id == product_uuid
+            ).all()
+        else:
+            mentions_query = session.query(RawMention, Review).join(
+                Review, RawMention.review_id == Review.id
+            ).filter(
+                RawMention.place_id.in_(place_ids),
+                RawMention.resolved_product_id == product_uuid
+            ).all()
+
+        # Convert to MentionData and group
+        mention_data = _mentions_to_mention_data(mentions_query)
+        groups, total_mentions, total_groups = group_mentions(mention_data)
+
+        return GroupedMentionsResponse(
+            groups=[MentionGroupResponse(**g.to_dict()) for g in groups],
+            total_mentions=total_mentions,
+            total_groups=total_groups,
+            entity_id=str(product.id),
+            entity_name=product.display_name or product.canonical_text,
+        )
+    finally:
+        session.close()
+
+
+@app.get("/api/onboarding/categories/{category_id}/mentions/grouped", response_model=GroupedMentionsResponse)
+async def get_grouped_category_mentions(
+    category_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    """Get mentions for a category, grouped by normalized text with fuzzy merging."""
+    session = get_session()
+    try:
+        category_uuid = UUID(category_id)
+        category = session.query(TaxonomyCategory).filter_by(id=category_uuid).first()
+        if not category:
+            raise HTTPException(status_code=404, detail="Category not found")
+
+        # Get taxonomy to determine draft vs published
+        taxonomy = session.query(PlaceTaxonomy).filter_by(id=category.taxonomy_id).first()
+        if not taxonomy:
+            raise HTTPException(status_code=404, detail="Taxonomy not found")
+
+        place_ids = taxonomy.all_place_ids
+        is_draft = taxonomy.status != 'active'
+
+        # Query mentions for this category
+        if is_draft:
+            mentions_query = session.query(RawMention, Review).join(
+                Review, RawMention.review_id == Review.id
+            ).filter(
+                RawMention.place_id.in_(place_ids),
+                RawMention.discovered_category_id == category_uuid
+            ).all()
+        else:
+            mentions_query = session.query(RawMention, Review).join(
+                Review, RawMention.review_id == Review.id
+            ).filter(
+                RawMention.place_id.in_(place_ids),
+                RawMention.resolved_category_id == category_uuid
+            ).all()
+
+        # Convert to MentionData and group
+        mention_data = _mentions_to_mention_data(mentions_query)
+        groups, total_mentions, total_groups = group_mentions(mention_data)
+
+        return GroupedMentionsResponse(
+            groups=[MentionGroupResponse(**g.to_dict()) for g in groups],
+            total_mentions=total_mentions,
+            total_groups=total_groups,
+            entity_id=str(category.id),
+            entity_name=category.display_name_en or category.name,
+        )
+    finally:
+        session.close()
+
+
+@app.get("/api/onboarding/taxonomies/{taxonomy_id}/orphan-mentions/grouped", response_model=GroupedOrphansResponse)
+async def get_grouped_orphan_mentions(
+    taxonomy_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    """Get orphan mentions grouped by normalized text with fuzzy merging."""
+    session = get_session()
+    try:
+        taxonomy_uuid = UUID(taxonomy_id)
+        taxonomy = session.query(PlaceTaxonomy).filter_by(id=taxonomy_uuid).first()
+        if not taxonomy:
+            raise HTTPException(status_code=404, detail="Taxonomy not found")
+
+        place_ids = taxonomy.all_place_ids
+        is_draft = taxonomy.status != 'active'
+
+        # Query product orphans
+        if is_draft:
+            product_orphans_query = session.query(RawMention, Review).join(
+                Review, RawMention.review_id == Review.id
+            ).filter(
+                RawMention.place_id.in_(place_ids),
+                RawMention.mention_type == 'product',
+                RawMention.discovered_product_id.is_(None)
+            ).all()
+
+            category_orphans_query = session.query(RawMention, Review).join(
+                Review, RawMention.review_id == Review.id
+            ).filter(
+                RawMention.place_id.in_(place_ids),
+                RawMention.mention_type == 'aspect',
+                RawMention.discovered_category_id.is_(None)
+            ).all()
+        else:
+            product_orphans_query = session.query(RawMention, Review).join(
+                Review, RawMention.review_id == Review.id
+            ).filter(
+                RawMention.place_id.in_(place_ids),
+                RawMention.mention_type == 'product',
+                RawMention.resolved_product_id.is_(None)
+            ).all()
+
+            category_orphans_query = session.query(RawMention, Review).join(
+                Review, RawMention.review_id == Review.id
+            ).filter(
+                RawMention.place_id.in_(place_ids),
+                RawMention.mention_type == 'aspect',
+                RawMention.resolved_category_id.is_(None)
+            ).all()
+
+        # Group product orphans
+        product_data = _mentions_to_mention_data(product_orphans_query)
+        product_groups, total_product, num_product_groups = group_mentions(product_data)
+
+        # Group category orphans
+        category_data = _mentions_to_mention_data(category_orphans_query)
+        category_groups, total_category, num_category_groups = group_mentions(category_data)
+
+        return GroupedOrphansResponse(
+            product_groups=[MentionGroupResponse(**g.to_dict()) for g in product_groups],
+            category_groups=[MentionGroupResponse(**g.to_dict()) for g in category_groups],
+            total_product_mentions=total_product,
+            total_category_mentions=total_category,
+            total_product_groups=num_product_groups,
+            total_category_groups=num_category_groups,
+        )
+    finally:
+        session.close()
+
+
+@app.post("/api/onboarding/mentions/move", response_model=BulkMoveMentionsResponse)
+async def bulk_move_mentions(
+    request: BulkMoveMentionsRequest,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Bulk move mentions to a different product or category.
+
+    For draft taxonomies: updates discovered_product_id or discovered_category_id
+    For published taxonomies: updates resolved_product_id or resolved_category_id
+    """
+    session = get_session()
+    try:
+        if not request.mention_ids:
+            raise HTTPException(status_code=400, detail="No mention IDs provided")
+
+        if request.target_type not in ('product', 'category'):
+            raise HTTPException(status_code=400, detail="target_type must be 'product' or 'category'")
+
+        # Validate target exists and get its taxonomy
+        if request.target_type == 'product':
+            target = session.query(TaxonomyProduct).filter_by(id=request.target_id).first()
+            if not target:
+                raise HTTPException(status_code=404, detail="Target product not found")
+            taxonomy = session.query(PlaceTaxonomy).filter_by(id=target.taxonomy_id).first()
+        else:
+            target = session.query(TaxonomyCategory).filter_by(id=request.target_id).first()
+            if not target:
+                raise HTTPException(status_code=404, detail="Target category not found")
+            taxonomy = session.query(PlaceTaxonomy).filter_by(id=target.taxonomy_id).first()
+
+        if not taxonomy:
+            raise HTTPException(status_code=404, detail="Taxonomy not found")
+
+        is_draft = taxonomy.status != 'active'
+
+        # Update mentions
+        if request.target_type == 'product':
+            if is_draft:
+                moved_count = session.query(RawMention).filter(
+                    RawMention.id.in_(request.mention_ids)
+                ).update(
+                    {RawMention.discovered_product_id: request.target_id},
+                    synchronize_session=False
+                )
+            else:
+                moved_count = session.query(RawMention).filter(
+                    RawMention.id.in_(request.mention_ids)
+                ).update(
+                    {RawMention.resolved_product_id: request.target_id},
+                    synchronize_session=False
+                )
+        else:
+            if is_draft:
+                moved_count = session.query(RawMention).filter(
+                    RawMention.id.in_(request.mention_ids)
+                ).update(
+                    {RawMention.discovered_category_id: request.target_id},
+                    synchronize_session=False
+                )
+            else:
+                moved_count = session.query(RawMention).filter(
+                    RawMention.id.in_(request.mention_ids)
+                ).update(
+                    {RawMention.resolved_category_id: request.target_id},
+                    synchronize_session=False
+                )
+
+        # Update mention counts on target
+        if request.target_type == 'product':
+            target.discovered_mention_count = (target.discovered_mention_count or 0) + moved_count
+        else:
+            target.discovered_mention_count = (target.discovered_mention_count or 0) + moved_count
+
+        # Log the action
+        target_name = target.display_name if request.target_type == 'product' else (target.display_name_en or target.name)
+        log_taxonomy_action(
+            session, taxonomy.id, current_user.id,
+            "bulk_move", "mention", None,
+            {"target_type": request.target_type, "target_id": str(request.target_id), "target_name": target_name},
+            {"moved_count": moved_count}
+        )
+
+        # Learn from corrections - add mention texts to anchor examples
+        # This enables immediate anchor improvement without waiting for publish
+        learned_count = 0
+        if moved_count > 0:
+            try:
+                from anchor_manager import learn_from_corrections
+                learned_count = learn_from_corrections(
+                    session=session,
+                    mention_ids=request.mention_ids,
+                    target_type=request.target_type,
+                    target_id=request.target_id,
+                    taxonomy=taxonomy,
+                )
+            except Exception as e:
+                # Log but don't fail the move operation
+                logger.warning(f"Failed to learn from corrections: {e}")
+
+        session.commit()
+
+        message = f"Moved {moved_count} mentions to {target_name}"
+        if learned_count > 0:
+            message += f" (learned {learned_count} new patterns)"
+
+        return BulkMoveMentionsResponse(
+            success=True,
+            moved_count=moved_count,
+            message=message
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Error bulk moving mentions: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         session.close()
 
@@ -1845,11 +2428,10 @@ def _aggregate_taxonomy_analytics(session, taxonomy_id: UUID):
                     category.avg_sentiment = 0.5  # Neutral default
 
 
-@app.post("/api/onboarding/taxonomies/{taxonomy_id}/import", response_model=ActionResponse)
+@app.post("/api/onboarding/taxonomies/{taxonomy_id}/import", response_model=TaxonomyImportResponse)
 async def import_taxonomy(
     taxonomy_id: UUID,
     request: TaxonomyImportRequest,
-    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user)
 ):
     """
@@ -1857,11 +2439,10 @@ async def import_taxonomy(
 
     This will:
     1. Validate taxonomy exists and is in draft status
-    2. Create imported categories/products in the taxonomy
-    3. Delete old discovered (non-imported) categories/products
-    4. Clear mention links (discovered_product_id, discovered_category_id -> NULL)
-    5. Generate anchors from import data
-    6. Queue re-clustering in background
+    2. Archive the old taxonomy (for learning/comparison)
+    3. Generate anchors from import data
+    4. Run re-clustering synchronously
+    5. Return the NEW taxonomy ID (re-clustering creates a new UUID)
     """
     from anchor_manager import generate_anchors_from_import
     from clustering_job import run_clustering_job
@@ -1876,106 +2457,118 @@ async def import_taxonomy(
             raise HTTPException(status_code=400, detail="Can only import into draft taxonomies")
 
         place_id = str(taxonomy.place_id)
+        place_name = taxonomy.place.name if taxonomy.place else "Unknown"
 
-        # Step 1: Delete all existing categories and products for this taxonomy
-        session.query(TaxonomyProduct).filter_by(
-            taxonomy_id=taxonomy_id
-        ).delete(synchronize_session=False)
-        session.query(TaxonomyCategory).filter_by(
-            taxonomy_id=taxonomy_id
-        ).delete(synchronize_session=False)
+        # Step 1: Archive the old taxonomy before re-clustering
+        categories = session.query(TaxonomyCategory).filter_by(taxonomy_id=taxonomy_id).all()
+        products = session.query(TaxonomyProduct).filter_by(taxonomy_id=taxonomy_id).all()
 
-        # Step 2: Clear mention links for this place
-        session.query(RawMention).filter(
-            RawMention.place_id == taxonomy.place_id
-        ).update({
-            RawMention.discovered_product_id: None,
-            RawMention.discovered_category_id: None,
-        }, synchronize_session=False)
+        # Build snapshot
+        snapshot = {
+            "taxonomy": {
+                "id": str(taxonomy.id),
+                "place_id": str(taxonomy.place_id),
+                "status": taxonomy.status,
+                "reviews_sampled": taxonomy.reviews_sampled,
+                "entities_discovered": taxonomy.entities_discovered,
+                "created_at": taxonomy.created_at.isoformat() if taxonomy.created_at else None,
+            },
+            "categories": [
+                {
+                    "id": str(c.id),
+                    "name": c.name,
+                    "display_name_en": c.display_name_en,
+                    "display_name_ar": c.display_name_ar,
+                    "parent_id": str(c.parent_id) if c.parent_id else None,
+                    "has_products": c.has_products,
+                    "source": c.source,
+                    "is_approved": c.is_approved,
+                    "mention_count": c.mention_count,
+                }
+                for c in categories
+            ],
+            "products": [
+                {
+                    "id": str(p.id),
+                    "canonical_text": p.canonical_text,
+                    "display_name": p.display_name,
+                    "assigned_category_id": str(p.assigned_category_id) if p.assigned_category_id else None,
+                    "variants": p.variants,
+                    "source": p.source,
+                    "is_approved": p.is_approved,
+                    "mention_count": p.mention_count,
+                }
+                for p in products
+            ],
+        }
 
-        # Step 3: Create imported categories and products
-        imported_count = 0
-        product_count = 0
-        for cat_data in request.categories:
-            category = TaxonomyCategory(
-                taxonomy_id=taxonomy_id,
-                name=cat_data.name,
-                display_name_en=cat_data.display_name_en,
-                display_name_ar=cat_data.display_name_ar,
-                has_products=not cat_data.is_aspect and len(cat_data.products) > 0,
-                source="imported",
-                is_approved=True,
-            )
-            session.add(category)
-            session.flush()  # Get category.id for products
-            imported_count += 1
+        archive = TaxonomyArchive(
+            original_taxonomy_id=taxonomy_id,
+            place_id=taxonomy.place_id,
+            place_name=place_name,
+            archive_reason="import_recluster",
+            archived_by=current_user.id,
+            snapshot=snapshot,
+            categories_count=len(categories),
+            products_count=len(products),
+            status_at_archive=taxonomy.status,
+        )
+        session.add(archive)
+        session.flush()
+        archive_id = str(archive.id)
 
-            # Create products for this category
-            for prod_data in cat_data.products:
-                product = TaxonomyProduct(
-                    taxonomy_id=taxonomy_id,
-                    assigned_category_id=category.id,
-                    canonical_text=prod_data.name,
-                    display_name=prod_data.display_name,
-                    variants=prod_data.variants,
-                    source="imported",
-                    is_approved=True,
-                )
-                session.add(product)
-                product_count += 1
-
-        # Step 4: Mark taxonomy as re-clustering
-        taxonomy.is_reclustering = True
-
-        # Log import action
+        # Log archive action
         log_taxonomy_action(
             session, taxonomy_id, current_user.id,
-            "import", "taxonomy", taxonomy_id,
+            "archive", "taxonomy", taxonomy_id,
             None,
-            {
-                "categories_imported": imported_count,
-                "products_imported": product_count,
-            }
+            {"archive_id": archive_id, "reason": "import_recluster"}
         )
 
         session.commit()
 
-        # Step 5: Generate anchors and queue re-clustering in background
+        # Step 2: Generate anchors from import data (returns anchors + hierarchy info)
         import_dicts = [cat.model_dump() for cat in request.categories]
-        import_anchors = generate_anchors_from_import(import_dicts)
+        import_anchors, hierarchy_info = generate_anchors_from_import(import_dicts)
 
-        def run_recluster():
-            try:
-                run_clustering_job(
-                    place_id=place_id,
-                    import_anchors=import_anchors,
-                    is_recluster=True,
-                )
-            except Exception as e:
-                logger.error(f"Re-clustering failed after import: {e}", exc_info=True)
-            finally:
-                # Clear re-clustering flag
-                # NOTE: save_draft_taxonomy(is_recluster=True) deletes the old
-                # PlaceTaxonomy and creates a new one with a new UUID, so we look
-                # up by place_id rather than taxonomy_id.
-                s = get_session()
-                try:
-                    t = s.query(PlaceTaxonomy).filter_by(
-                        place_id=place_id
-                    ).order_by(PlaceTaxonomy.created_at.desc()).first()
-                    if t and t.is_reclustering:
-                        t.is_reclustering = False
-                        s.commit()
-                except Exception:
-                    s.rollback()
-                finally:
-                    s.close()
+        # Step 3: Run re-clustering synchronously to get new taxonomy ID
+        # Note: This deletes the old taxonomy and creates a new one
+        try:
+            new_taxonomy_id = run_clustering_job(
+                place_id=place_id,
+                import_anchors=import_anchors,
+                import_hierarchy=hierarchy_info,
+                is_recluster=True,
+            )
+        except Exception as e:
+            logger.error(f"Re-clustering failed after import: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Re-clustering failed: {e}")
 
-        background_tasks.add_task(run_recluster)
+        # Step 4: Update archive with new taxonomy ID and clear reclustering flag
+        s = get_session()
+        try:
+            # Update archive with replacement ID
+            arch = s.query(TaxonomyArchive).filter_by(id=archive.id).first()
+            if arch and new_taxonomy_id:
+                arch.replaced_by_taxonomy_id = uuid.UUID(new_taxonomy_id)
 
-        return ActionResponse(
+            # Clear re-clustering flag on new taxonomy
+            if new_taxonomy_id:
+                new_tax = s.query(PlaceTaxonomy).filter_by(id=new_taxonomy_id).first()
+                if new_tax and new_tax.is_reclustering:
+                    new_tax.is_reclustering = False
+
+            s.commit()
+        except Exception:
+            s.rollback()
+        finally:
+            s.close()
+
+        return TaxonomyImportResponse(
             success=True,
-            message=f"Imported {imported_count} categories and {product_count} products. Re-clustering started."
+            message=f"Import complete. Old taxonomy archived, new taxonomy created with re-clustered data.",
+            new_taxonomy_id=new_taxonomy_id,
+            archived_taxonomy_id=archive_id,
         )
     except HTTPException:
         raise
@@ -1983,6 +2576,156 @@ async def import_taxonomy(
         session.rollback()
         logger.error(f"Failed to import taxonomy: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        session.close()
+
+
+class MenuImageResponse(BaseModel):
+    id: str
+    image_url: str
+    original_url: Optional[str]
+    created_at: Optional[str]
+
+
+class MenuImagesListResponse(BaseModel):
+    images: List[MenuImageResponse]
+    total: int
+    place_name: Optional[str]
+
+
+@app.get("/api/onboarding/taxonomies/{taxonomy_id}/menu-images", response_model=MenuImagesListResponse)
+async def get_taxonomy_menu_images(
+    taxonomy_id: UUID,
+    current_user: User = Depends(get_current_user)
+):
+    """Get menu images for a taxonomy's place(s)."""
+    session = get_session()
+    try:
+        taxonomy = session.query(PlaceTaxonomy).filter_by(id=taxonomy_id).first()
+        if not taxonomy:
+            raise HTTPException(status_code=404, detail="Taxonomy not found")
+
+        place_ids = taxonomy.all_place_ids
+        images = session.query(PlaceMenuImage).filter(
+            PlaceMenuImage.place_id.in_(place_ids)
+        ).order_by(PlaceMenuImage.created_at.desc()).all()
+
+        place_name = taxonomy.place.name if taxonomy.place else None
+
+        return MenuImagesListResponse(
+            images=[
+                MenuImageResponse(
+                    id=str(img.id),
+                    image_url=img.image_url,
+                    original_url=img.original_url,
+                    created_at=img.created_at.isoformat() if img.created_at else None,
+                )
+                for img in images
+            ],
+            total=len(images),
+            place_name=place_name,
+        )
+    finally:
+        session.close()
+
+
+# --- Taxonomy Archives Endpoints ---
+
+class ArchiveSummary(BaseModel):
+    """Summary of an archived taxonomy."""
+    id: str
+    original_taxonomy_id: str
+    place_id: str
+    place_name: Optional[str]
+    archive_reason: str
+    categories_count: int
+    products_count: int
+    status_at_archive: Optional[str]
+    replaced_by_taxonomy_id: Optional[str]
+    created_at: Optional[str]
+
+
+class ArchiveListResponse(BaseModel):
+    """List of archived taxonomies."""
+    archives: List[ArchiveSummary]
+    total: int
+
+
+class ArchiveDetailResponse(BaseModel):
+    """Full archive detail with snapshot."""
+    id: str
+    original_taxonomy_id: str
+    place_id: str
+    place_name: Optional[str]
+    archive_reason: str
+    categories_count: int
+    products_count: int
+    status_at_archive: Optional[str]
+    replaced_by_taxonomy_id: Optional[str]
+    snapshot: dict
+    created_at: Optional[str]
+
+
+@app.get("/api/onboarding/archives", response_model=ArchiveListResponse)
+async def list_taxonomy_archives(
+    place_id: Optional[UUID] = None,
+    current_user: User = Depends(get_current_user)
+):
+    """List all archived taxonomies, optionally filtered by place."""
+    session = get_session()
+    try:
+        query = session.query(TaxonomyArchive).order_by(TaxonomyArchive.created_at.desc())
+        if place_id:
+            query = query.filter_by(place_id=place_id)
+        archives = query.all()
+
+        return ArchiveListResponse(
+            archives=[
+                ArchiveSummary(
+                    id=str(a.id),
+                    original_taxonomy_id=str(a.original_taxonomy_id),
+                    place_id=str(a.place_id),
+                    place_name=a.place_name,
+                    archive_reason=a.archive_reason,
+                    categories_count=a.categories_count or 0,
+                    products_count=a.products_count or 0,
+                    status_at_archive=a.status_at_archive,
+                    replaced_by_taxonomy_id=str(a.replaced_by_taxonomy_id) if a.replaced_by_taxonomy_id else None,
+                    created_at=a.created_at.isoformat() if a.created_at else None,
+                )
+                for a in archives
+            ],
+            total=len(archives),
+        )
+    finally:
+        session.close()
+
+
+@app.get("/api/onboarding/archives/{archive_id}", response_model=ArchiveDetailResponse)
+async def get_taxonomy_archive(
+    archive_id: UUID,
+    current_user: User = Depends(get_current_user)
+):
+    """Get full archive detail including snapshot."""
+    session = get_session()
+    try:
+        archive = session.query(TaxonomyArchive).filter_by(id=archive_id).first()
+        if not archive:
+            raise HTTPException(status_code=404, detail="Archive not found")
+
+        return ArchiveDetailResponse(
+            id=str(archive.id),
+            original_taxonomy_id=str(archive.original_taxonomy_id),
+            place_id=str(archive.place_id),
+            place_name=archive.place_name,
+            archive_reason=archive.archive_reason,
+            categories_count=archive.categories_count or 0,
+            products_count=archive.products_count or 0,
+            status_at_archive=archive.status_at_archive,
+            replaced_by_taxonomy_id=str(archive.replaced_by_taxonomy_id) if archive.replaced_by_taxonomy_id else None,
+            snapshot=archive.snapshot,
+            created_at=archive.created_at.isoformat() if archive.created_at else None,
+        )
     finally:
         session.close()
 

@@ -65,18 +65,17 @@ export function MoveModal({
         </div>
 
         <div className="flex-1 overflow-y-auto space-y-1 mb-4">
-          {itemType === 'product' && (
-            <button
-              onClick={() => setSelectedId(null)}
-              className={`w-full text-left px-3 py-2 rounded-lg text-sm ${
-                selectedId === null
-                  ? 'bg-primary/20 text-primary'
-                  : 'hover:bg-card-hover text-foreground'
-              }`}
-            >
-              Standalone (no category)
-            </button>
-          )}
+          {/* For products: standalone option. For categories: root level option */}
+          <button
+            onClick={() => setSelectedId(null)}
+            className={`w-full text-left px-3 py-2 rounded-lg text-sm ${
+              selectedId === null
+                ? 'bg-primary/20 text-primary'
+                : 'hover:bg-card-hover text-foreground'
+            }`}
+          >
+            {itemType === 'product' ? 'Standalone (no category)' : 'Root level (no parent)'}
+          </button>
 
           {mainCategories.map((cat) => (
             <div key={cat.id}>

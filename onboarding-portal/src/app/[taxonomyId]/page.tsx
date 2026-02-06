@@ -16,6 +16,7 @@ import {
   addProductVariant,
   updateProduct,
   mergeProducts,
+  mergeCategories,
   deleteProduct,
   deleteCategory,
   createCategory,
@@ -37,6 +38,7 @@ import { MoveModal } from '@/components/MoveModal'
 import { AddCategoryModal } from '@/components/AddCategoryModal'
 import { AddProductModal } from '@/components/AddProductModal'
 import { MergeProductModal } from '@/components/MergeProductModal'
+import { MergeCategoryModal } from '@/components/MergeCategoryModal'
 import { EditProductModal } from '@/components/EditProductModal'
 import { EditCategoryModal } from '@/components/EditCategoryModal'
 import { ImportModal } from '@/components/ImportModal'
@@ -54,6 +56,7 @@ import {
 } from 'lucide-react'
 import { MentionPanel } from '@/components/MentionPanel'
 import { OrphanPanel } from '@/components/OrphanPanel'
+import { MenuImagesPanel } from '@/components/MenuImagesPanel'
 
 function TaxonomyEditor() {
   const params = useParams()
@@ -91,6 +94,7 @@ function TaxonomyEditor() {
 
   // New editor modals
   const [mergeModal, setMergeModal] = useState<TaxonomyProduct | null>(null)
+  const [mergeCategoryModal, setMergeCategoryModal] = useState<TaxonomyCategory | null>(null)
   const [editProductModal, setEditProductModal] = useState<TaxonomyProduct | null>(null)
   const [editCategoryModal, setEditCategoryModal] = useState<TaxonomyCategory | null>(null)
   const [deleteConfirm, setDeleteConfirm] = useState<{
@@ -196,6 +200,17 @@ function TaxonomyEditor() {
     try {
       await mergeProducts(sourceId, targetId)
       setMergeModal(null)
+      loadTaxonomy()
+    } catch (err) {
+      throw err // Let the modal handle the error
+    }
+  }
+
+  // Category merge
+  const handleMergeCategories = async (sourceId: string, targetId: string) => {
+    try {
+      await mergeCategories(sourceId, targetId)
+      setMergeCategoryModal(null)
       loadTaxonomy()
     } catch (err) {
       throw err // Let the modal handle the error
@@ -474,6 +489,10 @@ function TaxonomyEditor() {
                     name: cat?.display_name_en || cat?.name || 'Category',
                   })
                 }}
+                onMerge={(id) => {
+                  const cat = taxonomy.categories.find((c) => c.id === id)
+                  if (cat) setMergeCategoryModal(cat)
+                }}
               />
             </CardContent>
           </Card>
@@ -551,9 +570,19 @@ function TaxonomyEditor() {
           </Card>
         </div>
 
+        {/* Menu Images Panel */}
+        <div className="mt-6">
+          <MenuImagesPanel taxonomyId={taxonomyId} />
+        </div>
+
         {/* Orphan Mentions Panel */}
         <div className="mt-6">
-          <OrphanPanel taxonomyId={taxonomyId} />
+          <OrphanPanel
+            taxonomyId={taxonomyId}
+            categories={taxonomy.categories}
+            products={taxonomy.products}
+            onMentionsMoved={loadTaxonomy}
+          />
         </div>
       </main>
 
@@ -564,6 +593,9 @@ function TaxonomyEditor() {
           itemId={mentionPanel.id}
           itemName={mentionPanel.name}
           onClose={() => setMentionPanel(null)}
+          categories={taxonomy.categories}
+          products={taxonomy.products}
+          onMentionsMoved={loadTaxonomy}
         />
       )}
 
@@ -648,6 +680,16 @@ function TaxonomyEditor() {
           onMerge={handleMergeProducts}
           sourceProduct={mergeModal}
           products={taxonomy.products}
+        />
+      )}
+
+      {mergeCategoryModal && (
+        <MergeCategoryModal
+          isOpen={!!mergeCategoryModal}
+          onClose={() => setMergeCategoryModal(null)}
+          onMerge={handleMergeCategories}
+          sourceCategory={mergeCategoryModal}
+          categories={taxonomy.categories}
         />
       )}
 

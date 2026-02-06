@@ -205,16 +205,32 @@ export async function updateProduct(
 export async function mergeProducts(
   sourceProductId: string,
   targetProductId: string
-): Promise<{ success: boolean, message: string, product?: TaxonomyProduct }> {
+): Promise<{ success: boolean, message: string, target_id: string, merged_mention_count: number }> {
   const res = await fetch(`${API_URL}/api/onboarding/products/merge`, {
     method: 'POST',
     headers: getAuthHeaders(),
     body: JSON.stringify({
-      source_product_id: sourceProductId,
-      target_product_id: targetProductId,
+      source_id: sourceProductId,
+      target_id: targetProductId,
     }),
   })
   if (!res.ok) throw new Error('Failed to merge products')
+  return res.json()
+}
+
+export async function mergeCategories(
+  sourceCategoryId: string,
+  targetCategoryId: string
+): Promise<{ success: boolean, message: string, target_id: string, merged_mention_count: number }> {
+  const res = await fetch(`${API_URL}/api/onboarding/categories/merge`, {
+    method: 'POST',
+    headers: getAuthHeaders(),
+    body: JSON.stringify({
+      source_id: sourceCategoryId,
+      target_id: targetCategoryId,
+    }),
+  })
+  if (!res.ok) throw new Error('Failed to merge categories')
   return res.json()
 }
 
@@ -301,6 +317,8 @@ export interface ImportCategory {
   display_name_en: string
   display_name_ar?: string
   is_aspect: boolean
+  is_parent?: boolean  // True for parent/container categories
+  parent?: string      // Name of parent category (for hierarchy)
   examples: string[]
   products: ImportProduct[]
 }
@@ -319,6 +337,31 @@ export async function importTaxonomy(
     body: JSON.stringify(data),
   })
   if (!res.ok) throw new Error('Failed to import taxonomy')
+  return res.json()
+}
+
+// Menu Images
+export interface MenuImage {
+  id: string
+  image_url: string
+  original_url: string | null
+  created_at: string | null
+}
+
+export interface MenuImagesResponse {
+  images: MenuImage[]
+  total: number
+  place_name: string | null
+}
+
+export async function fetchMenuImages(taxonomyId: string): Promise<MenuImagesResponse> {
+  const res = await fetch(`${API_URL}/api/onboarding/taxonomies/${taxonomyId}/menu-images`, {
+    headers: getAuthHeaders(),
+  })
+  if (!res.ok) {
+    if (res.status === 401) throw new Error('Unauthorized')
+    throw new Error('Failed to fetch menu images')
+  }
   return res.json()
 }
 
@@ -348,6 +391,40 @@ export interface OrphanMentionsResponse {
   category_orphans: Mention[]
   total_product_orphans: number
   total_category_orphans: number
+}
+
+// Grouped mentions types
+export interface MentionGroup {
+  normalized_text: string
+  display_text: string
+  mention_ids: string[]
+  count: number
+  sentiments: { positive: number; negative: number; neutral: number }
+  avg_similarity: number | null
+  sample_reviews: string[]
+}
+
+export interface GroupedMentionsResponse {
+  groups: MentionGroup[]
+  total_mentions: number
+  total_groups: number
+  entity_id: string
+  entity_name: string
+}
+
+export interface GroupedOrphansResponse {
+  product_groups: MentionGroup[]
+  category_groups: MentionGroup[]
+  total_product_mentions: number
+  total_category_mentions: number
+  total_product_groups: number
+  total_category_groups: number
+}
+
+export interface BulkMoveResponse {
+  success: boolean
+  moved_count: number
+  message: string
 }
 
 // Fetch mentions for a product
@@ -387,5 +464,54 @@ export async function fetchOrphanMentions(taxonomyId: string): Promise<OrphanMen
     { headers: getAuthHeaders() }
   )
   if (!res.ok) throw new Error('Failed to fetch orphan mentions')
+  return res.json()
+}
+
+// Fetch grouped product mentions
+export async function fetchGroupedProductMentions(productId: string): Promise<GroupedMentionsResponse> {
+  const res = await fetch(
+    `${API_URL}/api/onboarding/products/${productId}/mentions/grouped`,
+    { headers: getAuthHeaders() }
+  )
+  if (!res.ok) throw new Error('Failed to fetch grouped product mentions')
+  return res.json()
+}
+
+// Fetch grouped category mentions
+export async function fetchGroupedCategoryMentions(categoryId: string): Promise<GroupedMentionsResponse> {
+  const res = await fetch(
+    `${API_URL}/api/onboarding/categories/${categoryId}/mentions/grouped`,
+    { headers: getAuthHeaders() }
+  )
+  if (!res.ok) throw new Error('Failed to fetch grouped category mentions')
+  return res.json()
+}
+
+// Fetch grouped orphan mentions
+export async function fetchGroupedOrphanMentions(taxonomyId: string): Promise<GroupedOrphansResponse> {
+  const res = await fetch(
+    `${API_URL}/api/onboarding/taxonomies/${taxonomyId}/orphan-mentions/grouped`,
+    { headers: getAuthHeaders() }
+  )
+  if (!res.ok) throw new Error('Failed to fetch grouped orphan mentions')
+  return res.json()
+}
+
+// Bulk move mentions to a product or category
+export async function bulkMoveMentions(
+  mentionIds: string[],
+  targetType: 'product' | 'category',
+  targetId: string
+): Promise<BulkMoveResponse> {
+  const res = await fetch(`${API_URL}/api/onboarding/mentions/move`, {
+    method: 'POST',
+    headers: getAuthHeaders(),
+    body: JSON.stringify({
+      mention_ids: mentionIds,
+      target_type: targetType,
+      target_id: targetId,
+    }),
+  })
+  if (!res.ok) throw new Error('Failed to move mentions')
   return res.json()
 }
