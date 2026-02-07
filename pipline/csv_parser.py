@@ -8,7 +8,8 @@ import math
 import pandas as pd
 
 from logging_config import get_logger
-from database import Place, Review, get_session
+from database import Place, PlaceMenuImage, Review, get_session
+from image_store import ImageStore
 
 logger = get_logger(__name__, service="csv_parser")
 
@@ -76,6 +77,13 @@ def parse_csv(csv_path: str) -> list[dict]:
                 "complete_address": parse_json_field(row.get("complete_address")),
             })
         }
+
+        # Parse menu images
+        menu_images_raw = parse_json_field(row.get("menu_images"))
+        if isinstance(menu_images_raw, list):
+            place_data["menu_images"] = [u for u in menu_images_raw if isinstance(u, str) and u]
+        else:
+            place_data["menu_images"] = []
 
         # Parse reviews from user_reviews and user_reviews_extended JSON fields
         reviews_raw = parse_json_field(row.get("user_reviews")) or []
@@ -167,6 +175,24 @@ def save_place_and_reviews(place_data: dict, job_id: str = None) -> tuple:
             session.flush()
             review_ids.append(str(review.id))
 
+        # Download and store menu images
+        menu_image_count = 0
+        menu_images = place_data.get("menu_images", [])
+        if menu_images:
+            try:
+                store = ImageStore()
+                stored = store.download_menu_images(menu_images, place_id)
+                for item in stored:
+                    menu_img = PlaceMenuImage(
+                        place_id=place.id,
+                        image_url=item["image_url"],
+                        original_url=item["original_url"],
+                    )
+                    session.add(menu_img)
+                menu_image_count = len(stored)
+            except Exception as e:
+                logger.warning("Failed to store menu images", extra={"extra_data": {"error": str(e)}})
+
         session.commit()
         logger.info(
             "Saved place and reviews",
@@ -174,7 +200,8 @@ def save_place_and_reviews(place_data: dict, job_id: str = None) -> tuple:
                 "place_name": place_data["name"],
                 "new_reviews": len(review_ids),
                 "skipped_duplicates": skipped_count,
-                "is_new_place": is_new_place
+                "is_new_place": is_new_place,
+                "menu_images": menu_image_count,
             }}
         )
         return place_id, review_ids

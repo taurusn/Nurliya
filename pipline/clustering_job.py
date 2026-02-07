@@ -299,7 +299,14 @@ def is_clustering_needed(place_id: str, job_id: str = None) -> Tuple[bool, str]:
             if existing.status == "review":
                 return False, "Taxonomy in review, cannot create new draft"
 
-            # Active taxonomy exists - check for re-discovery threshold
+            # Active taxonomy exists - cooldown after recent publish
+            if existing.published_at:
+                from datetime import datetime, timedelta
+                hours_since_publish = (datetime.utcnow() - existing.published_at).total_seconds() / 3600
+                if hours_since_publish < 24:
+                    return False, f"Published {hours_since_publish:.1f}h ago, cooldown until 24h"
+
+            # Check for re-discovery threshold
             # FEATURE-001: Count unresolved mentions across ALL places in shared taxonomy
             all_place_ids = existing.all_place_ids
             unresolved_count = session.query(RawMention).filter(
@@ -763,6 +770,112 @@ def build_hierarchy(
             "mention_vector_ids": [item.vector_id for item in items],
         }
         hierarchy["aspect_categories"].append(aspect_cat)
+
+    return hierarchy
+
+
+def _deduplicate_categories(hierarchy: dict) -> dict:
+    """
+    Merge categories that share the same `name` and `parent_id`.
+    Reassigns products and sub-categories from duplicates to the surviving category.
+    """
+    # Dedup main_categories (parent_id is always None)
+    seen_main = {}  # name -> category dict
+    merged_main = []
+    main_id_remap = {}  # old_id -> surviving_id
+
+    for cat in hierarchy["main_categories"]:
+        key = cat["name"]
+        if key in seen_main:
+            survivor = seen_main[key]
+            main_id_remap[cat["id"]] = survivor["id"]
+            survivor["discovered_mention_count"] = (
+                (survivor.get("discovered_mention_count") or 0) +
+                (cat.get("discovered_mention_count") or 0)
+            )
+        else:
+            seen_main[key] = cat
+            merged_main.append(cat)
+
+    hierarchy["main_categories"] = merged_main
+
+    # Remap sub-category parent_ids that pointed to merged-away mains
+    for sub in hierarchy["sub_categories"]:
+        if sub["parent_id"] in main_id_remap:
+            sub["parent_id"] = main_id_remap[sub["parent_id"]]
+
+    # Dedup sub_categories by (name, parent_id)
+    seen_sub = {}  # (name, parent_id) -> category dict
+    merged_sub = []
+    sub_id_remap = {}  # old_id -> surviving_id
+
+    for cat in hierarchy["sub_categories"]:
+        key = (cat["name"], cat["parent_id"])
+        if key in seen_sub:
+            survivor = seen_sub[key]
+            sub_id_remap[cat["id"]] = survivor["id"]
+            survivor["discovered_mention_count"] = (
+                (survivor.get("discovered_mention_count") or 0) +
+                (cat.get("discovered_mention_count") or 0)
+            )
+        else:
+            seen_sub[key] = cat
+            merged_sub.append(cat)
+
+    hierarchy["sub_categories"] = merged_sub
+
+    # Cross-level dedup: if a main_category has the same name as a sub_category,
+    # merge the main into the sub (sub already has a proper parent in the hierarchy)
+    sub_names = {}
+    for sub in hierarchy["sub_categories"]:
+        sub_names.setdefault(sub["name"], sub)
+
+    cross_remap = {}
+    remaining_main = []
+    for main_cat in hierarchy["main_categories"]:
+        if main_cat["name"] in sub_names:
+            survivor = sub_names[main_cat["name"]]
+            cross_remap[main_cat["id"]] = survivor["id"]
+            survivor["discovered_mention_count"] = (
+                (survivor.get("discovered_mention_count") or 0) +
+                (main_cat.get("discovered_mention_count") or 0)
+            )
+        else:
+            remaining_main.append(main_cat)
+
+    hierarchy["main_categories"] = remaining_main
+
+    # Remap product discovered_category_id from merged-away categories
+    all_remap = {**main_id_remap, **sub_id_remap, **cross_remap}
+    if all_remap:
+        for product in hierarchy["products"]:
+            old_cat = product.get("discovered_category_id")
+            if old_cat in all_remap:
+                product["discovered_category_id"] = all_remap[old_cat]
+
+        logger.info(f"Deduplicated categories: {len(all_remap)} duplicates merged",
+                    extra={"extra_data": {"remapped": all_remap}})
+
+    # Dedup aspect_categories by name
+    seen_aspect = {}
+    merged_aspect = []
+    for cat in hierarchy["aspect_categories"]:
+        key = cat["name"]
+        if key in seen_aspect:
+            survivor = seen_aspect[key]
+            survivor["discovered_mention_count"] = (
+                (survivor.get("discovered_mention_count") or 0) +
+                (cat.get("discovered_mention_count") or 0)
+            )
+            # Merge mention_vector_ids
+            survivor_vids = survivor.get("mention_vector_ids") or []
+            cat_vids = cat.get("mention_vector_ids") or []
+            survivor["mention_vector_ids"] = survivor_vids + cat_vids
+        else:
+            seen_aspect[key] = cat
+            merged_aspect.append(cat)
+
+    hierarchy["aspect_categories"] = merged_aspect
 
     return hierarchy
 
@@ -1552,6 +1665,9 @@ def run_clustering_job(
         hierarchy = _merge_hierarchies(anchor_hierarchy, discovery_hierarchy, import_anchors, import_hierarchy)
     else:
         hierarchy = _merge_hierarchies({}, discovery_hierarchy, import_anchors, import_hierarchy) if import_anchors else discovery_hierarchy
+
+    # Deduplicate categories with the same name after all merges
+    hierarchy = _deduplicate_categories(hierarchy)
 
     # Check if hierarchy has any content
     total_entities = (

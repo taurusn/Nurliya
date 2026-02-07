@@ -14,6 +14,7 @@ ARG NEXT_PUBLIC_API_URL=https://api.nurliya.com
 ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
 ENV NEXT_TELEMETRY_DISABLED=1
 
+ENV NODE_OPTIONS="--max-old-space-size=512"
 RUN npm run build
 
 FROM base AS runner

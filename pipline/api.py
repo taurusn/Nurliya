@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, WebSocket, WebSocke
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
 from typing import Optional, List, Set, Dict
+import uuid
 from uuid import UUID
 from sqlalchemy import func, text, case, or_
 
@@ -2197,8 +2198,11 @@ def _index_taxonomy_vectors(session, place_id: str, taxonomy_id: str, products, 
                     # Index each variant as a separate point with same entity_id
                     for i, (text, emb) in enumerate(zip(texts, product_embs)):
                         if emb is not None and not all(v == 0.0 for v in emb):
-                            # Use product_id for canonical, product_id_variant_{i} for variants
-                            point_id = product_id if i == 0 else f"{product_id}_v{i}"
+                            # Use product_id for canonical, uuid5 for variants (Qdrant requires valid UUIDs)
+                            if i == 0:
+                                point_id = product_id
+                            else:
+                                point_id = str(uuid.uuid5(uuid.UUID(product_id), f"v{i}"))
                             products_to_index.append((point_id, text, emb, product_id, category_id))
                             indexed_any = True
 
@@ -2469,7 +2473,7 @@ def _aggregate_taxonomy_analytics(session, taxonomy_id: UUID):
             if category_id and category_id in category_totals:
                 category_totals[category_id]['count'] += count
                 # Convert avg back to sum: avg_sent * count = sum
-                category_totals[category_id]['sentiment_sum'] += (avg_sent * count)
+                category_totals[category_id]['sentiment_sum'] += float(avg_sent or 0) * count
 
         # Update category records
         for category_id, totals in category_totals.items():

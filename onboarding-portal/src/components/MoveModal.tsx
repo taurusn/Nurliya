@@ -87,7 +87,7 @@ export function MoveModal({
                     : 'hover:bg-card-hover text-foreground'
                 }`}
               >
-                {cat.display_name_en || cat.name}
+                {cat.display_name_ar || cat.display_name_en || cat.name}
               </button>
               {getChildren(cat.id).map((child) => (
                 <button
@@ -99,7 +99,7 @@ export function MoveModal({
                       : 'hover:bg-card-hover text-foreground'
                   }`}
                 >
-                  {child.display_name_en || child.name}
+                  {child.display_name_ar || child.display_name_en || child.name}
                 </button>
               ))}
             </div>

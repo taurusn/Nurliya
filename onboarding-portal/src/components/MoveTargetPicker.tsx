@@ -68,7 +68,7 @@ export function MoveTargetPicker({
   const getCategoryName = (categoryId: string | null) => {
     if (!categoryId) return null
     const cat = categories.find((c) => c.id === categoryId)
-    return cat?.display_name_en || cat?.name
+    return cat?.display_name_ar || cat?.display_name_en || cat?.name
   }
 
   const handleClose = () => {
@@ -180,16 +180,16 @@ export function MoveTargetPicker({
                   return (
                     <div key={category.id}>
                       <button
-                        onClick={() => onSelect('category', category.id, category.display_name_en || category.name)}
+                        onClick={() => onSelect('category', category.id, category.display_name_ar || category.display_name_en || category.name)}
                         className="w-full p-3 text-left rounded-lg hover:bg-card-hover transition-colors"
                       >
                         <div className="flex items-center gap-2">
                           <FolderTree className="w-4 h-4 text-muted flex-shrink-0" />
                           <span className="font-medium text-foreground">
-                            {category.display_name_en || category.name}
+                            {category.display_name_ar || category.display_name_en || category.name}
                           </span>
-                          {category.display_name_ar && (
-                            <span className="text-muted text-sm">({category.display_name_ar})</span>
+                          {category.display_name_en && category.display_name_ar && (
+                            <span className="text-muted text-sm">({category.display_name_en})</span>
                           )}
                           {category.is_approved && (
                             <Badge variant="success" className="text-xs">approved</Badge>
@@ -208,16 +208,16 @@ export function MoveTargetPicker({
                       {children.map((child) => (
                         <button
                           key={child.id}
-                          onClick={() => onSelect('category', child.id, child.display_name_en || child.name)}
+                          onClick={() => onSelect('category', child.id, child.display_name_ar || child.display_name_en || child.name)}
                           className="w-full p-3 pl-8 text-left rounded-lg hover:bg-card-hover transition-colors"
                         >
                           <div className="flex items-center gap-2">
                             <FolderTree className="w-4 h-4 text-muted flex-shrink-0" />
                             <span className="font-medium text-foreground">
-                              {child.display_name_en || child.name}
+                              {child.display_name_ar || child.display_name_en || child.name}
                             </span>
-                            {child.display_name_ar && (
-                              <span className="text-muted text-sm">({child.display_name_ar})</span>
+                            {child.display_name_en && child.display_name_ar && (
+                              <span className="text-muted text-sm">({child.display_name_en})</span>
                             )}
                             {child.is_approved && (
                               <Badge variant="success" className="text-xs">approved</Badge>

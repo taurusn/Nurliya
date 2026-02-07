@@ -100,7 +100,7 @@ function CategoryNode({
             <FolderTree className="w-4 h-4 text-muted flex-shrink-0" />
           )}
           <span className="text-sm text-foreground truncate">
-            {category.display_name_en || category.name}
+            {category.display_name_ar || category.display_name_en || category.name}
           </span>
           <ApprovalBadge
             isApproved={category.is_approved}
@@ -141,7 +141,7 @@ function CategoryNode({
                 size="icon"
                 variant="ghost"
                 className="h-7 w-7"
-                onClick={() => onShowMentions(category.id, category.display_name_en || category.name)}
+                onClick={() => onShowMentions(category.id, category.display_name_ar || category.display_name_en || category.name)}
                 title="View mentions"
               >
                 <MessageSquare className="w-3.5 h-3.5 text-primary" />

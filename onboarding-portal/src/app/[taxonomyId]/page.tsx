@@ -67,6 +67,7 @@ function TaxonomyEditor() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [publishing, setPublishing] = useState(false)
+  const [approvingAll, setApprovingAll] = useState(false)
 
   const [selectedCategoryId, setSelectedCategoryId] = useState<string | null>(null)
 
@@ -302,6 +303,33 @@ function TaxonomyEditor() {
     }
   }
 
+  // Approve All (skip rejected items)
+  const handleApproveAll = async () => {
+    if (!taxonomy) return
+    setApprovingAll(true)
+    try {
+      const unapprovedCats = taxonomy.categories.filter(
+        (c) => !c.is_approved && !c.rejection_reason
+      )
+      const unapprovedProds = taxonomy.products.filter(
+        (p) => !p.is_approved && !p.rejection_reason
+      )
+
+      for (const cat of unapprovedCats) {
+        await approveCategory(cat.id)
+      }
+      for (const prod of unapprovedProds) {
+        await approveProduct(prod.id)
+      }
+
+      await loadTaxonomy()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to approve all')
+    } finally {
+      setApprovingAll(false)
+    }
+  }
+
   // Publish
   const handlePublish = async () => {
     if (!taxonomy) return
@@ -352,6 +380,9 @@ function TaxonomyEditor() {
 
   const approvedCategories = taxonomy.categories.filter((c) => c.is_approved).length
   const approvedProducts = taxonomy.products.filter((p) => p.is_approved).length
+  const unapprovedCount =
+    taxonomy.categories.filter((c) => !c.is_approved && !c.rejection_reason).length +
+    taxonomy.products.filter((p) => !p.is_approved && !p.rejection_reason).length
   const canPublish =
     taxonomy.status !== 'active' && (approvedCategories > 0 || approvedProducts > 0)
 
@@ -389,6 +420,12 @@ function TaxonomyEditor() {
                 <Button variant="outline" size="sm" onClick={() => setShowImportModal(true)}>
                   <Upload className="w-4 h-4 mr-2" />
                   Import
+                </Button>
+              )}
+              {taxonomy.status !== 'active' && unapprovedCount > 0 && (
+                <Button variant="outline" size="sm" onClick={handleApproveAll} disabled={approvingAll}>
+                  <Check className="w-4 h-4 mr-2" />
+                  {approvingAll ? 'Approving...' : `Approve All (${unapprovedCount})`}
                 </Button>
               )}
               {canPublish && (
@@ -462,7 +499,7 @@ function TaxonomyEditor() {
                   setRejectModal({
                     type: 'category',
                     id,
-                    name: cat?.display_name_en || cat?.name || 'Category',
+                    name: cat?.display_name_ar || cat?.display_name_en || cat?.name || 'Category',
                   })
                 }}
                 onMove={(id) => {
@@ -470,7 +507,7 @@ function TaxonomyEditor() {
                   setMoveModal({
                     type: 'category',
                     id,
-                    name: cat?.display_name_en || cat?.name || 'Category',
+                    name: cat?.display_name_ar || cat?.display_name_en || cat?.name || 'Category',
                     currentCategoryId: cat?.parent_id,
                   })
                 }}
@@ -486,7 +523,7 @@ function TaxonomyEditor() {
                   setDeleteConfirm({
                     type: 'category',
                     id,
-                    name: cat?.display_name_en || cat?.name || 'Category',
+                    name: cat?.display_name_ar || cat?.display_name_en || cat?.name || 'Category',
                   })
                 }}
                 onMerge={(id) => {
@@ -506,7 +543,8 @@ function TaxonomyEditor() {
                 {selectedCategoryId && (
                   <span className="font-normal text-muted ml-2">
                     in{' '}
-                    {taxonomy.categories.find((c) => c.id === selectedCategoryId)?.display_name_en ||
+                    {taxonomy.categories.find((c) => c.id === selectedCategoryId)?.display_name_ar ||
+                      taxonomy.categories.find((c) => c.id === selectedCategoryId)?.display_name_en ||
                       'selected category'}
                   </span>
                 )}

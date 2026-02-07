@@ -117,7 +117,7 @@ export function AddCategoryModal({ isOpen, onClose, onAdd, categories }: AddCate
               <option value="">None (main category)</option>
               {mainCategories.map((cat) => (
                 <option key={cat.id} value={cat.id}>
-                  {cat.display_name_en || cat.name}
+                  {cat.display_name_ar || cat.display_name_en || cat.name}
                 </option>
               ))}
             </select>

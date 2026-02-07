@@ -43,8 +43,7 @@ export function ProductList({
       ? products
       : products.filter(
           (p) =>
-            p.assigned_category_id === selectedCategoryId ||
-            p.discovered_category_id === selectedCategoryId
+            (p.assigned_category_id ?? p.discovered_category_id) === selectedCategoryId
         )
 
     // Apply search filter
@@ -72,7 +71,7 @@ export function ProductList({
   const getCategoryName = (categoryId: string | null) => {
     if (!categoryId) return 'Standalone'
     const cat = categories.find((c) => c.id === categoryId)
-    return cat?.display_name_en || cat?.name || 'Unknown'
+    return cat?.display_name_ar || cat?.display_name_en || cat?.name || 'Unknown'
   }
 
   const ProductRow = ({ product }: { product: TaxonomyProduct }) => (

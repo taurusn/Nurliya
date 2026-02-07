@@ -17,8 +17,10 @@ import numpy as np
 from embedding_client import normalize_arabic, generate_embeddings, compute_similarity
 
 
-# Grouping similarity threshold (same as DBSCAN product clustering)
-GROUP_SIMILARITY_THRESHOLD = 0.78
+# Grouping similarity threshold — must be high enough to avoid merging
+# domain-related but distinct Arabic words (e.g. الاكل "food" vs الكيك "cake" = 0.86).
+# 0.90 merges true spelling variants while keeping distinct concepts separate.
+GROUP_SIMILARITY_THRESHOLD = 0.90
 
 
 @dataclass
@@ -54,6 +56,22 @@ class MentionGroup:
         }
 
 
+def _strip_arabic_definite_article(text: str) -> str:
+    """
+    Strip the Arabic definite article "ال" (al-) from the start of each word.
+    Handles standalone words and multi-word phrases.
+    e.g. "الفلات وايت" -> "فلات وايت", "الكابتشينو" -> "كابتشينو"
+    """
+    words = text.split()
+    stripped = []
+    for word in words:
+        if word.startswith('ال') and len(word) > 2:
+            stripped.append(word[2:])
+        else:
+            stripped.append(word)
+    return ' '.join(stripped)
+
+
 def normalize_for_grouping(text: str) -> str:
     """
     Normalize text for grouping (more aggressive than embedding normalization).
@@ -63,8 +81,9 @@ def normalize_for_grouping(text: str) -> str:
     2. Arabic normalization (harakat, hamza, etc.)
     3. Lowercase
     4. Remove punctuation (keep Arabic/Latin letters, numbers, spaces)
-    5. Collapse multiple spaces
-    6. Strip
+    5. Strip Arabic definite article "ال" from each word
+    6. Collapse multiple spaces
+    7. Strip
     """
     if not text:
         return ""
@@ -81,6 +100,9 @@ def normalize_for_grouping(text: str) -> str:
     # Remove punctuation - keep Arabic letters (\u0600-\u06FF), Latin letters, numbers, spaces
     # Also keep Persian/Urdu extensions (\u0750-\u077F, \uFB50-\uFDFF, \uFE70-\uFEFF)
     text = re.sub(r'[^\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFFa-z0-9\s]', '', text)
+
+    # Strip Arabic definite article "ال" from each word
+    text = _strip_arabic_definite_article(text)
 
     # Collapse whitespace
     text = re.sub(r'\s+', ' ', text)

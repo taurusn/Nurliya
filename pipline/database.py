@@ -187,6 +187,19 @@ class ActivityLog(Base):
     place_id = Column(UUID(as_uuid=True), ForeignKey("places.id", ondelete="SET NULL"), nullable=True)
 
 
+class PlaceMenuImage(Base):
+    """Menu images downloaded from Google Maps and stored in MinIO."""
+    __tablename__ = "place_menu_images"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    place_id = Column(UUID(as_uuid=True), ForeignKey("places.id", ondelete="CASCADE"), nullable=False, index=True)
+    image_url = Column(Text, nullable=False)  # MinIO URL (permanent)
+    original_url = Column(Text)  # Google URL (may expire)
+    created_at = Column(TIMESTAMP, default=datetime.utcnow)
+
+    place = relationship("Place")
+
+
 # =============================================================================
 # DYNAMIC TAXONOMY SYSTEM TABLES
 # =============================================================================
@@ -384,6 +397,51 @@ class TaxonomyAuditLog(Base):
 
     taxonomy = relationship("PlaceTaxonomy")
     user = relationship("User")
+
+
+# =============================================================================
+# TAXONOMY ARCHIVE - For learning from previous versions
+# =============================================================================
+
+class TaxonomyArchive(Base):
+    """
+    Archive of taxonomy snapshots before re-clustering/deletion.
+
+    Stores full JSON snapshot of taxonomy state for:
+    - Learning from previous clustering results
+    - Comparing before/after import changes
+    - Audit trail of taxonomy evolution
+    """
+    __tablename__ = "taxonomy_archives"
+    __table_args__ = (
+        Index('ix_taxonomy_archives_place', 'place_id'),
+        Index('ix_taxonomy_archives_original', 'original_taxonomy_id'),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    original_taxonomy_id = Column(UUID(as_uuid=True), nullable=False)  # ID before deletion
+    place_id = Column(UUID(as_uuid=True), ForeignKey("places.id", ondelete="CASCADE"), nullable=False)
+    place_name = Column(String(255))  # Denormalized for easy reference
+
+    # Reason for archival
+    archive_reason = Column(String(50), nullable=False)  # 'import_recluster', 'manual_delete', 'republish'
+    archived_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+
+    # Full snapshot of taxonomy state
+    snapshot = Column(JSONB, nullable=False)  # {taxonomy: {...}, categories: [...], products: [...]}
+
+    # Stats at time of archival
+    categories_count = Column(Integer, default=0)
+    products_count = Column(Integer, default=0)
+    status_at_archive = Column(String(20))  # draft, review, active
+
+    # Link to new taxonomy (if replaced)
+    replaced_by_taxonomy_id = Column(UUID(as_uuid=True), nullable=True)
+
+    created_at = Column(TIMESTAMP, default=datetime.utcnow)
+
+    place = relationship("Place")
+    archived_by_user = relationship("User")
 
 
 # =============================================================================

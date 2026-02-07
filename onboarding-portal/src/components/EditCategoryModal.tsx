@@ -138,7 +138,7 @@ export function EditCategoryModal({
               <option value="">None (root level)</option>
               {availableParents.map((cat) => (
                 <option key={cat.id} value={cat.id}>
-                  {cat.display_name_en || cat.name}
+                  {cat.display_name_ar || cat.display_name_en || cat.name}
                 </option>
               ))}
             </select>

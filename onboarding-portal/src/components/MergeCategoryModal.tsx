@@ -68,8 +68,8 @@ export function MergeCategoryModal({
 
   if (!isOpen) return null
 
-  const sourceName = sourceCategory.display_name_en || sourceCategory.name
-  const targetName = selectedTarget?.display_name_en || selectedTarget?.name
+  const sourceName = sourceCategory.display_name_ar || sourceCategory.display_name_en || sourceCategory.name
+  const targetName = selectedTarget?.display_name_ar || selectedTarget?.display_name_en || selectedTarget?.name
 
   // Calculate merged result preview
   const sourceProducts = categories.filter(c => c.parent_id === sourceCategory.id).length
@@ -80,7 +80,7 @@ export function MergeCategoryModal({
   const getParentName = (parentId: string | null) => {
     if (!parentId) return null
     const parent = categories.find(c => c.id === parentId)
-    return parent?.display_name_en || parent?.name
+    return parent?.display_name_ar || parent?.display_name_en || parent?.name
   }
 
   return (
@@ -113,8 +113,8 @@ export function MergeCategoryModal({
               <div className="flex items-center gap-2">
                 <FolderTree className="w-4 h-4 text-muted" />
                 <span className="font-medium text-foreground">{sourceName}</span>
-                {sourceCategory.display_name_ar && (
-                  <span className="text-muted">({sourceCategory.display_name_ar})</span>
+                {sourceCategory.display_name_en && sourceCategory.display_name_ar && (
+                  <span className="text-muted">({sourceCategory.display_name_en})</span>
                 )}
               </div>
               <div className="flex items-center gap-2 mt-1 text-xs text-muted">
@@ -157,7 +157,7 @@ export function MergeCategoryModal({
                 </div>
               ) : (
                 availableTargets.map((category) => {
-                  const name = category.display_name_en || category.name
+                  const name = category.display_name_ar || category.display_name_en || category.name
                   const isSelected = selectedTarget?.id === category.id
                   const parentName = getParentName(category.parent_id)
                   return (
@@ -170,8 +170,8 @@ export function MergeCategoryModal({
                     >
                       <div className="flex items-center gap-2">
                         <span className="font-medium text-foreground">{name}</span>
-                        {category.display_name_ar && (
-                          <span className="text-muted text-sm">({category.display_name_ar})</span>
+                        {category.display_name_en && category.display_name_ar && (
+                          <span className="text-muted text-sm">({category.display_name_en})</span>
                         )}
                       </div>
                       <div className="flex items-center gap-2 mt-1 text-xs text-muted">

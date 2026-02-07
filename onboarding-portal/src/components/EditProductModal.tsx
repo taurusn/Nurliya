@@ -83,10 +83,10 @@ export function EditProductModal({
     .filter((c) => c.has_products)
     .map((c) => {
       const parent = categories.find((p) => p.id === c.parent_id)
-      const prefix = parent ? `${parent.display_name_en || parent.name} → ` : ''
+      const prefix = parent ? `${parent.display_name_ar || parent.display_name_en || parent.name} → ` : ''
       return {
         id: c.id,
-        label: `${prefix}${c.display_name_en || c.name}`,
+        label: `${prefix}${c.display_name_ar || c.display_name_en || c.name}`,
       }
     })
 

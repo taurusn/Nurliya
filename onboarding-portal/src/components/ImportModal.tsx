@@ -41,6 +41,8 @@ function validateImportData(data: unknown): { valid: boolean; error?: string; pa
     display_name_en: cat.display_name_en as string,
     display_name_ar: (cat.display_name_ar as string) || undefined,
     is_aspect: cat.is_aspect as boolean,
+    is_parent: cat.is_parent as boolean | undefined,
+    parent: (cat.parent as string) || undefined,
     examples: Array.isArray(cat.examples) ? cat.examples : [],
     products: Array.isArray(cat.products)
       ? (cat.products as Record<string, unknown>[]).map((p) => ({
@@ -67,25 +69,43 @@ function downloadJson(data: object, filename: string) {
 function buildBlankTemplate(): TaxonomyImportData {
   return {
     categories: [
+      // Aspect category (no products, just mentions)
       {
-        name: 'service',
-        display_name_en: 'Service Quality',
-        display_name_ar: 'جودة الخدمة',
+        name: 'service_quality',
+        display_name_en: 'Service & Staff',
+        display_name_ar: 'الخدمة والموظفين',
         is_aspect: true,
-        examples: ['الخدمة ممتازة', 'التعامل راقي'],
+        examples: ['الخدمة ممتازة', 'التعامل راقي', 'سرعة', 'الموظفين'],
         products: [],
       },
+      // Parent category (container for sub-categories)
       {
-        name: 'hot_drinks',
-        display_name_en: 'Hot Drinks',
-        display_name_ar: 'مشروبات ساخنة',
+        name: 'coffee_drinks',
+        display_name_en: 'Coffee Drinks',
+        display_name_ar: 'مشروبات القهوة',
+        is_aspect: false,
+        is_parent: true,
+        examples: [],
+        products: [],
+      },
+      // Child category with products
+      {
+        name: 'espresso_drinks',
+        display_name_en: 'Espresso Based Drinks',
+        display_name_ar: 'مشروبات الإسبريسو',
+        parent: 'coffee_drinks',
         is_aspect: false,
         examples: [],
         products: [
           {
-            name: 'لاتيه',
-            display_name: 'Latte / لاتيه',
-            variants: ['latte', 'لاتيه'],
+            name: 'Latte',
+            display_name: 'لاتيه',
+            variants: ['لاتية', 'لاتيه حار', 'لاتيه', 'latte', 'لاتي'],
+          },
+          {
+            name: 'Cappuccino',
+            display_name: 'كابتشينو',
+            variants: ['الكابتشينو', 'كابتشينو', 'cappuccino'],
           },
         ],
       },
@@ -97,34 +117,79 @@ function buildTemplateFromDraft(
   categories: TaxonomyCategory[],
   products: TaxonomyProduct[]
 ): TaxonomyImportData {
-  const parentCats = categories.filter((c) => !c.parent_id)
-  const childCats = categories.filter((c) => c.parent_id)
+  // Build a map of category id -> name for parent references
+  const catIdToName = new Map(categories.map((c) => [c.id, c.name]))
 
-  return {
-    categories: parentCats.map((parent) => {
-      // Collect products from this parent and all its children
-      // Products may be linked via assigned_category_id or discovered_category_id
-      const children = childCats.filter((c) => c.parent_id === parent.id)
-      const relevantCatIds = [parent.id, ...children.map((c) => c.id)]
-      const catProducts = products.filter((p) => {
-        const catId = p.assigned_category_id || p.discovered_category_id
-        return catId && relevantCatIds.includes(catId)
-      })
+  // Identify parent categories (those with children)
+  const parentIds = new Set(categories.filter((c) => c.parent_id).map((c) => c.parent_id!))
 
-      return {
-        name: parent.name,
-        display_name_en: parent.display_name_en || parent.name,
-        display_name_ar: parent.display_name_ar || undefined,
-        is_aspect: !parent.has_products,
-        examples: [],
-        products: catProducts.map((p) => ({
-          name: p.canonical_text,
-          display_name: p.display_name || p.canonical_text,
-          variants: p.variants || [],
-        })),
+  // Build template categories with proper hierarchy
+  const templateCategories: ImportCategory[] = []
+
+  for (const cat of categories) {
+    const isParent = parentIds.has(cat.id)
+    const isAspect = !cat.has_products && !isParent
+
+    // Get products for this specific category
+    const catProducts = products.filter((p) => {
+      const catId = p.assigned_category_id || p.discovered_category_id
+      return catId === cat.id
+    })
+
+    const templateCat: ImportCategory & { parent?: string; is_parent?: boolean } = {
+      name: cat.name,
+      display_name_en: cat.display_name_en || cat.name,
+      display_name_ar: cat.display_name_ar || undefined,
+      is_aspect: isAspect,
+      examples: [],
+      products: catProducts.map((p) => ({
+        name: p.canonical_text,
+        display_name: p.display_name || p.canonical_text,
+        variants: p.variants || [],
+      })),
+    }
+
+    // Add parent reference if this is a child category
+    if (cat.parent_id) {
+      const parentName = catIdToName.get(cat.parent_id)
+      if (parentName) {
+        templateCat.parent = parentName
       }
-    }),
+    }
+
+    // Mark as parent if it has children
+    if (isParent) {
+      templateCat.is_parent = true
+    }
+
+    templateCategories.push(templateCat)
   }
+
+  // Sort: aspects first, then parent categories, then children
+  templateCategories.sort((a, b) => {
+    const aIsAspect = a.is_aspect
+    const bIsAspect = b.is_aspect
+    const aIsParent = (a as { is_parent?: boolean }).is_parent
+    const bIsParent = (b as { is_parent?: boolean }).is_parent
+    const aHasParent = !!(a as { parent?: string }).parent
+    const bHasParent = !!(b as { parent?: string }).parent
+
+    // Aspects first
+    if (aIsAspect && !bIsAspect) return 1
+    if (!aIsAspect && bIsAspect) return -1
+
+    // Then parent categories
+    if (aIsParent && !bIsParent) return -1
+    if (!aIsParent && bIsParent) return 1
+
+    // Then children after their parents
+    if (aHasParent && !bHasParent) return 1
+    if (!aHasParent && bHasParent) return -1
+
+    return 0
+  })
+
+  return { categories: templateCategories }
 }
 
 export function ImportModal({ isOpen, onClose, onImport, categories, products }: ImportModalProps) {
@@ -194,6 +259,8 @@ export function ImportModal({ isOpen, onClose, onImport, categories, products }:
 
   const categoryCount = importData?.categories.length || 0
   const aspectCount = importData?.categories.filter((c) => c.is_aspect).length || 0
+  const parentCount = importData?.categories.filter((c) => c.is_parent).length || 0
+  const childCount = importData?.categories.filter((c) => c.parent).length || 0
   const productCatCount = categoryCount - aspectCount
   const productCount = importData?.categories.reduce(
     (sum, c) => sum + (c.products?.length || 0), 0
@@ -274,7 +341,9 @@ export function ImportModal({ isOpen, onClose, onImport, categories, products }:
                 <FolderTree className="w-4 h-4 text-muted" />
                 <span className="text-muted">Categories:</span>
                 <span className="text-foreground">{categoryCount}</span>
-                <span className="text-muted">({aspectCount} aspect, {productCatCount} product)</span>
+                <span className="text-muted">
+                  ({aspectCount} aspect{parentCount > 0 && `, ${parentCount} parent`}{childCount > 0 && `, ${childCount} child`})
+                </span>
               </div>
               <div className="flex items-center gap-2 text-sm">
                 <Package className="w-4 h-4 text-muted" />
@@ -283,11 +352,22 @@ export function ImportModal({ isOpen, onClose, onImport, categories, products }:
               </div>
               <div className="mt-3 max-h-32 overflow-y-auto space-y-1">
                 {importData.categories.map((cat, i) => (
-                  <div key={i} className="flex items-center gap-2 text-xs text-muted">
-                    <span className={cat.is_aspect ? 'text-primary' : 'text-warning'}>
-                      {cat.is_aspect ? 'aspect' : 'product'}
+                  <div key={i} className={`flex items-center gap-2 text-xs text-muted ${cat.parent ? 'ml-4' : ''}`}>
+                    <span className={
+                      cat.is_aspect ? 'text-primary' :
+                      cat.is_parent ? 'text-blue-400' :
+                      cat.parent ? 'text-green-400' :
+                      'text-warning'
+                    }>
+                      {cat.is_aspect ? 'aspect' :
+                       cat.is_parent ? 'parent' :
+                       cat.parent ? 'child' :
+                       'product'}
                     </span>
-                    <span className="text-foreground">{cat.display_name_en}</span>
+                    <span className="text-foreground">{cat.display_name_ar || cat.display_name_en}</span>
+                    {cat.parent && (
+                      <span className="text-muted/70">({cat.parent})</span>
+                    )}
                     {cat.products && cat.products.length > 0 && (
                       <span>({cat.products.length} products)</span>
                     )}

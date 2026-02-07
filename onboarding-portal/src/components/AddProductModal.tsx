@@ -54,10 +54,10 @@ export function AddProductModal({ isOpen, onClose, onAdd, categories }: AddProdu
   const categoryOptions: { id: string; label: string }[] = []
   const mainCategories = categories.filter((c) => !c.parent_id && c.has_products)
   mainCategories.forEach((main) => {
-    categoryOptions.push({ id: main.id, label: main.display_name_en || main.name })
+    categoryOptions.push({ id: main.id, label: main.display_name_ar || main.display_name_en || main.name })
     const children = categories.filter((c) => c.parent_id === main.id && c.has_products)
     children.forEach((child) => {
-      categoryOptions.push({ id: child.id, label: `  ${child.display_name_en || child.name}` })
+      categoryOptions.push({ id: child.id, label: `  ${child.display_name_ar || child.display_name_en || child.name}` })
     })
   })
 
