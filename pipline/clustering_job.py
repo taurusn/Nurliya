@@ -21,6 +21,7 @@ from database import (
 )
 import vector_store
 from vector_store import MENTIONS_COLLECTION, VectorPayload
+from anchor_manager import normalize_business_type
 
 logger = get_logger(__name__, service="clustering")
 
@@ -690,6 +691,7 @@ def build_hierarchy(
             "has_products": label.get("has_products", True),
             "parent_id": parent_id,
             "discovered_mention_count": sum(item.mention_count for item in items),
+            "centroid_embedding": product_centroids.get(cluster_id),
         }
 
         if parent_id:
@@ -966,9 +968,11 @@ def save_draft_taxonomy(
         product_mention_links = []  # (product_db_id, [vector_ids])
         for prod_data in hierarchy["products"]:
             discovered_cat = category_id_map.get(prod_data["discovered_category_id"])
+            category_id = discovered_cat.id if discovered_cat else None
             product = TaxonomyProduct(
                 taxonomy_id=taxonomy_id,
-                discovered_category_id=discovered_cat.id if discovered_cat else None,
+                discovered_category_id=category_id,
+                assigned_category_id=category_id,  # Auto-assign to discovered category
                 canonical_text=prod_data["canonical_text"],
                 display_name=prod_data["display_name"],
                 variants=prod_data.get("variants", []),  # Save variants
@@ -1060,7 +1064,10 @@ def save_draft_taxonomy(
         session.close()
 
 
-def build_anchor_matched_hierarchy(matched_items: List[Dict]) -> dict:
+def build_anchor_matched_hierarchy(
+    matched_items: List[Dict],
+    import_hierarchy: Optional[Dict] = None
+) -> dict:
     """
     Build hierarchy entries from anchor-matched items.
 
@@ -1072,6 +1079,8 @@ def build_anchor_matched_hierarchy(matched_items: List[Dict]) -> dict:
     Args:
         matched_items: Items with 'anchor_match' (AnchorMatch), 'anchor_category',
                        plus standard fields (vector_id, text, embedding, etc.)
+        import_hierarchy: Optional dict of category hierarchy from import template:
+                          {cat_name: {parent, display_name_en, display_name_ar, is_aspect}}
 
     Returns:
         Hierarchy dict with main_categories, sub_categories, products, aspect_categories
@@ -1083,6 +1092,36 @@ def build_anchor_matched_hierarchy(matched_items: List[Dict]) -> dict:
         "aspect_categories": [],
     }
 
+    import_hierarchy = import_hierarchy or {}
+
+    # Track created category IDs for parent linking
+    cat_name_to_id = {}
+
+    # First pass: create parent categories from import hierarchy
+    # (Do this BEFORE early return so parents exist even with no matches)
+    if import_hierarchy:
+        parent_names = set()
+        for cat_name, info in import_hierarchy.items():
+            if info.get("parent"):
+                parent_names.add(info["parent"])
+
+        for parent_name in parent_names:
+            if parent_name in import_hierarchy:
+                parent_info = import_hierarchy[parent_name]
+                parent_id = str(uuid.uuid4())
+                cat_name_to_id[parent_name] = parent_id
+
+                hierarchy["main_categories"].append({
+                    "id": parent_id,
+                    "name": parent_name,
+                    "display_name_en": parent_info.get("display_name_en", ""),
+                    "display_name_ar": parent_info.get("display_name_ar", ""),
+                    "has_products": False,  # Parent categories don't have direct products
+                    "parent_id": None,
+                    "discovered_mention_count": 0,
+                })
+
+    # Early return if no matched items (but keep parent categories created above)
     if not matched_items:
         return hierarchy
 
@@ -1094,7 +1133,14 @@ def build_anchor_matched_hierarchy(matched_items: List[Dict]) -> dict:
     for anchor_cat_name, items in by_anchor.items():
         match = items[0]["anchor_match"]  # AnchorMatch dataclass
         cat_id = str(uuid.uuid4())
+        cat_name_to_id[anchor_cat_name] = cat_id
         total_mentions = sum(item.get("mention_count", 1) for item in items)
+
+        # Get parent from import hierarchy
+        parent_name = None
+        if anchor_cat_name in import_hierarchy:
+            parent_name = import_hierarchy[anchor_cat_name].get("parent")
+        parent_id = cat_name_to_id.get(parent_name) if parent_name else None
 
         if match.is_aspect:
             # Aspect category — flat, no products underneath
@@ -1107,22 +1153,28 @@ def build_anchor_matched_hierarchy(matched_items: List[Dict]) -> dict:
                 "display_name_en": match.display_name_en,
                 "display_name_ar": match.display_name_ar,
                 "has_products": False,
-                "parent_id": None,
+                "parent_id": parent_id,
                 "discovered_mention_count": total_mentions,
                 "centroid_embedding": centroid,
                 "mention_vector_ids": [item["vector_id"] for item in items],
             })
         else:
             # Product category — create category + deduplicated products
-            hierarchy["main_categories"].append({
+            # If has parent, it's a sub_category; otherwise main_category
+            cat_entry = {
                 "id": cat_id,
                 "name": match.category_name,
                 "display_name_en": match.display_name_en,
                 "display_name_ar": match.display_name_ar,
                 "has_products": True,
-                "parent_id": None,
+                "parent_id": parent_id,
                 "discovered_mention_count": total_mentions,
-            })
+            }
+
+            if parent_id:
+                hierarchy["sub_categories"].append(cat_entry)
+            else:
+                hierarchy["main_categories"].append(cat_entry)
 
             # Convert dicts back to ClusterItems for deduplication
             cluster_items = [
@@ -1161,19 +1213,58 @@ def build_anchor_matched_hierarchy(matched_items: List[Dict]) -> dict:
     return hierarchy
 
 
-def _merge_hierarchies(anchor_hierarchy: dict, discovery_hierarchy: dict) -> dict:
+def _merge_hierarchies(
+    anchor_hierarchy: dict,
+    discovery_hierarchy: dict,
+    import_anchors: Optional[List[Dict]] = None,
+    import_hierarchy: Optional[Dict] = None
+) -> dict:
     """
     Merge anchor-matched and HDBSCAN-discovered hierarchies.
 
-    Anchor categories take priority — discovery categories with the same name
-    are skipped to avoid duplicates. All discovery products are included since
-    they come from unmatched items.
+    When import_anchors exist:
+    - Compare discovery category centroids to anchor centroids (embedding similarity)
+    - If similarity > 0.6, merge discovery products into that anchor category
+    - If not similar enough, keep as new discovery category
+
+    This prevents duplicates while allowing genuine new discoveries.
     """
-    # Collect anchor category names to avoid duplicates
-    anchor_cat_names = set()
+    MERGE_THRESHOLD = 0.6  # Minimum similarity to merge
+
+    # Build anchor centroids map: category_name -> (centroid, category_dict)
+    anchor_centroids = {}  # name -> {"centroid": [...], "cat": {...}, "is_aspect": bool}
+
+    if import_anchors:
+        # Group anchors by category and compute category centroid
+        from collections import defaultdict
+        cat_embeddings = defaultdict(list)
+        cat_info = {}
+
+        for anchor in import_anchors:
+            cat_name = anchor.get("category_name")
+            if cat_name and anchor.get("centroid_embedding"):
+                cat_embeddings[cat_name].append(anchor["centroid_embedding"])
+                if cat_name not in cat_info:
+                    cat_info[cat_name] = {
+                        "is_aspect": anchor.get("is_aspect", True),
+                        "display_name_en": anchor.get("display_name_en", ""),
+                        "display_name_ar": anchor.get("display_name_ar", ""),
+                    }
+
+        for cat_name, embeddings in cat_embeddings.items():
+            centroid = np.mean(embeddings, axis=0)
+            anchor_centroids[cat_name] = {
+                "centroid": centroid,
+                "is_aspect": cat_info[cat_name]["is_aspect"],
+                "display_name_en": cat_info[cat_name]["display_name_en"],
+                "display_name_ar": cat_info[cat_name]["display_name_ar"],
+            }
+
+    # Collect anchor category info from matched hierarchy
+    anchor_cats = {}  # name -> category dict
     for cat_list_key in ("main_categories", "sub_categories", "aspect_categories"):
         for cat in anchor_hierarchy.get(cat_list_key, []):
-            anchor_cat_names.add(cat["name"])
+            anchor_cats[cat["name"]] = cat
 
     merged = {
         "main_categories": list(anchor_hierarchy.get("main_categories", [])),
@@ -1182,14 +1273,67 @@ def _merge_hierarchies(anchor_hierarchy: dict, discovery_hierarchy: dict) -> dic
         "aspect_categories": list(anchor_hierarchy.get("aspect_categories", [])),
     }
 
-    # Add discovery categories that don't conflict with anchor names
+    def find_similar_anchor_by_embedding(
+        discovery_centroid: Optional[List[float]],
+        is_aspect: bool
+    ) -> Optional[str]:
+        """Find anchor category using embedding similarity."""
+        if not discovery_centroid or not anchor_centroids:
+            return None
+
+        disc_vec = np.array(discovery_centroid)
+        disc_norm = np.linalg.norm(disc_vec)
+        if disc_norm == 0:
+            return None
+        disc_vec = disc_vec / disc_norm
+
+        best_match = None
+        best_score = MERGE_THRESHOLD
+
+        for anchor_name, anchor_info in anchor_centroids.items():
+            # Only match aspects to aspects, products to products
+            if is_aspect != anchor_info["is_aspect"]:
+                continue
+
+            anchor_vec = np.array(anchor_info["centroid"])
+            anchor_norm = np.linalg.norm(anchor_vec)
+            if anchor_norm == 0:
+                continue
+            anchor_vec = anchor_vec / anchor_norm
+
+            score = float(np.dot(disc_vec, anchor_vec))
+
+            if score > best_score:
+                best_score = score
+                best_match = anchor_name
+
+        return best_match
+
+    # Process discovery categories - merge if similar to anchor, else keep as new
+    disc_to_anchor = {}  # discovery_category_id -> anchor_category_id
+
     for cat_list_key in ("main_categories", "sub_categories", "aspect_categories"):
+        is_aspect = (cat_list_key == "aspect_categories")
         for cat in discovery_hierarchy.get(cat_list_key, []):
-            if cat["name"] not in anchor_cat_names:
+            # Use embedding similarity to find matching anchor
+            centroid = cat.get("centroid_embedding")
+            similar = find_similar_anchor_by_embedding(centroid, is_aspect)
+
+            if similar and similar in anchor_cats:
+                # Similar anchor found - map for product reassignment
+                disc_to_anchor[cat["id"]] = anchor_cats[similar]["id"]
+                logger.debug(f"Merging discovery '{cat['name']}' into anchor '{similar}'")
+            else:
+                # No similar anchor - keep as new discovery category
                 merged[cat_list_key].append(cat)
 
-    # Add all discovery products (from unmatched items, no overlap possible)
-    merged["products"].extend(discovery_hierarchy.get("products", []))
+    # Add discovery products, reassigning to anchor categories when matched
+    for product in discovery_hierarchy.get("products", []):
+        disc_cat_id = product.get("discovered_category_id")
+        if disc_cat_id and disc_cat_id in disc_to_anchor:
+            # Reassign to the matching anchor category
+            product["discovered_category_id"] = disc_to_anchor[disc_cat_id]
+        merged["products"].append(product)
 
     return merged
 
@@ -1200,6 +1344,7 @@ def run_clustering_job(
     place_ids: Optional[List[str]] = None,  # PHASE 4: Multi-place support
     scrape_job_id: Optional[str] = None,    # PHASE 4: Link to parent scrape
     import_anchors: Optional[List[Dict]] = None,  # OS-imported anchors for re-clustering
+    import_hierarchy: Optional[Dict] = None,  # Hierarchy info from import template
     is_recluster: bool = False,             # Skip guards when re-clustering after import
 ) -> Optional[str]:
     """
@@ -1218,6 +1363,8 @@ def run_clustering_job(
         scrape_job_id: Parent scrape job UUID (PHASE 4)
         import_anchors: OS-imported anchors for re-clustering (same format as
                         load_anchors_for_business output). Merged with learned anchors.
+        import_hierarchy: Dict of category hierarchy from import template:
+                          {cat_name: {parent, display_name_en, display_name_ar, is_aspect}}
         is_recluster: If True, skip is_clustering_needed() check and existing-draft guard.
                       Used when re-clustering after OS JSON import.
 
@@ -1236,7 +1383,7 @@ def run_clustering_job(
     session = get_session()
     try:
         place = session.query(Place).filter_by(id=place_id).first()
-        business_type = place.category if place and place.category else "business"
+        business_type = normalize_business_type(place.category) if place else "general"
     finally:
         session.close()
 
@@ -1277,10 +1424,17 @@ def run_clustering_job(
     # Load learned anchors from PostgreSQL (384-dim centroids stored as JSONB),
     # merge with any OS-imported anchors, and classify mentions.
     # Matched items go directly into the hierarchy; unmatched go to HDBSCAN.
-    from anchor_manager import classify_mentions_to_anchors, load_anchors_for_business
+    from anchor_manager import classify_mentions_to_anchors, load_anchors_for_business, load_anchors_from_archive
 
     db_anchors = load_anchors_for_business(business_type)
-    all_anchors = db_anchors + (import_anchors or [])
+
+    # Load anchors from previous approved taxonomy archives for this place
+    archive_anchors = load_anchors_from_archive(place_id)
+    # Deduplicate: skip archive anchors already covered by db_anchors
+    existing_names = {a["category_name"] for a in db_anchors}
+    archive_anchors = [a for a in archive_anchors if a["category_name"] not in existing_names]
+
+    all_anchors = db_anchors + archive_anchors + (import_anchors or [])
 
     anchor_matched = []
     if all_anchors:
@@ -1394,10 +1548,10 @@ def run_clustering_job(
 
     # Build anchor-matched hierarchy and merge with discovery
     if anchor_matched:
-        anchor_hierarchy = build_anchor_matched_hierarchy(anchor_matched)
-        hierarchy = _merge_hierarchies(anchor_hierarchy, discovery_hierarchy)
+        anchor_hierarchy = build_anchor_matched_hierarchy(anchor_matched, import_hierarchy)
+        hierarchy = _merge_hierarchies(anchor_hierarchy, discovery_hierarchy, import_anchors, import_hierarchy)
     else:
-        hierarchy = discovery_hierarchy
+        hierarchy = _merge_hierarchies({}, discovery_hierarchy, import_anchors, import_hierarchy) if import_anchors else discovery_hierarchy
 
     # Check if hierarchy has any content
     total_entities = (

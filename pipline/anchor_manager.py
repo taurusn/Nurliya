@@ -23,7 +23,8 @@ from datetime import datetime
 from sqlalchemy import or_
 from database import (
     SessionLocal, CategoryAnchor, AnchorExample,
-    PlaceTaxonomy, TaxonomyCategory, TaxonomyProduct, RawMention
+    PlaceTaxonomy, TaxonomyCategory, TaxonomyProduct, RawMention,
+    TaxonomyArchive
 )
 import embedding_client
 from logging_config import get_logger
@@ -34,10 +35,52 @@ logger = get_logger(__name__, service="anchor_manager")
 # All embeddings are 384-dim (paraphrase-multilingual-MiniLM-L12-v2)
 LEARNED_MATCH_THRESHOLD = 0.80   # Learned from approved taxonomies
 IMPORT_MATCH_THRESHOLD = 0.70    # OS-imported anchors (relaxed for Arabic/multilingual)
+ARCHIVE_MATCH_THRESHOLD = 0.75   # Archive-derived anchors (from previous approved taxonomies)
 DEFAULT_MATCH_THRESHOLD = 0.85
 
 # Learning weights
 CORRECTION_WEIGHT = 2.0  # Human corrections count 2x vs auto-discovered mentions
+
+# Business type normalization mapping
+# Maps raw Google Maps category strings (English + Arabic) to canonical keys
+BUSINESS_TYPE_MAP = {
+    # Coffee / Cafe
+    "coffee shop": "cafe",
+    "cafe": "cafe",
+    "café": "cafe",
+    "مقهى": "cafe",
+    "كوفي شوب": "cafe",
+    "كافيه": "cafe",
+    "coffee": "cafe",
+    "coffeehouse": "cafe",
+    # Restaurant
+    "restaurant": "restaurant",
+    "مطعم": "restaurant",
+    "fast food restaurant": "restaurant",
+    "مطعم وجبات سريعة": "restaurant",
+    # Bakery
+    "bakery": "bakery",
+    "مخبز": "bakery",
+    "مخبزة": "bakery",
+}
+
+
+def normalize_business_type(raw_category: str) -> str:
+    """
+    Normalize a raw Google Maps category string to a canonical business type.
+    Uses case-insensitive lookup against a known mapping, with fallback
+    to lowercased + underscored version of the raw string.
+    """
+    if not raw_category:
+        return "general"
+
+    normalized = raw_category.strip().lower()
+
+    if normalized in BUSINESS_TYPE_MAP:
+        return BUSINESS_TYPE_MAP[normalized]
+
+    # Fallback: lowercase, replace spaces with underscores
+    return normalized.replace(" ", "_")
 
 
 @dataclass
@@ -145,6 +188,8 @@ def classify_to_anchor(
         source = anchor.get("source", "learned")
         if source == "import":
             anchor_threshold = IMPORT_MATCH_THRESHOLD
+        elif source == "archive":
+            anchor_threshold = ARCHIVE_MATCH_THRESHOLD
         else:
             anchor_threshold = LEARNED_MATCH_THRESHOLD
 
@@ -227,8 +272,8 @@ def learn_from_approved_taxonomy(taxonomy_id: str) -> int:
             logger.warning(f"Taxonomy not found: {taxonomy_id}")
             return 0
 
-        # Get business type from place
-        business_type = taxonomy.place.category if taxonomy.place else "coffee_shop"
+        # Get business type from place (normalized for cross-place consistency)
+        business_type = normalize_business_type(taxonomy.place.category) if taxonomy.place else "general"
 
         # Process each approved category
         for category in taxonomy.categories:
@@ -750,9 +795,9 @@ def learn_from_corrections(
     if not category:
         return 0
 
-    # Determine business_type from place
+    # Determine business_type from place (normalized for cross-place consistency)
     place = taxonomy.place
-    business_type = place.category if place and place.category else 'general'
+    business_type = normalize_business_type(place.category) if place and place.category else 'general'
 
     # Find existing anchor for this category
     anchor = session.query(CategoryAnchor).filter_by(
@@ -834,6 +879,272 @@ def learn_from_corrections(
     )
 
     return new_count
+
+
+def update_product_vectors_from_corrections(
+    session,
+    mention_ids: list,
+    target_type: str,
+    target_id,
+    taxonomy,
+) -> int:
+    """
+    Update Qdrant PRODUCTS_COLLECTION with correction data.
+
+    When mentions are moved to a product/category, upsert the mention embeddings
+    as additional vectors pointing to the target entity. This gives immediate
+    improvement in product matching without waiting for full re-publish.
+
+    Only runs when taxonomy is active (draft has no PRODUCTS_COLLECTION data).
+    Returns number of vectors upserted.
+    """
+    # Import inside function to avoid circular dependency
+    # (vector_store and anchor_manager both import from database)
+    import vector_store
+    from vector_store import PRODUCTS_COLLECTION, TaxonomyVectorPayload
+
+    if not vector_store.is_available():
+        return 0
+
+    place_id = str(taxonomy.place_id)
+    taxonomy_id = str(taxonomy.id)
+
+    # Get the target entity details
+    if target_type == 'product':
+        target = session.query(TaxonomyProduct).filter_by(id=target_id).first()
+        if not target:
+            return 0
+        entity_type = "product"
+        entity_id = str(target.id)
+        category_id = str(target.assigned_category_id) if target.assigned_category_id else None
+    else:
+        target = session.query(TaxonomyCategory).filter_by(id=target_id).first()
+        if not target:
+            return 0
+        entity_type = "category"
+        entity_id = str(target.id)
+        category_id = None
+
+    # Get mention texts and generate embeddings
+    mentions = session.query(RawMention).filter(RawMention.id.in_(mention_ids)).all()
+    unique_texts = list(set(m.mention_text for m in mentions if m.mention_text))
+
+    if not unique_texts:
+        return 0
+
+    embeddings = embedding_client.generate_embeddings(unique_texts, normalize=True)
+    if not embeddings:
+        return 0
+
+    # Build batch of vectors to upsert
+    vectors_to_upsert = []
+    for text, emb in zip(unique_texts, embeddings):
+        if not emb:
+            continue
+
+        point_id = str(uuid.uuid4())
+        payload = TaxonomyVectorPayload(
+            text=text,
+            place_id=place_id,
+            taxonomy_id=taxonomy_id,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            category_id=category_id,
+        )
+        vectors_to_upsert.append((point_id, emb, payload))
+
+    if not vectors_to_upsert:
+        return 0
+
+    count = vector_store.upsert_vectors_batch(PRODUCTS_COLLECTION, vectors_to_upsert)
+
+    logger.info(
+        f"Upserted {count} correction vectors to PRODUCTS_COLLECTION",
+        extra={"data": {
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "place_id": place_id,
+        }}
+    )
+    return count
+
+
+def remove_anchor_examples_for_taxonomy(
+    session,
+    category_name: str,
+    taxonomy_id,  # UUID from SQLAlchemy model
+    business_type: str,
+) -> int:
+    """
+    Remove anchor examples that were learned from a specific taxonomy.
+
+    Called when a category is rejected. Only removes examples with
+    source_taxonomy_id matching the given taxonomy. If the anchor has
+    no remaining examples after removal, delete the anchor itself
+    (but only if source is 'correction' or 'learned', not 'seed' or 'import').
+
+    Returns number of examples removed.
+    """
+    anchor = session.query(CategoryAnchor).filter_by(
+        business_type=business_type,
+        category_name=category_name,
+    ).first()
+
+    if not anchor:
+        return 0
+
+    # Delete examples from this specific taxonomy
+    removed = session.query(AnchorExample).filter_by(
+        anchor_id=anchor.id,
+        source_taxonomy_id=taxonomy_id,
+    ).delete(synchronize_session=False)
+
+    if removed > 0:
+        remaining = session.query(AnchorExample).filter_by(
+            anchor_id=anchor.id
+        ).count()
+
+        if remaining == 0 and anchor.source in ('correction', 'learned'):
+            session.delete(anchor)
+            logger.info(f"Deleted empty anchor '{category_name}' after rejection")
+        else:
+            _recompute_anchor_centroid(session, anchor)
+            logger.info(
+                f"Removed {removed} examples from anchor '{category_name}', "
+                f"{remaining} remaining"
+            )
+
+    return removed
+
+
+def cleanup_orphaned_examples(session, taxonomy_id) -> int:
+    """
+    Remove anchor examples tied to a taxonomy that is being deleted/archived.
+
+    Called before a taxonomy is replaced (e.g., during import re-cluster).
+    Only removes examples with source='correction' and the matching
+    source_taxonomy_id. Learned examples from publish are kept because
+    they represent validated knowledge.
+
+    Uses the caller's session for transaction consistency.
+    Returns number of examples cleaned up.
+    """
+    examples = session.query(AnchorExample).filter_by(
+        source_taxonomy_id=taxonomy_id,
+        source='correction',
+    ).all()
+
+    if not examples:
+        return 0
+
+    anchor_ids = set(ex.anchor_id for ex in examples)
+
+    removed = session.query(AnchorExample).filter_by(
+        source_taxonomy_id=taxonomy_id,
+        source='correction',
+    ).delete(synchronize_session=False)
+
+    # Recompute centroids for affected anchors
+    for anchor_id in anchor_ids:
+        anchor = session.query(CategoryAnchor).filter_by(id=anchor_id).first()
+        if anchor:
+            remaining = session.query(AnchorExample).filter_by(anchor_id=anchor_id).count()
+            if remaining == 0 and anchor.source in ('correction', 'learned'):
+                session.delete(anchor)
+            else:
+                _recompute_anchor_centroid(session, anchor)
+
+    logger.info(f"Cleaned up {removed} orphaned correction examples for taxonomy {taxonomy_id}")
+    return removed
+
+
+def load_anchors_from_archive(place_id: str) -> list:
+    """
+    Load anchors from the most recent approved taxonomy archive for a place.
+
+    These provide continuity when a taxonomy is re-clustered: the system
+    remembers what categories the user previously approved.
+
+    Only uses the most recent archive that was in 'active' status at archival.
+
+    Returns list of anchor dicts compatible with classify_mentions_to_anchors().
+    """
+    session = SessionLocal()
+    try:
+        archive = session.query(TaxonomyArchive).filter_by(
+            place_id=place_id,
+        ).filter(
+            TaxonomyArchive.status_at_archive == 'active'
+        ).order_by(
+            TaxonomyArchive.created_at.desc()
+        ).first()
+
+        if not archive or not archive.snapshot:
+            return []
+
+        snapshot = archive.snapshot
+        approved_categories = [
+            c for c in snapshot.get("categories", [])
+            if c.get("is_approved")
+        ]
+
+        if not approved_categories:
+            return []
+
+        anchors = []
+        for cat in approved_categories:
+            cat_name = cat.get("name", "")
+            display_en = cat.get("display_name_en", "")
+            display_ar = cat.get("display_name_ar", "")
+            is_aspect = not cat.get("has_products", False)
+
+            # Use stored centroid embedding if available (avoids regeneration)
+            stored_centroid = cat.get("centroid_embedding")
+            if stored_centroid and isinstance(stored_centroid, list) and len(stored_centroid) > 0:
+                centroid = stored_centroid
+            else:
+                # Fallback: generate from display names (for old archives without centroid)
+                texts = []
+                if display_ar:
+                    texts.append(display_ar)
+                if display_en:
+                    texts.append(display_en)
+                if not texts:
+                    texts = [cat_name]
+
+                embeddings = embedding_client.generate_embeddings(texts)
+                if not embeddings:
+                    continue
+
+                valid_embs = [e for e in embeddings if e]
+                if not valid_embs:
+                    continue
+
+                centroid = np.mean(valid_embs, axis=0).tolist()
+
+            anchors.append({
+                "id": str(uuid.uuid4()),
+                "category_name": cat_name,
+                "display_name_en": display_en or cat_name,
+                "display_name_ar": display_ar or "",
+                "is_aspect": is_aspect,
+                "centroid_embedding": centroid,
+                "source": "archive",
+                "example_count": 1,
+                "match_count": 0,
+            })
+
+        logger.info(
+            f"Loaded {len(anchors)} anchors from archive for place {place_id}",
+            extra={"data": {"archive_id": str(archive.id)}}
+        )
+        return anchors
+
+    except Exception as e:
+        logger.error(f"Failed to load archive anchors: {e}")
+        return []
+    finally:
+        session.close()
 
 
 def _create_anchor_from_category(

@@ -730,6 +730,20 @@ async def update_category(
             category.rejection_reason = request.rejection_reason
             message = f"Category '{category.name}' rejected"
 
+            # Clean up anchor examples created from this taxonomy
+            try:
+                from anchor_manager import remove_anchor_examples_for_taxonomy, normalize_business_type
+                taxonomy = category.taxonomy
+                if taxonomy and taxonomy.place:
+                    bt = normalize_business_type(taxonomy.place.category)
+                    removed = remove_anchor_examples_for_taxonomy(
+                        session, category.name, category.taxonomy_id, bt
+                    )
+                    if removed > 0:
+                        message += f" ({removed} anchor examples cleaned)"
+            except Exception as e:
+                logger.warning(f"Failed to clean anchor on rejection: {e}")
+
         elif request.action == "move":
             category.parent_id = request.parent_id
             message = f"Category '{category.name}' moved"
@@ -804,6 +818,23 @@ async def update_product(
             product.is_approved = False
             product.rejection_reason = request.rejection_reason
             message = f"Product '{product.display_name or product.canonical_text}' rejected"
+
+            # Clean up anchor examples for the product's category
+            try:
+                from anchor_manager import remove_anchor_examples_for_taxonomy, normalize_business_type
+                if product.assigned_category_id:
+                    cat = session.query(TaxonomyCategory).filter_by(id=product.assigned_category_id).first()
+                    if cat:
+                        taxonomy = session.query(PlaceTaxonomy).filter_by(id=product.taxonomy_id).first()
+                        if taxonomy and taxonomy.place:
+                            bt = normalize_business_type(taxonomy.place.category)
+                            removed = remove_anchor_examples_for_taxonomy(
+                                session, cat.name, product.taxonomy_id, bt
+                            )
+                            if removed > 0:
+                                message += f" ({removed} anchor examples cleaned)"
+            except Exception as e:
+                logger.warning(f"Failed to clean anchor on product rejection: {e}")
 
         elif request.action == "move":
             old_category_id = product.assigned_category_id
@@ -1659,13 +1690,15 @@ async def get_orphan_mentions(
         is_draft = taxonomy.status != 'active'
 
         if is_draft:
-            # For DRAFT: orphans are those without discovered_product_id
+            # For DRAFT: orphans are those without discovered_product_id AND discovered_category_id
+            # If a product mention was moved to a category, it's no longer orphaned
             product_orphans_query = session.query(RawMention, Review).join(
                 Review, RawMention.review_id == Review.id
             ).filter(
                 RawMention.place_id.in_(place_ids),
                 RawMention.mention_type == 'product',
-                RawMention.discovered_product_id.is_(None)
+                RawMention.discovered_product_id.is_(None),
+                RawMention.discovered_category_id.is_(None)
             ).limit(limit).all()
 
             category_orphans_query = session.query(RawMention, Review).join(
@@ -1679,7 +1712,8 @@ async def get_orphan_mentions(
             total_product_orphans = session.query(RawMention).filter(
                 RawMention.place_id.in_(place_ids),
                 RawMention.mention_type == 'product',
-                RawMention.discovered_product_id.is_(None)
+                RawMention.discovered_product_id.is_(None),
+                RawMention.discovered_category_id.is_(None)
             ).count()
 
             total_category_orphans = session.query(RawMention).filter(
@@ -1688,13 +1722,15 @@ async def get_orphan_mentions(
                 RawMention.discovered_category_id.is_(None)
             ).count()
         else:
-            # For PUBLISHED: orphans are those without resolved_product_id
+            # For PUBLISHED: orphans are those without resolved_product_id AND resolved_category_id
+            # If a product mention was moved to a category, it's no longer orphaned
             product_orphans_query = session.query(RawMention, Review).join(
                 Review, RawMention.review_id == Review.id
             ).filter(
                 RawMention.place_id.in_(place_ids),
                 RawMention.mention_type == 'product',
-                RawMention.resolved_product_id.is_(None)
+                RawMention.resolved_product_id.is_(None),
+                RawMention.resolved_category_id.is_(None)
             ).limit(limit).all()
 
             category_orphans_query = session.query(RawMention, Review).join(
@@ -1708,7 +1744,8 @@ async def get_orphan_mentions(
             total_product_orphans = session.query(RawMention).filter(
                 RawMention.place_id.in_(place_ids),
                 RawMention.mention_type == 'product',
-                RawMention.resolved_product_id.is_(None)
+                RawMention.resolved_product_id.is_(None),
+                RawMention.resolved_category_id.is_(None)
             ).count()
 
             total_category_orphans = session.query(RawMention).filter(
@@ -1892,14 +1929,15 @@ async def get_grouped_orphan_mentions(
         place_ids = taxonomy.all_place_ids
         is_draft = taxonomy.status != 'active'
 
-        # Query product orphans
+        # Query product orphans (not assigned to product OR category)
         if is_draft:
             product_orphans_query = session.query(RawMention, Review).join(
                 Review, RawMention.review_id == Review.id
             ).filter(
                 RawMention.place_id.in_(place_ids),
                 RawMention.mention_type == 'product',
-                RawMention.discovered_product_id.is_(None)
+                RawMention.discovered_product_id.is_(None),
+                RawMention.discovered_category_id.is_(None)
             ).all()
 
             category_orphans_query = session.query(RawMention, Review).join(
@@ -1915,7 +1953,8 @@ async def get_grouped_orphan_mentions(
             ).filter(
                 RawMention.place_id.in_(place_ids),
                 RawMention.mention_type == 'product',
-                RawMention.resolved_product_id.is_(None)
+                RawMention.resolved_product_id.is_(None),
+                RawMention.resolved_category_id.is_(None)
             ).all()
 
             category_orphans_query = session.query(RawMention, Review).join(
@@ -2046,11 +2085,29 @@ async def bulk_move_mentions(
                 # Log but don't fail the move operation
                 logger.warning(f"Failed to learn from corrections: {e}")
 
+        # Update Qdrant PRODUCTS_COLLECTION with correction vectors
+        # Only for active taxonomies (draft has no published vectors)
+        qdrant_updated = 0
+        if moved_count > 0 and taxonomy.status == 'active':
+            try:
+                from anchor_manager import update_product_vectors_from_corrections
+                qdrant_updated = update_product_vectors_from_corrections(
+                    session=session,
+                    mention_ids=request.mention_ids,
+                    target_type=request.target_type,
+                    target_id=request.target_id,
+                    taxonomy=taxonomy,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to update product vectors: {e}")
+
         session.commit()
 
         message = f"Moved {moved_count} mentions to {target_name}"
         if learned_count > 0:
             message += f" (learned {learned_count} new patterns)"
+        if qdrant_updated > 0:
+            message += f" (+{qdrant_updated} vectors updated)"
 
         return BulkMoveMentionsResponse(
             success=True,
@@ -2484,6 +2541,7 @@ async def import_taxonomy(
                     "source": c.source,
                     "is_approved": c.is_approved,
                     "mention_count": c.mention_count,
+                    "centroid_embedding": c.centroid_embedding,
                 }
                 for c in categories
             ],
@@ -2526,6 +2584,16 @@ async def import_taxonomy(
         )
 
         session.commit()
+
+        # Clean up speculative correction examples from the old taxonomy
+        try:
+            from anchor_manager import cleanup_orphaned_examples
+            cleaned = cleanup_orphaned_examples(session, taxonomy_id)
+            if cleaned > 0:
+                session.commit()
+                logger.info(f"Cleaned {cleaned} correction examples before re-cluster")
+        except Exception as e:
+            logger.warning(f"Failed to clean orphaned examples: {e}")
 
         # Step 2: Generate anchors from import data (returns anchors + hierarchy info)
         import_dicts = [cat.model_dump() for cat in request.categories]

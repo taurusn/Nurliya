@@ -239,7 +239,7 @@ def upsert_vector(
 
 def upsert_vectors_batch(
     collection_name: str,
-    vectors: List[Tuple[str, List[float], VectorPayload]],
+    vectors: List[Tuple[str, List[float], Union[VectorPayload, TaxonomyVectorPayload]]],
     batch_size: int = 100,
 ) -> int:
     """
