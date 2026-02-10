@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Image struct {
@@ -479,10 +480,17 @@ func parseReviews(reviewsI []any) []Review {
 			}
 		}
 
-		// Try multiple paths for the timestamp
-		time := getNthElementAndCast[[]any](el, 2, 2, 0, 1, 21, 6, 8)
-		if len(time) == 0 {
-			time = getNthElementAndCast[[]any](el, 2, 2, 0, 1, 6, 8)
+		// Try multiple paths for the timestamp date array [year, month, day]
+		timeArr := getNthElementAndCast[[]any](el, 2, 2, 0, 1, 21, 6, 8)
+		if len(timeArr) == 0 {
+			timeArr = getNthElementAndCast[[]any](el, 2, 2, 0, 1, 6, 8)
+		}
+
+		// Fallback: extract unix microsecond timestamp from el[1][2]
+		// This is the most reliable path — present on every review
+		var unixMicro float64
+		if len(timeArr) < 3 {
+			unixMicro = getNthElementAndCast[float64](el, 1, 2)
 		}
 
 		// Try multiple paths for profile picture
@@ -525,11 +533,15 @@ func parseReviews(reviewsI []any) []Review {
 			Name:           authorName,
 			ProfilePicture: profilePic,
 			When: func() string {
-				if len(time) < 3 {
-					return ""
+				if len(timeArr) >= 3 {
+					return fmt.Sprintf("%v-%v-%v", timeArr[0], timeArr[1], timeArr[2])
 				}
-
-				return fmt.Sprintf("%v-%v-%v", time[0], time[1], time[2])
+				// Fallback: convert unix microseconds to date
+				if unixMicro > 0 {
+					t := time.Unix(int64(unixMicro)/1e6, 0).UTC()
+					return fmt.Sprintf("%d-%d-%d", t.Year(), int(t.Month()), t.Day())
+				}
+				return ""
 			}(),
 			Rating:      rating,
 			Description: description,

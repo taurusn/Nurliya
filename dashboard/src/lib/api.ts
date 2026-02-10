@@ -32,8 +32,17 @@ export interface PipelineStageStatus {
   reviews_count: number
   mentions_count: number
   analyses_count: number
+  analyzable_reviews: number
   taxonomy_status: string | null
   taxonomy_id: string | null
+  stages: {
+    scraping: { reviews: number }
+    extracting: { mentions: number; reviews: number }
+    clustering: { mentions: number }
+    approving: { approved: number; total: number }
+    analyzing: { analyzed: number; total: number }
+    complete: { reviews: number; mentions: number; analyzed: number }
+  }
 }
 
 export async function fetchPipelineStatus(placeId?: string): Promise<PipelineStageStatus | { places: PipelineStageStatus[] }> {

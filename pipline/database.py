@@ -15,7 +15,7 @@ from config import DATABASE_URL
 
 logger = get_logger(__name__, service="database")
 
-engine = create_engine(DATABASE_URL)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=5, max_overflow=10)
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
@@ -113,6 +113,9 @@ class ReviewAnalysis(Base):
     summary_ar = Column(Text)
     summary_en = Column(Text)
     suggested_reply_ar = Column(Text)
+    needs_action = Column(Boolean, default=False)
+    action_ar = Column(Text)
+    action_en = Column(Text)
     raw_response = Column(JSONB)
     analyzed_at = Column(TIMESTAMP, default=datetime.utcnow)
 
@@ -347,6 +350,12 @@ class RawMention(Base):
         Index('ix_raw_mentions_resolved_category', 'resolved_category_id'),
         Index('ix_raw_mentions_discovered_product', 'discovered_product_id'),
         Index('ix_raw_mentions_discovered_category', 'discovered_category_id'),
+        # Composite indexes for grouped mention queries
+        Index('ix_raw_mentions_place_disc_cat', 'place_id', 'discovered_category_id'),
+        Index('ix_raw_mentions_place_disc_prod', 'place_id', 'discovered_product_id'),
+        Index('ix_raw_mentions_place_res_cat', 'place_id', 'resolved_category_id'),
+        Index('ix_raw_mentions_place_res_prod', 'place_id', 'resolved_product_id'),
+        Index('ix_raw_mentions_place_type', 'place_id', 'mention_type'),
     )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

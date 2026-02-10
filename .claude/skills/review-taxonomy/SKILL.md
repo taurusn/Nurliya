@@ -71,10 +71,12 @@ Review the taxonomy tree and identify ALL issues. Check for:
 1. **Empty categories** — 0 mentions AND 0 products. Candidate for rejection.
 2. **Duplicate categories** — Same or very similar Arabic/English names.
 3. **Misplaced hierarchy** — Categories under the wrong parent (e.g. desserts under coffee should be standalone).
-4. **Wrong naming** — Clustering artifacts, unclear names, missing Arabic names.
+4. **Missing Arabic names** — Categories with only English names. (Do NOT rename product display_names — they are raw extracted text from customer reviews and should stay as-is.)
 5. **Missing categories** — Expected categories for the business type that are absent.
 6. **Over-fragmented** — Multiple categories that should be one (e.g. "coffee_quality" + "coffee_taste").
 7. **Products in wrong category** — Product name clearly belongs elsewhere.
+8. **Dirty variants** — HDBSCAN clustering artifacts in product variant lists (e.g. "تيشيرت" as variant of "كورتادو"). These pollute taxonomy-aware sentiment analysis prompts.
+9. **Mega-categories** — One category with too many unrelated products dumped together. Needs splitting.
 
 ### Business Type Heuristics
 
@@ -245,6 +247,30 @@ Report total resolved per type.
 
 ---
 
+## Step 6b: Clean Dirty Variants
+
+After moving mentions and handling orphans, review product variant lists for clustering artifacts.
+
+For each product with variants, check if every variant is truly an alternative name for the same product.
+
+Common problems:
+- Unrelated products grouped by HDBSCAN (e.g. "ماتيلدا كيك" as variant of "كورتادو")
+- Generic words (e.g. "القهاوي" as variant of "اسبرسو")
+- Different drink types (e.g. "Iced Latte" as variant of "قهوة اليوم")
+
+Use the API to remove bad variants and set clean ones:
+```
+PATCH /api/onboarding/products/{product_id}
+Body: {"action": "remove_variant", "variant": "bad variant text"}
+
+PATCH /api/onboarding/products/{product_id}
+Body: {"action": "set_variants", "variants": ["clean", "list", "only"]}
+```
+
+Present the variant cleanup plan and WAIT for user confirmation before executing.
+
+---
+
 ## Step 7: Final Verification
 
 1. Re-fetch taxonomy:
@@ -286,14 +312,18 @@ Total mutations performed: 42
 ## Rules
 
 1. **NEVER mutate without presenting the plan and getting user confirmation first.**
-2. **Arabic first** — `display_name_ar` is the PRIMARY display. Always show it first, English in parentheses.
-3. **curl format** — All API calls: `curl -s -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json"`
-4. **python3 for JSON** — Always parse JSON with python3, not jq. Handles Arabic text and Unicode correctly.
-5. **Error handling** — On API error, show the full error response and ask the user how to proceed. Don't silently skip.
-6. **Merge survivors** — For merges, the target (survivor) should be the item with: Arabic name preferred, more mentions preferred, cleaner display name.
-7. **Category names** — The `name` field in create requests must be lowercase_with_underscores.
-8. **Bilingual** — Always provide both `display_name_en` and `display_name_ar` when creating categories.
-9. **Top-level** — Use `"parent_id": null` in move requests to make a category standalone.
-10. **Product moves** — Use `assigned_category_id` field (NOT `category_id`) when moving products.
-11. **Mutation count** — Keep a running count of all mutations and report at the end.
-12. **Batch processing** — Process categories in batches of 3-5 when reviewing mentions to keep output manageable.
+2. **NEVER approve or publish** — only the user decides when to approve/publish.
+3. **Arabic first** — `display_name_ar` is the PRIMARY display. Always show it first, English in parentheses.
+4. **Product names are sacred** — `display_name` comes from customer reviews. NEVER rename products. Only clean variants and move between categories.
+5. **curl format** — All API calls: `curl -s -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json"`
+6. **python3 for JSON** — Always parse JSON with python3, not jq. Handles Arabic text and Unicode correctly.
+7. **ALWAYS use full UUIDs** — When fetching taxonomy, save the full JSON and extract complete UUIDs. NEVER truncate or guess IDs. Re-fetch the taxonomy before bulk operations to get fresh IDs.
+8. **Error handling** — On API error, show the full error response and ask the user how to proceed. Don't silently skip.
+9. **Merge survivors** — For merges, the target (survivor) should be the item with: Arabic name preferred, more mentions preferred, cleaner display name.
+10. **Category names** — The `name` field in create requests must be lowercase_with_underscores.
+11. **Bilingual** — Always provide both `display_name_en` and `display_name_ar` when creating categories.
+12. **Top-level** — Use `"parent_id": null` in move requests to make a category standalone.
+13. **Product moves** — Use `assigned_category_id` field (NOT `category_id`) when moving products.
+14. **Mutation count** — Keep a running count of all mutations and report at the end.
+15. **Batch processing** — Process categories in batches of 3-5 when reviewing mentions to keep output manageable.
+16. **Self-review** — After completing reorganization, critically review your own work: check for dirty variants, misplaced products, and clustering artifacts before presenting the final summary.

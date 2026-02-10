@@ -150,7 +150,7 @@ Orphans are mentions not assigned to any active category or product.
 
 ## Mutation Endpoints
 
-### Update Product (Move / Approve / Reject / Add Variant)
+### Update Product (Move / Approve / Reject / Add Variant / Remove Variant / Set Variants)
 ```
 PATCH /api/onboarding/products/{product_id}
 
@@ -165,6 +165,12 @@ Body (reject):
 
 Body (add variant):
 {"action": "add_variant", "variant": "الكابتشينو"}
+
+Body (remove variant):
+{"action": "remove_variant", "variant": "bad variant text"}
+
+Body (set variants — replace entire list):
+{"action": "set_variants", "variants": ["clean", "variant", "list"]}
 
 Response: {"success": true, "message": "Product 'كابتشينو' moved"}
 ```

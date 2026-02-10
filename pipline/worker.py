@@ -753,6 +753,9 @@ def save_analysis(review_id: str, analysis: dict):
             summary_ar=analysis.get("summary_ar"),
             summary_en=analysis.get("summary_en"),
             suggested_reply_ar=analysis.get("suggested_reply_ar"),
+            needs_action=analysis.get("needs_action", False),
+            action_ar=analysis.get("action_ar"),
+            action_en=analysis.get("action_en"),
             raw_response=analysis,
         )
         session.add(review_analysis)
@@ -809,9 +812,9 @@ def process_message(ch, method, properties, body):
             return
 
         # Determine processing mode
-        # Environment variable overrides message mode for backward compatibility
+        # Environment variable overrides "full" mode only — explicit "sentiment" from publish is never blocked
         extraction_only_env = os.environ.get("EXTRACTION_ONLY_MODE", "").lower() == "true"
-        if extraction_only_env:
+        if extraction_only_env and mode == "full":
             mode = "extraction"
 
         # Mode: extraction - Only extract mentions, skip sentiment analysis

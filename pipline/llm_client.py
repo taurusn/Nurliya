@@ -51,6 +51,14 @@ SUGGESTED REPLY GUIDELINES:
 - Keep under 50 words
 - Do not be defensive or make excuses
 
+ACTION NOTE GUIDELINES (internal note for business owner, NOT for the customer):
+- Set needs_action=true ONLY for negative or urgent reviews that warrant a follow-up action
+- For positive/neutral reviews, set needs_action=false and leave action_ar/action_en as empty strings
+- Suggest specific compensation when appropriate: free item, discount, invitation to revisit
+- Flag for manager escalation if health/safety related
+- Keep concise (under 20 words)
+- Examples: "تعويض بقهوة مجانية" / "Offer free coffee as compensation"
+
 OUTPUT FORMAT:
 Return ONLY valid JSON with this exact structure (no markdown, no explanation):
 {
@@ -62,7 +70,10 @@ Return ONLY valid JSON with this exact structure (no markdown, no explanation):
   "urgent": true | false,
   "summary_ar": "ملخص بالعربي",
   "summary_en": "English summary",
-  "suggested_reply_ar": "رد مقترح بالسعودي"
+  "suggested_reply_ar": "رد مقترح بالسعودي",
+  "needs_action": true | false,
+  "action_ar": "ملاحظة داخلية للإدارة أو فارغ",
+  "action_en": "Internal action note or empty string"
 }"""
 
 
@@ -350,6 +361,14 @@ Set urgent=true if:
 - Review mentions health/safety issue
 - Review threatens to report or escalate
 
+ACTION NOTE GUIDELINES (internal note for business owner, NOT for the customer):
+- Set needs_action=true ONLY for negative or urgent reviews that warrant a follow-up action
+- For positive/neutral reviews, set needs_action=false and leave action_ar/action_en as empty strings
+- Reference the SPECIFIC product or category when suggesting compensation (e.g., "تعويض بـ Spanish Latte مجاني")
+- Suggest specific compensation when appropriate: free item, discount, invitation to revisit
+- Flag for manager escalation if health/safety related
+- Keep concise (under 20 words)
+
 OUTPUT FORMAT:
 Return ONLY valid JSON (no markdown, no explanation):
 {
@@ -365,7 +384,10 @@ Return ONLY valid JSON (no markdown, no explanation):
   "urgent": true | false,
   "summary_ar": "ملخص يذكر المنتجات المحددة بالاسم",
   "summary_en": "Summary mentioning specific product names",
-  "suggested_reply_ar": "رد يذكر المنتج أو المشكلة المحددة"
+  "suggested_reply_ar": "رد يذكر المنتج أو المشكلة المحددة",
+  "needs_action": true | false,
+  "action_ar": "ملاحظة داخلية للإدارة أو فارغ",
+  "action_en": "Internal action note or empty string"
 }
 
 NOTE: For matched_products and matched_categories, specify the sentiment for EACH item

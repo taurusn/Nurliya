@@ -1,11 +1,14 @@
 """
 Embedding client for generating text embeddings with Arabic support.
 Uses sentence-transformers with multilingual model.
+
+Includes an in-memory embedding cache to avoid recomputing embeddings
+for the same normalized text (used heavily by mention grouping).
 """
 
 import re
 import unicodedata
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from logging_config import get_logger
 from config import EMBEDDING_MODEL, EMBEDDING_DIMENSION
@@ -15,6 +18,11 @@ logger = get_logger(__name__, service="embedding")
 # Lazy load model to avoid import overhead
 _model = None
 _model_load_attempted = False
+
+# In-memory cache: normalized_text -> embedding vector
+# MiniLM embeddings are 384 floats (~3KB each), 1000 entries ≈ 3MB
+_embedding_cache: Dict[str, List[float]] = {}
+EMBEDDING_CACHE_MAX_SIZE = 2000
 
 
 def _get_model():
@@ -134,7 +142,7 @@ def normalize_for_embedding(text: str) -> str:
 
 def generate_embedding(text: str, normalize: bool = True) -> Optional[List[float]]:
     """
-    Generate embedding for a single text.
+    Generate embedding for a single text. Uses in-memory cache.
 
     Args:
         text: Input text to embed
@@ -155,9 +163,15 @@ def generate_embedding(text: str, normalize: bool = True) -> Optional[List[float
         logger.warning("Empty text after normalization, returning zero vector")
         return [0.0] * EMBEDDING_DIMENSION
 
+    # Check cache
+    if text in _embedding_cache:
+        return _embedding_cache[text]
+
     try:
         embedding = model.encode(text, convert_to_numpy=True)
-        return embedding.tolist()
+        result = embedding.tolist()
+        _cache_embedding(text, result)
+        return result
     except Exception as e:
         logger.error(f"Failed to generate embedding: {e}")
         return None
@@ -166,6 +180,7 @@ def generate_embedding(text: str, normalize: bool = True) -> Optional[List[float
 def generate_embeddings(texts: List[str], normalize: bool = True, batch_size: int = 32) -> Optional[List[List[float]]]:
     """
     Generate embeddings for multiple texts (batch processing).
+    Uses in-memory cache — only computes embeddings for uncached texts.
 
     Args:
         texts: List of input texts
@@ -184,24 +199,52 @@ def generate_embeddings(texts: List[str], normalize: bool = True, batch_size: in
         return []
 
     if normalize:
-        texts = [normalize_for_embedding(t) for t in texts]
+        normalized = [normalize_for_embedding(t) for t in texts]
+    else:
+        normalized = list(texts)
 
-    # Replace empty strings with placeholder to maintain index alignment
-    processed_texts = [t if t else " " for t in texts]
+    # Split into cached and uncached
+    results: List[Optional[List[float]]] = [None] * len(normalized)
+    uncached_texts = []
+    uncached_indices = []
 
-    try:
-        embeddings = model.encode(processed_texts, convert_to_numpy=True, batch_size=batch_size)
-        result = embeddings.tolist()
+    for i, t in enumerate(normalized):
+        if not t:
+            results[i] = [0.0] * EMBEDDING_DIMENSION
+        elif t in _embedding_cache:
+            results[i] = _embedding_cache[t]
+        else:
+            uncached_texts.append(t)
+            uncached_indices.append(i)
 
-        # Zero out embeddings for originally empty texts
-        for i, original in enumerate(texts):
-            if not original:
-                result[i] = [0.0] * EMBEDDING_DIMENSION
+    # Only call model.encode for uncached texts
+    if uncached_texts:
+        try:
+            new_embeddings = model.encode(uncached_texts, convert_to_numpy=True, batch_size=batch_size)
+            for idx, emb in zip(uncached_indices, new_embeddings):
+                emb_list = emb.tolist()
+                results[idx] = emb_list
+                _cache_embedding(normalized[idx], emb_list)
+        except Exception as e:
+            logger.error(f"Failed to generate batch embeddings: {e}")
+            return None
 
-        return result
-    except Exception as e:
-        logger.error(f"Failed to generate batch embeddings: {e}")
-        return None
+    cache_hits = len(normalized) - len(uncached_texts)
+    if cache_hits > 0:
+        logger.debug(f"Embedding cache: {cache_hits}/{len(normalized)} hits, {len(uncached_texts)} computed")
+
+    return results
+
+
+def _cache_embedding(text: str, embedding: List[float]):
+    """Add an embedding to the cache, evicting oldest entries if full."""
+    if len(_embedding_cache) >= EMBEDDING_CACHE_MAX_SIZE:
+        # Evict ~10% of oldest entries (dict preserves insertion order in Python 3.7+)
+        evict_count = EMBEDDING_CACHE_MAX_SIZE // 10
+        keys_to_evict = list(_embedding_cache.keys())[:evict_count]
+        for k in keys_to_evict:
+            del _embedding_cache[k]
+    _embedding_cache[text] = embedding
 
 
 def compute_similarity(embedding1: List[float], embedding2: List[float]) -> float:

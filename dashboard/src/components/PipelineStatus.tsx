@@ -25,6 +25,26 @@ const STAGES = [
   { key: 'complete', label: 'Done', icon: CheckCircle },
 ] as const
 
+function getStageDetail(stageKey: string, stages: PipelineStageStatus['stages'] | undefined): string {
+  if (!stages) return ''
+  switch (stageKey) {
+    case 'scraping':
+      return stages.scraping.reviews > 0 ? `${stages.scraping.reviews}` : ''
+    case 'extracting':
+      return stages.extracting.mentions > 0 ? `${stages.extracting.mentions}/${stages.extracting.reviews}` : ''
+    case 'clustering':
+      return stages.clustering.mentions > 0 ? `${stages.clustering.mentions}` : ''
+    case 'approving':
+      return stages.approving.total > 0 ? `${stages.approving.approved}/${stages.approving.total}` : ''
+    case 'analyzing':
+      return stages.analyzing.total > 0 ? `${stages.analyzing.analyzed}/${stages.analyzing.total}` : ''
+    case 'complete':
+      return stages.complete.analyzed > 0 ? `${stages.complete.analyzed}` : ''
+    default:
+      return ''
+  }
+}
+
 type StageKey = typeof STAGES[number]['key']
 
 function getStageIndex(stage: string): number {
@@ -60,6 +80,7 @@ export function PipelineStatus({ stats, pipelineStatus }: PipelineStatusProps) {
           const isComplete = index < currentStageIndex
           const isFuture = index > currentStageIndex
 
+          const detail = getStageDetail(stage.key, pipelineStatus?.stages)
           return (
             <div key={stage.key} className="flex items-center">
               <div className="flex flex-col items-center">
@@ -92,6 +113,17 @@ export function PipelineStatus({ stats, pipelineStatus }: PipelineStatusProps) {
                 >
                   {stage.label}
                 </span>
+                {(isComplete || isActive) && detail && (
+                  <span
+                    className={cn(
+                      "text-[9px] font-mono",
+                      isComplete && "text-success/70",
+                      isActive && "text-blue-400/80"
+                    )}
+                  >
+                    {detail}
+                  </span>
+                )}
               </div>
               {index < STAGES.length - 1 && (
                 <div

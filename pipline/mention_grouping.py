@@ -3,9 +3,12 @@ Mention Grouping Utilities
 
 Groups mentions by normalized text and merges similar groups using embedding similarity.
 Handles Arabic text normalization (harakat, hamza variants, etc.)
+Includes result-level caching to avoid reprocessing unchanged mention sets.
 """
 
+import hashlib
 import re
+import time
 import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -15,6 +18,11 @@ from sklearn.cluster import DBSCAN
 import numpy as np
 
 from embedding_client import normalize_arabic, generate_embeddings, compute_similarity
+
+# Result-level cache: hash of mention IDs → (groups, total_mentions, total_groups, timestamp)
+_grouping_cache: Dict[str, Tuple[List, int, int, float]] = {}
+GROUPING_CACHE_MAX_SIZE = 100
+GROUPING_CACHE_TTL = 300  # 5 minutes
 
 
 # Grouping similarity threshold — must be high enough to avoid merging
@@ -301,12 +309,20 @@ def merge_similar_groups(
     return result_groups
 
 
+def _compute_cache_key(mentions: List[MentionData]) -> str:
+    """Compute a stable cache key from mention IDs."""
+    id_str = ",".join(sorted(m.id for m in mentions))
+    return hashlib.md5(id_str.encode()).hexdigest()
+
+
 def group_mentions(
     mentions: List[MentionData],
     similarity_threshold: float = GROUP_SIMILARITY_THRESHOLD
 ) -> Tuple[List[MentionGroup], int, int]:
     """
     Main entry point: Group mentions by normalized text, then merge similar groups.
+    Uses result-level caching — if the same set of mentions is queried again
+    within the TTL, returns cached results instantly.
 
     Args:
         mentions: List of MentionData objects
@@ -318,10 +334,29 @@ def group_mentions(
     if not mentions:
         return [], 0, 0
 
+    # Check result cache
+    cache_key = _compute_cache_key(mentions)
+    now = time.time()
+    if cache_key in _grouping_cache:
+        groups, total_mentions, total_groups, cached_at = _grouping_cache[cache_key]
+        if now - cached_at < GROUPING_CACHE_TTL:
+            return groups, total_mentions, total_groups
+
     # Step 1: Group by exact normalized text
     text_groups = group_mentions_by_text(mentions)
 
     # Step 2: Merge similar groups using embeddings
     merged_groups = merge_similar_groups(text_groups, similarity_threshold)
+
+    # Cache the result
+    if len(_grouping_cache) >= GROUPING_CACHE_MAX_SIZE:
+        # Evict expired entries, then oldest if still full
+        expired = [k for k, v in _grouping_cache.items() if now - v[3] >= GROUPING_CACHE_TTL]
+        for k in expired:
+            del _grouping_cache[k]
+        if len(_grouping_cache) >= GROUPING_CACHE_MAX_SIZE:
+            oldest = min(_grouping_cache, key=lambda k: _grouping_cache[k][3])
+            del _grouping_cache[oldest]
+    _grouping_cache[cache_key] = (merged_groups, len(mentions), len(merged_groups), now)
 
     return merged_groups, len(mentions), len(merged_groups)

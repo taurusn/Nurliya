@@ -104,6 +104,9 @@ async def poll_database():
                     # Broadcast stats update
                     places_count = session.query(Place).count()
                     reviews_count = session.query(Review).count()
+                    analyzable_count = session.query(Review).filter(
+                        Review.text.isnot(None), Review.text != ''
+                    ).count()
                     analyses_count = session.query(ReviewAnalysis).count()
                     mentions_count = session.query(RawMention).count()
 
@@ -170,7 +173,7 @@ async def poll_database():
                             "reviews_count": reviews_count,
                             "analyses_count": analyses_count,
                             "mentions_count": mentions_count,
-                            "pending_analyses": reviews_count - analyses_count,
+                            "pending_analyses": max(0, analyzable_count - analyses_count),
                             "queue_messages": queue_messages,
                             "queue_consumers": queue_consumers,
                             "scrape_jobs": {
@@ -230,6 +233,13 @@ async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
     logger.info("Starting Nurliya API...")
     create_tables()
+    # Pre-load embedding model to avoid cold start on first request
+    try:
+        from embedding_client import _get_model
+        _get_model()
+        logger.info("Embedding model pre-loaded")
+    except Exception as e:
+        logger.warning(f"Failed to pre-load embedding model: {e}")
     # Start background polling task
     poll_task = asyncio.create_task(poll_database())
     logger.info("API started successfully")
@@ -364,6 +374,9 @@ class ReviewAnalysisData(BaseModel):
     summary_ar: Optional[str]
     summary_en: Optional[str]
     suggested_reply_ar: Optional[str]
+    needs_action: bool = False
+    action_ar: Optional[str]
+    action_en: Optional[str]
 
 
 class ReviewWithAnalysis(BaseModel):
@@ -408,10 +421,11 @@ class CategoryUpdateRequest(BaseModel):
 
 class ProductUpdateRequest(BaseModel):
     """Request to update a taxonomy product."""
-    action: str = Field(..., description="Action: approve, reject, move, add_variant")
+    action: str = Field(..., description="Action: approve, reject, move, add_variant, remove_variant, set_variants")
     rejection_reason: Optional[str] = Field(None, description="Required if action=reject")
     assigned_category_id: Optional[UUID] = Field(None, description="Category ID if action=move (None=standalone)")
-    variant: Optional[str] = Field(None, description="Variant text if action=add_variant")
+    variant: Optional[str] = Field(None, description="Variant text if action=add_variant or remove_variant")
+    variants: Optional[List[str]] = Field(None, description="Full variant list if action=set_variants")
 
 
 class CategoryCreateRequest(BaseModel):
@@ -869,6 +883,23 @@ async def update_product(
                 variants.append(request.variant)
                 product.variants = variants
             message = f"Variant '{request.variant}' added"
+
+        elif request.action == "remove_variant":
+            if not request.variant:
+                raise HTTPException(status_code=400, detail="Variant text required")
+            variants = product.variants or []
+            if request.variant in variants:
+                variants.remove(request.variant)
+                product.variants = variants
+                message = f"Variant '{request.variant}' removed"
+            else:
+                raise HTTPException(status_code=400, detail=f"Variant '{request.variant}' not found in product variants")
+
+        elif request.action == "set_variants":
+            if request.variants is None:
+                raise HTTPException(status_code=400, detail="Variants list required")
+            product.variants = request.variants
+            message = f"Variants updated ({len(request.variants)} variants)"
 
         else:
             raise HTTPException(status_code=400, detail=f"Unknown action: {request.action}")
@@ -2022,20 +2053,55 @@ async def bulk_move_mentions(
 
         is_draft = taxonomy.status != 'active'
 
+        # Snapshot source assignments BEFORE the move so we can decrement their counts
+        mentions = session.query(RawMention).filter(
+            RawMention.id.in_(request.mention_ids)
+        ).all()
+
+        if is_draft:
+            source_product_counts = {}
+            source_category_counts = {}
+            for m in mentions:
+                if m.discovered_product_id:
+                    pid = m.discovered_product_id
+                    source_product_counts[pid] = source_product_counts.get(pid, 0) + 1
+                if m.discovered_category_id:
+                    cid = m.discovered_category_id
+                    source_category_counts[cid] = source_category_counts.get(cid, 0) + 1
+        else:
+            source_product_counts = {}
+            source_category_counts = {}
+            for m in mentions:
+                if m.resolved_product_id:
+                    pid = m.resolved_product_id
+                    source_product_counts[pid] = source_product_counts.get(pid, 0) + 1
+                if m.resolved_category_id:
+                    cid = m.resolved_category_id
+                    source_category_counts[cid] = source_category_counts.get(cid, 0) + 1
+
         # Update mentions
+        # When moving to a category: update category AND clear product link
+        # When moving to a product: update product AND set category to product's category
         if request.target_type == 'product':
+            product_category_id = target.assigned_category_id or target.discovered_category_id
             if is_draft:
                 moved_count = session.query(RawMention).filter(
                     RawMention.id.in_(request.mention_ids)
                 ).update(
-                    {RawMention.discovered_product_id: request.target_id},
+                    {
+                        RawMention.discovered_product_id: request.target_id,
+                        RawMention.discovered_category_id: product_category_id,
+                    },
                     synchronize_session=False
                 )
             else:
                 moved_count = session.query(RawMention).filter(
                     RawMention.id.in_(request.mention_ids)
                 ).update(
-                    {RawMention.resolved_product_id: request.target_id},
+                    {
+                        RawMention.resolved_product_id: request.target_id,
+                        RawMention.resolved_category_id: product_category_id,
+                    },
                     synchronize_session=False
                 )
         else:
@@ -2043,22 +2109,53 @@ async def bulk_move_mentions(
                 moved_count = session.query(RawMention).filter(
                     RawMention.id.in_(request.mention_ids)
                 ).update(
-                    {RawMention.discovered_category_id: request.target_id},
+                    {
+                        RawMention.discovered_category_id: request.target_id,
+                        RawMention.discovered_product_id: None,
+                    },
                     synchronize_session=False
                 )
             else:
                 moved_count = session.query(RawMention).filter(
                     RawMention.id.in_(request.mention_ids)
                 ).update(
-                    {RawMention.resolved_category_id: request.target_id},
+                    {
+                        RawMention.resolved_category_id: request.target_id,
+                        RawMention.resolved_product_id: None,
+                    },
                     synchronize_session=False
                 )
 
-        # Update mention counts on target
-        if request.target_type == 'product':
-            target.discovered_mention_count = (target.discovered_mention_count or 0) + moved_count
-        else:
-            target.discovered_mention_count = (target.discovered_mention_count or 0) + moved_count
+        # Decrement counts on sources
+        for pid, count in source_product_counts.items():
+            if pid != request.target_id:  # Don't decrement if moving within same product
+                source_prod = session.query(TaxonomyProduct).filter_by(id=pid).first()
+                if source_prod:
+                    source_prod.discovered_mention_count = max(0, (source_prod.discovered_mention_count or 0) - count)
+
+        for cid, count in source_category_counts.items():
+            target_cat_id = request.target_id if request.target_type == 'category' else product_category_id
+            if cid != target_cat_id:  # Don't decrement if moving within same category
+                source_cat = session.query(TaxonomyCategory).filter_by(id=cid).first()
+                if source_cat:
+                    source_cat.discovered_mention_count = max(0, (source_cat.discovered_mention_count or 0) - count)
+
+        # Increment count on target
+        target.discovered_mention_count = (target.discovered_mention_count or 0) + moved_count
+
+        # When moving to a product, also increment the product's category count
+        # for mentions that came from a different category
+        if request.target_type == 'product' and product_category_id:
+            cat_increment = 0
+            for cid, count in source_category_counts.items():
+                if cid != product_category_id:
+                    cat_increment += count
+            # Also count mentions that had no source category
+            cat_increment += moved_count - sum(source_category_counts.values())
+            if cat_increment > 0:
+                target_cat = session.query(TaxonomyCategory).filter_by(id=product_category_id).first()
+                if target_cat:
+                    target_cat.discovered_mention_count = (target_cat.discovered_mention_count or 0) + cat_increment
 
         # Log the action
         target_name = target.display_name if request.target_type == 'product' else (target.display_name_en or target.name)
@@ -2900,9 +2997,10 @@ async def publish_taxonomy(
                          extra={"extra_data": {"taxonomy_id": str(taxonomy_id)}})
 
         # Queue reviews for sentiment analysis now that taxonomy is active
-        # Fetch all reviews for this place that don't have analysis yet
+        # Fetch all reviews for ALL places in this taxonomy that don't have analysis yet
+        all_place_ids = taxonomy.all_place_ids
         reviews_to_analyze = session.query(Review).filter(
-            Review.place_id == taxonomy.place_id,
+            Review.place_id.in_(all_place_ids),
             Review.job_id.isnot(None)  # Must have a job_id
         ).outerjoin(ReviewAnalysis, Review.id == ReviewAnalysis.review_id).filter(
             ReviewAnalysis.id.is_(None)  # No existing analysis
@@ -3337,11 +3435,17 @@ async def get_stats(place_id: Optional[str] = None):
             place_uuid = UUID(place_id)
             places_count = 1
             reviews_count = session.query(Review).join(Job).filter(Job.place_id == place_uuid).count()
+            analyzable_count = session.query(Review).join(Job).filter(
+                Job.place_id == place_uuid, Review.text.isnot(None), Review.text != ''
+            ).count()
             analyses_count = session.query(ReviewAnalysis).join(Review).join(Job).filter(Job.place_id == place_uuid).count()
             mentions_count = session.query(RawMention).filter(RawMention.place_id == place_uuid).count()
         else:
             places_count = session.query(Place).count()
             reviews_count = session.query(Review).count()
+            analyzable_count = session.query(Review).filter(
+                Review.text.isnot(None), Review.text != ''
+            ).count()
             analyses_count = session.query(ReviewAnalysis).count()
             mentions_count = session.query(RawMention).count()
 
@@ -3374,7 +3478,7 @@ async def get_stats(place_id: Optional[str] = None):
             "reviews_count": reviews_count,
             "analyses_count": analyses_count,
             "mentions_count": mentions_count,
-            "pending_analyses": reviews_count - analyses_count,
+            "pending_analyses": max(0, analyzable_count - analyses_count),
             "queue_messages": queue_messages,
             "queue_consumers": queue_consumers,
             "scrape_jobs": {
@@ -3416,8 +3520,13 @@ def _get_place_pipeline_status(session, place) -> dict:
     """Calculate pipeline stage for a single place."""
     place_id = place.id
 
-    # Count reviews
+    # Count reviews (total and analyzable — reviews with text)
     reviews_count = session.query(Review).join(Job).filter(Job.place_id == place_id).count()
+    analyzable_reviews = session.query(Review).join(Job).filter(
+        Job.place_id == place_id,
+        Review.text.isnot(None),
+        Review.text != ''
+    ).count()
 
     # Count mentions extracted
     mentions_count = session.query(RawMention).filter(RawMention.place_id == place_id).count()
@@ -3440,6 +3549,14 @@ def _get_place_pipeline_status(session, place) -> dict:
 
     # Determine current stage
     # Stages: scraping → extracting → clustering → approving → analyzing → complete
+    total_items = 0
+    approved_items = 0
+    if taxonomy:
+        total_items = session.query(TaxonomyProduct).filter_by(taxonomy_id=taxonomy.id).count() + \
+                     session.query(TaxonomyCategory).filter_by(taxonomy_id=taxonomy.id).count()
+        approved_items = session.query(TaxonomyProduct).filter_by(taxonomy_id=taxonomy.id, is_approved=True).count() + \
+                        session.query(TaxonomyCategory).filter_by(taxonomy_id=taxonomy.id, is_approved=True).count()
+
     if reviews_count == 0:
         stage = "scraping"
         stage_progress = 0
@@ -3454,18 +3571,10 @@ def _get_place_pipeline_status(session, place) -> dict:
         stage_progress = 50  # Waiting for clustering to run
     elif taxonomy_status == "draft":
         stage = "approving"
-        # Calculate approval progress
-        if taxonomy:
-            total_items = session.query(TaxonomyProduct).filter_by(taxonomy_id=taxonomy.id).count() + \
-                         session.query(TaxonomyCategory).filter_by(taxonomy_id=taxonomy.id).count()
-            approved_items = session.query(TaxonomyProduct).filter_by(taxonomy_id=taxonomy.id, is_approved=True).count() + \
-                            session.query(TaxonomyCategory).filter_by(taxonomy_id=taxonomy.id, is_approved=True).count()
-            stage_progress = int((approved_items / total_items) * 100) if total_items > 0 else 0
-        else:
-            stage_progress = 0
-    elif taxonomy_status == "active" and analyses_count < reviews_count:
+        stage_progress = int((approved_items / total_items) * 100) if total_items > 0 else 0
+    elif taxonomy_status == "active" and analyses_count < analyzable_reviews:
         stage = "analyzing"
-        stage_progress = int((analyses_count / reviews_count) * 100) if reviews_count > 0 else 0
+        stage_progress = int((analyses_count / analyzable_reviews) * 100) if analyzable_reviews > 0 else 0
     else:
         stage = "complete"
         stage_progress = 100
@@ -3478,8 +3587,21 @@ def _get_place_pipeline_status(session, place) -> dict:
         "reviews_count": reviews_count,
         "mentions_count": mentions_count,
         "analyses_count": analyses_count,
+        "analyzable_reviews": analyzable_reviews,
         "taxonomy_status": taxonomy_status,
         "taxonomy_id": str(taxonomy.id) if taxonomy else None,
+        "stages": {
+            "scraping": {"reviews": reviews_count},
+            "extracting": {"mentions": mentions_count, "reviews": reviews_count},
+            "clustering": {"mentions": mentions_count},
+            "approving": {"approved": approved_items, "total": total_items},
+            "analyzing": {"analyzed": analyses_count, "total": analyzable_reviews},
+            "complete": {
+                "reviews": reviews_count,
+                "mentions": mentions_count,
+                "analyzed": analyses_count,
+            },
+        },
     }
 
 
