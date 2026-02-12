@@ -145,6 +145,9 @@ MINIO_SECRET_KEY = get_secret("MINIO_ROOT_PASSWORD", "nurliya123")
 MINIO_BUCKET = os.getenv("MINIO_BUCKET", "menu-images")
 MINIO_PUBLIC_URL = os.getenv("MINIO_PUBLIC_URL", "https://storage.nurliya.com")
 
+# Redis
+REDIS_URL = get_secret("REDIS_URL", "redis://localhost:6379/0")
+
 # Deprecated - kept for backwards compatibility
 GEMINI_API_KEY = get_secret("GEMINI_API_KEY", "")
 GEMINI_MODEL = "gemini-2.0-flash-lite"

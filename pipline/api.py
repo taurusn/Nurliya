@@ -2986,6 +2986,14 @@ async def publish_taxonomy(
 
         session.commit()
 
+        # Invalidate insights cache for all places in this taxonomy (non-blocking)
+        try:
+            from redis_client import invalidate_insights
+            for pid in all_place_ids:
+                invalidate_insights(str(pid))
+        except Exception as e:
+            logger.warning(f"Failed to invalidate insights cache: {e}")
+
         # Auto-learn anchors from approved categories (non-blocking)
         from anchor_manager import learn_from_approved_taxonomy
         try:
@@ -3857,6 +3865,187 @@ async def get_overview(
         session.close()
 
 
+@app.get("/api/insights")
+async def get_insights_endpoint(
+    place_id: str,
+    sections: Optional[str] = None,
+    days: int = 90,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Get business intelligence insights for a place.
+
+    Parameters:
+    - place_id: UUID of the place (required)
+    - sections: Comma-separated section names (optional, default: all)
+    - days: Time window for recent data (default: 90)
+    - start_date: Filter reviews from this date (YYYY-MM-DD)
+    - end_date: Filter reviews up to this date (YYYY-MM-DD)
+    """
+    from insights import get_insights
+
+    session = get_session()
+    try:
+        # Validate place access (same pattern as /api/overview)
+        user_jobs = session.query(ScrapeJob).filter(ScrapeJob.user_id == current_user.id).all()
+        user_place_ids = []
+        for job in user_jobs:
+            if job.pipeline_job_ids:
+                pipeline_jobs = session.query(Job).filter(Job.id.in_(job.pipeline_job_ids)).all()
+                user_place_ids.extend([str(pj.place_id) for pj in pipeline_jobs if pj.place_id])
+        user_place_ids = list(set(user_place_ids))
+
+        if place_id not in user_place_ids:
+            raise HTTPException(status_code=404, detail="Place not found or not accessible")
+
+        section_list = None
+        if sections:
+            section_list = [s.strip() for s in sections.split(",") if s.strip()]
+
+        result = get_insights(
+            session=session,
+            place_ids=[place_id],
+            sections=section_list,
+            days=days,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        return result
+    finally:
+        session.close()
+
+
+@app.get("/api/reviews/search")
+async def search_reviews(
+    place_id: str,
+    ids: Optional[str] = None,
+    product_id: Optional[str] = None,
+    topic: Optional[str] = None,
+    sentiment: Optional[str] = None,
+    author: Optional[str] = None,
+    day_of_week: Optional[int] = None,
+    limit: int = 20,
+    offset: int = 0,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Flexible review search for drill-down from insight sections.
+    Supports filtering by review IDs, product, topic, sentiment, author, day of week.
+    """
+    session = get_session()
+    try:
+        # Validate place access
+        user_jobs = session.query(ScrapeJob).filter(ScrapeJob.user_id == current_user.id).all()
+        user_place_ids = []
+        for job in user_jobs:
+            if job.pipeline_job_ids:
+                pipeline_jobs = session.query(Job).filter(Job.id.in_(job.pipeline_job_ids)).all()
+                user_place_ids.extend([str(pj.place_id) for pj in pipeline_jobs if pj.place_id])
+        user_place_ids = list(set(user_place_ids))
+
+        if place_id not in user_place_ids:
+            raise HTTPException(status_code=404, detail="Place not found or not accessible")
+
+        # Base query
+        query = (
+            session.query(Review, ReviewAnalysis)
+            .outerjoin(ReviewAnalysis, Review.id == ReviewAnalysis.review_id)
+            .filter(Review.place_id == place_id)
+        )
+
+        # Filter by specific IDs
+        if ids:
+            id_list = [i.strip() for i in ids.split(",") if i.strip()]
+            query = query.filter(Review.id.in_(id_list))
+
+        # Filter by product (via RawMention)
+        if product_id:
+            review_ids_with_product = (
+                session.query(RawMention.review_id)
+                .filter(
+                    RawMention.place_id == place_id,
+                    or_(
+                        RawMention.resolved_product_id == product_id,
+                        RawMention.discovered_product_id == product_id
+                    )
+                )
+                .distinct()
+                .all()
+            )
+            product_review_ids = [r[0] for r in review_ids_with_product]
+            query = query.filter(Review.id.in_(product_review_ids))
+
+        # Filter by sentiment
+        if sentiment:
+            query = query.filter(ReviewAnalysis.sentiment == sentiment)
+
+        # Filter by author
+        if author:
+            query = query.filter(Review.author == author)
+
+        # Get total before pagination
+        total = query.count()
+
+        # Get results
+        results = query.order_by(Review.created_at.desc()).offset(offset).limit(min(limit, 50)).all()
+
+        # Post-filter by topic and day_of_week (stored as strings/arrays, not SQL-filterable easily)
+        review_list = []
+        for review, analysis in results:
+            # Day of week filter
+            if day_of_week is not None and review.review_date:
+                try:
+                    parts = review.review_date.split("-")
+                    from datetime import date as dt_date
+                    d = dt_date(int(parts[0]), int(parts[1]), int(parts[2]))
+                    if d.weekday() != day_of_week:
+                        continue
+                except (ValueError, IndexError):
+                    continue
+
+            # Topic filter
+            if topic and analysis:
+                all_topics = (analysis.topics_positive or []) + (analysis.topics_negative or [])
+                if topic not in all_topics:
+                    continue
+
+            analysis_data = None
+            if analysis:
+                analysis_data = ReviewAnalysisData(
+                    sentiment=analysis.sentiment,
+                    score=float(analysis.score) if analysis.score else None,
+                    topics_positive=analysis.topics_positive or [],
+                    topics_negative=analysis.topics_negative or [],
+                    language=analysis.language,
+                    urgent=analysis.urgent or False,
+                    summary_ar=analysis.summary_ar,
+                    summary_en=analysis.summary_en,
+                    suggested_reply_ar=analysis.suggested_reply_ar,
+                    needs_action=analysis.needs_action or False,
+                    action_ar=analysis.action_ar,
+                    action_en=analysis.action_en,
+                )
+
+            review_list.append(ReviewWithAnalysis(
+                id=str(review.id),
+                author=review.author,
+                rating=review.rating,
+                text=review.text,
+                review_date=review.review_date,
+                analysis=analysis_data,
+            ))
+
+        # For topic/day_of_week post-filters, total is approximate
+        if topic or day_of_week is not None:
+            total = len(review_list)
+
+        return {"reviews": review_list, "total": total}
+    finally:
+        session.close()
+
+
 @app.get("/api/sentiment-trend")
 async def get_sentiment_trend(
     period: str = "7d",
@@ -4050,7 +4239,37 @@ async def get_sentiment_trend(
                 else:
                     buckets[bucket_key]["neutral"] += 1
 
-        # Sort buckets chronologically
+        # Fill empty buckets so bar count matches the requested range
+        def generate_all_keys(start, end, zoom_level):
+            keys = []
+            if zoom_level == "day":
+                d = start
+                while d <= end:
+                    keys.append(d.isoformat())
+                    d += timedelta(days=1)
+            elif zoom_level == "week":
+                d = start
+                while d <= end:
+                    keys.append(f"{d.year}-W{d.isocalendar()[1]:02d}")
+                    d += timedelta(days=7)
+            elif zoom_level == "month":
+                d = datetime(start.year, start.month, 1).date()
+                while d <= end:
+                    keys.append(d.strftime("%Y-%m"))
+                    if d.month == 12:
+                        d = datetime(d.year + 1, 1, 1).date()
+                    else:
+                        d = datetime(d.year, d.month + 1, 1).date()
+            else:  # year
+                for y in range(start.year, end.year + 1):
+                    keys.append(str(y))
+            return keys
+
+        all_keys = generate_all_keys(range_start, range_end, zoom)
+        for k in all_keys:
+            if k not in buckets:
+                buckets[k] = {"positive": 0, "negative": 0, "neutral": 0, "total": 0, "reviews": []}
+
         sorted_keys = sorted(buckets.keys())
 
         for key in sorted_keys:
@@ -4170,7 +4389,9 @@ async def get_sentiment_trend(
                         if cached:
                             llm_insight = {
                                 "analysis": cached.analysis,
-                                "recommendation": cached.recommendation
+                                "analysis_ar": getattr(cached, 'analysis_ar', None),
+                                "recommendation": cached.recommendation,
+                                "recommendation_ar": getattr(cached, 'recommendation_ar', None),
                             }
                         # Note: If not cached, insight was generated when job completed
                         # No queueing here - anomaly detection runs automatically on job completion

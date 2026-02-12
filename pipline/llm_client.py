@@ -151,13 +151,16 @@ TOPIC CHANGES VS 7-DAY BASELINE:
 REVIEWS FROM THIS DATE:
 {reviews_summary}
 
-Provide a brief analysis in JSON format:
+Provide a brief analysis in JSON format with both English and Arabic:
 {{
   "analysis": "2-3 sentences explaining what likely caused this anomaly. Look for patterns across reviews.",
-  "recommendation": "One specific, actionable step the business can take."
+  "analysis_ar": "نفس التحليل باللغة العربية، ٢-٣ جمل تشرح سبب هذا التغير",
+  "recommendation": "One specific, actionable step the business can take.",
+  "recommendation_ar": "خطوة واحدة محددة وقابلة للتنفيذ باللغة العربية"
 }}
 
 Be specific to the data provided. Do not give generic advice.
+The Arabic text must be a proper Arabic translation, not transliteration.
 Return ONLY valid JSON, no markdown or explanation."""
 
     logger.debug("Generating anomaly insight", extra={"extra_data": {"date": anomaly_date, "type": anomaly_type}})

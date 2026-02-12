@@ -30,6 +30,18 @@ services:
       retries: 5
     restart: unless-stopped
 
+  redis:
+    image: redis:7-alpine
+    container_name: nurliya-redis
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
   qdrant:
     image: qdrant/qdrant:latest
     container_name: nurliya-qdrant
@@ -90,6 +102,7 @@ services:
       JWT_SECRET: ${JWT_SECRET:-nurliya-jwt-change-in-production}
       # Vector DB
       QDRANT_URL: http://qdrant:6333
+      REDIS_URL: redis://redis:6379/0
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -100,6 +113,8 @@ services:
       rabbitmq:
         condition: service_healthy
       qdrant:
+        condition: service_healthy
+      redis:
         condition: service_healthy
       scraper:
         condition: service_started
@@ -129,6 +144,7 @@ services:
       SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL:-}
       # Vector DB
       QDRANT_URL: http://qdrant:6333
+      REDIS_URL: redis://redis:6379/0
       # Extraction mode - default TRUE for extract-first pipeline
       # Sentiment analysis runs AFTER taxonomy is approved/published
       EXTRACTION_ONLY_MODE: ${EXTRACTION_ONLY_MODE:-true}
@@ -140,6 +156,8 @@ services:
       rabbitmq:
         condition: service_healthy
       qdrant:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     restart: unless-stopped
     deploy:
@@ -223,6 +241,7 @@ services:
 
 volumes:
   postgres_data:
+  redis_data:
   rabbitmq_data:
   qdrant_data:
   scraper_data:

@@ -2,6 +2,31 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Year of Handcrafts — Saudi MoC Arabic font */
+@font-face {
+  font-family: 'YearOfHandcrafts';
+  src: url('https://twebs-uploads.s3.eu-west-1.amazonaws.com/1d4d9ab7-7e77-4872-8a15-76d095ecf7d2/custom_uploads/VGhlWWVhcm9mSGFuZGljcmFmdHMtUmVndWxhci5vdGYxNzM4NjYwODIwODA1.otf') format('opentype');
+  font-weight: 100 300;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'YearOfHandcrafts';
+  src: url('https://twebs-uploads.s3.eu-west-1.amazonaws.com/1d4d9ab7-7e77-4872-8a15-76d095ecf7d2/custom_uploads/VGhlWWVhcm9mSGFuZGljcmFmdHMtTWVkaXVtLm90ZjE3Mzg2NjA4MzI5OA==.otf') format('opentype');
+  font-weight: 400 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'YearOfHandcrafts';
+  src: url('https://twebs-uploads.s3.eu-west-1.amazonaws.com/1d4d9ab7-7e77-4872-8a15-76d095ecf7d2/custom_uploads/VGhlWWVhcm9mSGFuZGljcmFmdHMtQm9sZC5vdGYxNzM4NjYwODQ2NzY=.otf') format('opentype');
+  font-weight: 700 900;
+  font-style: normal;
+  font-display: swap;
+}
+
 :root {
   --background: #09090b;
   --foreground: #fafafa;
@@ -19,7 +44,7 @@ html {
 body {
   color: var(--foreground);
   background: var(--background);
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  font-family: 'YearOfHandcrafts', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
   line-height: 1.5;
 }
 

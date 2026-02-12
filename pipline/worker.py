@@ -632,6 +632,18 @@ def update_job_progress(job_id: str):
         # Trigger taxonomy clustering if conditions are met
         from clustering_job import trigger_taxonomy_clustering
         trigger_taxonomy_clustering(job_id)
+        # Invalidate insights cache so next request gets fresh data
+        try:
+            from redis_client import invalidate_insights
+            s = get_session()
+            try:
+                job_obj = s.query(Job).filter_by(id=job_id).first()
+                if job_obj and job_obj.place_id:
+                    invalidate_insights(str(job_obj.place_id))
+            finally:
+                s.close()
+        except Exception as e:
+            logger.warning(f"Failed to invalidate insights cache: {e}")
 
 
 def check_and_send_scrape_job_report(completed_job_id: str):
@@ -998,7 +1010,9 @@ def process_anomaly_insight(ch, method, properties, body):
                 magnitude=magnitude,
                 reason=reason,
                 analysis=insight.get("analysis"),
+                analysis_ar=insight.get("analysis_ar"),
                 recommendation=insight.get("recommendation"),
+                recommendation_ar=insight.get("recommendation_ar"),
                 review_ids=review_uuid_list if review_uuid_list else None
             )
             session.add(anomaly_insight)

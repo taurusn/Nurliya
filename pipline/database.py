@@ -161,8 +161,10 @@ class AnomalyInsight(Base):
     anomaly_type = Column(String(20))  # 'spike' or 'drop'
     magnitude = Column(DECIMAL(5, 2))  # percentage change
     reason = Column(Text)  # Statistical reason
-    analysis = Column(Text)  # LLM-generated analysis
-    recommendation = Column(Text)  # LLM-generated recommendation
+    analysis = Column(Text)  # LLM-generated analysis (English)
+    analysis_ar = Column(Text)  # LLM-generated analysis (Arabic)
+    recommendation = Column(Text)  # LLM-generated recommendation (English)
+    recommendation_ar = Column(Text)  # LLM-generated recommendation (Arabic)
     review_ids = Column(ARRAY(UUID(as_uuid=True)))  # Reviews that contributed to this anomaly
     created_at = Column(TIMESTAMP, default=datetime.utcnow)
 
