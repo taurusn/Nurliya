@@ -33,10 +33,11 @@ logger = get_logger(__name__, service="anchor_manager")
 
 # Thresholds for anchor matching
 # All embeddings are 384-dim (paraphrase-multilingual-MiniLM-L12-v2)
-LEARNED_MATCH_THRESHOLD = 0.80   # Learned from approved taxonomies
-IMPORT_MATCH_THRESHOLD = 0.70    # OS-imported anchors (relaxed for Arabic/multilingual)
-ARCHIVE_MATCH_THRESHOLD = 0.75   # Archive-derived anchors (from previous approved taxonomies)
-DEFAULT_MATCH_THRESHOLD = 0.85
+# V2: 1-NN margin-based rejection replaces absolute thresholds.
+# Margin = minimum gap between best and second-best category scores.
+DEFAULT_MARGIN = 0.01        # Reject if best category doesn't beat runner-up by this margin
+IMPORT_MATCH_THRESHOLD = 0.70    # OS-imported anchors (still centroid-based)
+ARCHIVE_MATCH_THRESHOLD = 0.75   # Archive-derived anchors (still centroid-based)
 
 # Learning weights
 CORRECTION_WEIGHT = 2.0  # Human corrections count 2x vs auto-discovered mentions
@@ -98,17 +99,15 @@ class AnchorMatch:
 
 def load_anchors_for_business(business_type: str) -> List[Dict]:
     """
-    Load all anchors (learned + imported) for a business type.
+    Load all anchors and their individual examples for a business type.
 
-    Anchors are stored in PostgreSQL with centroid embeddings as JSONB.
-    Each centroid is a 384-dim vector (MiniLM-L12-v2), compatible with
-    the vectors stored in Qdrant's MENTIONS_COLLECTION.
+    Returns anchor metadata plus pre-normalized example vectors for 1-NN classification.
 
     Args:
         business_type: Business type identifier (e.g., 'coffee_shop')
 
     Returns:
-        List of anchor dictionaries with centroid embeddings
+        List of anchor dictionaries with centroid + individual examples
     """
     session = SessionLocal()
     try:
@@ -117,22 +116,47 @@ def load_anchors_for_business(business_type: str) -> List[Dict]:
         ).all()
 
         result = []
+        total_examples = 0
         for anchor in anchors:
-            if anchor.centroid_embedding:
-                result.append({
-                    "id": str(anchor.id),
-                    "category_name": anchor.category_name,
-                    "display_name_en": anchor.display_name_en,
-                    "display_name_ar": anchor.display_name_ar,
-                    "is_aspect": anchor.is_aspect,
-                    "centroid_embedding": anchor.centroid_embedding,
-                    "source": anchor.source,
-                    "example_count": anchor.example_count,
-                    "match_count": anchor.match_count,
-                })
+            if not anchor.centroid_embedding:
+                continue
 
-        logger.info(f"Loaded {len(result)} anchors for {business_type}",
-                   extra={"extra_data": {"business_type": business_type}})
+            # Load individual examples for 1-NN classification
+            examples = session.query(AnchorExample).filter_by(
+                anchor_id=anchor.id
+            ).all()
+
+            example_list = []
+            seen_texts = set()
+            for ex in examples:
+                if not ex.embedding or ex.text in seen_texts:
+                    continue  # Skip duplicates
+                seen_texts.add(ex.text)
+                emb = np.array(ex.embedding)
+                norm = np.linalg.norm(emb)
+                if norm > 0:
+                    example_list.append({
+                        "text": ex.text,
+                        "unit_vec": (emb / norm).tolist(),
+                        "source": ex.source,
+                    })
+
+            total_examples += len(example_list)
+            result.append({
+                "id": str(anchor.id),
+                "category_name": anchor.category_name,
+                "display_name_en": anchor.display_name_en,
+                "display_name_ar": anchor.display_name_ar,
+                "is_aspect": anchor.is_aspect,
+                "centroid_embedding": anchor.centroid_embedding,
+                "source": anchor.source,
+                "example_count": anchor.example_count,
+                "match_count": anchor.match_count,
+                "examples": example_list,
+            })
+
+        logger.info(f"Loaded {len(result)} anchors ({total_examples} examples) for {business_type}",
+                    extra={"data": {"service": "anchor_manager", "business_type": business_type}})
         return result
 
     finally:
@@ -142,21 +166,24 @@ def load_anchors_for_business(business_type: str) -> List[Dict]:
 def classify_to_anchor(
     embedding: List[float],
     anchors: List[Dict],
-    threshold: float = DEFAULT_MATCH_THRESHOLD,
+    margin: float = DEFAULT_MARGIN,
 ) -> Optional[AnchorMatch]:
     """
-    Classify a mention embedding to the nearest anchor if above threshold.
+    Classify a mention embedding using 1-nearest-neighbor with margin rejection.
 
-    Uses cosine similarity to find the best matching anchor.
-    Applies source-specific thresholds (learned=0.88, import=0.85).
+    Compares against individual anchor examples (not centroids). Rejects
+    ambiguous matches where the best category doesn't beat the runner-up
+    by the required margin.
+
+    For import/archive anchors that lack examples, falls back to centroid matching.
 
     Args:
         embedding: 384-dim embedding vector (MiniLM-L12-v2)
-        anchors: List of anchor dictionaries from load_anchors_for_business
-        threshold: Minimum similarity threshold for a match
+        anchors: List of anchor dicts from load_anchors_for_business (with 'examples')
+        margin: Minimum gap between best and second-best category scores
 
     Returns:
-        AnchorMatch if found, None otherwise
+        AnchorMatch if confident match found, None otherwise
     """
     if not anchors or not embedding:
         return None
@@ -169,51 +196,58 @@ def classify_to_anchor(
 
     query_vec = query_vec / query_norm
 
-    best_match = None
-    best_score = threshold  # Only consider matches above threshold
+    # Collect best score per category from individual examples (1-NN per category)
+    cat_best = {}  # category_name -> (score, anchor_dict)
 
     for anchor in anchors:
-        centroid = np.array(anchor["centroid_embedding"])
-        centroid_norm = np.linalg.norm(centroid)
-
-        if centroid_norm == 0:
-            continue
-
-        centroid = centroid / centroid_norm
-
-        # Cosine similarity
-        score = float(np.dot(query_vec, centroid))
-
-        # Apply source-specific threshold
+        cat_name = anchor["category_name"]
         source = anchor.get("source", "learned")
-        if source == "import":
-            anchor_threshold = IMPORT_MATCH_THRESHOLD
-        elif source == "archive":
-            anchor_threshold = ARCHIVE_MATCH_THRESHOLD
+
+        # For learned/correction anchors: use individual examples
+        examples = anchor.get("examples", [])
+        if examples:
+            for ex in examples:
+                ex_vec = np.array(ex["unit_vec"])
+                score = float(np.dot(query_vec, ex_vec))
+                if cat_name not in cat_best or score > cat_best[cat_name][0]:
+                    cat_best[cat_name] = (score, anchor)
         else:
-            anchor_threshold = LEARNED_MATCH_THRESHOLD
+            # Fallback to centroid for import/archive anchors without examples
+            centroid = anchor.get("centroid_embedding")
+            if centroid:
+                c = np.array(centroid)
+                cn = np.linalg.norm(c)
+                if cn > 0:
+                    score = float(np.dot(query_vec, c / cn))
+                    # Apply source-specific threshold for centroid fallback
+                    thresh = IMPORT_MATCH_THRESHOLD if source == "import" else ARCHIVE_MATCH_THRESHOLD
+                    if score >= thresh:
+                        if cat_name not in cat_best or score > cat_best[cat_name][0]:
+                            cat_best[cat_name] = (score, anchor)
 
-        if score < anchor_threshold:
-            continue
+    if not cat_best:
+        return None
 
-        # Update best match (highest score wins)
-        if score > best_score:
-            best_score = score
-            best_match = anchor
+    # Sort categories by best score
+    ranked = sorted(cat_best.items(), key=lambda x: x[1][0], reverse=True)
+    best_cat, (best_score, best_anchor) = ranked[0]
 
-    if best_match:
-        return AnchorMatch(
-            anchor_id=best_match["id"],
-            anchor_name=best_match["category_name"],
-            category_name=best_match["category_name"],
-            display_name_en=best_match["display_name_en"],
-            display_name_ar=best_match["display_name_ar"],
-            is_aspect=best_match["is_aspect"],
-            confidence=best_score,
-            source=best_match.get("source", "learned"),
-        )
+    # Margin rejection: best must beat second-best category by margin
+    if len(ranked) > 1:
+        second_score = ranked[1][1][0]
+        if best_score - second_score < margin:
+            return None  # Ambiguous — send to HDBSCAN discovery
 
-    return None
+    return AnchorMatch(
+        anchor_id=best_anchor["id"],
+        anchor_name=best_anchor["category_name"],
+        category_name=best_anchor["category_name"],
+        display_name_en=best_anchor["display_name_en"],
+        display_name_ar=best_anchor["display_name_ar"],
+        is_aspect=best_anchor["is_aspect"],
+        confidence=best_score,
+        source=best_anchor.get("source", "learned"),
+    )
 
 
 def update_anchor_stats(anchor_id: str, confidence: float):
@@ -252,10 +286,14 @@ def update_anchor_stats(anchor_id: str, confidence: float):
 
 def learn_from_approved_taxonomy(taxonomy_id: str) -> int:
     """
-    Extract new anchors/examples from an approved taxonomy.
+    Extract anchor examples from an approved taxonomy.
 
-    Called when a taxonomy is published/approved. Extracts categories
-    and their mentions as learned examples for future places.
+    Called when a taxonomy is published/approved. Learns from:
+    - Approved product canonical names + variants (high-quality, human-reviewed labels)
+    - For aspect categories: unique mention texts (limited to top-frequency)
+
+    Does NOT bulk-add all raw mention texts — those are noisy and cause
+    centroid dilution. Product names are the curated signal.
 
     Args:
         taxonomy_id: UUID of the approved taxonomy
@@ -272,162 +310,120 @@ def learn_from_approved_taxonomy(taxonomy_id: str) -> int:
             logger.warning(f"Taxonomy not found: {taxonomy_id}")
             return 0
 
-        # Get business type from place (normalized for cross-place consistency)
         business_type = normalize_business_type(taxonomy.place.category) if taxonomy.place else "general"
 
-        # Process each approved category
         for category in taxonomy.categories:
             if not category.is_approved:
                 continue
 
-            # Get all mentions in this category (check both discovered and resolved)
-            mentions = session.query(RawMention).filter(
-                or_(
-                    RawMention.discovered_category_id == category.id,
-                    RawMention.resolved_category_id == category.id,
-                )
-            ).all()
+            # Collect texts to learn from this category
+            texts_to_learn = []
 
-            # For product categories, also collect product names/variants
-            product_texts = []
             if category.has_products:
+                # Product categories: learn from canonical product names + variants
                 products = session.query(TaxonomyProduct).filter_by(
                     assigned_category_id=category.id,
                     is_approved=True,
                 ).all()
                 for product in products:
                     if product.canonical_text:
-                        product_texts.append(product.canonical_text)
+                        texts_to_learn.append(product.canonical_text)
                     if product.variants:
-                        product_texts.extend(product.variants)
+                        texts_to_learn.extend(product.variants)
+            else:
+                # Aspect categories: learn from unique mention texts (limit 20)
+                mentions = session.query(RawMention).filter(
+                    or_(
+                        RawMention.discovered_category_id == category.id,
+                        RawMention.resolved_category_id == category.id,
+                    )
+                ).all()
+                seen = set()
+                for m in mentions:
+                    if m.mention_text and m.mention_text not in seen:
+                        seen.add(m.mention_text)
+                        texts_to_learn.append(m.mention_text)
+                        if len(texts_to_learn) >= 20:
+                            break
 
-            if not mentions and not product_texts:
+            if not texts_to_learn:
                 continue
 
+            # Deduplicate
+            texts_to_learn = list(dict.fromkeys(texts_to_learn))
+
             # Find or create anchor
-            existing_anchor = session.query(CategoryAnchor).filter_by(
+            anchor = session.query(CategoryAnchor).filter_by(
                 business_type=business_type,
-                category_name=category.name
+                category_name=category.name,
             ).first()
 
-            if existing_anchor:
-                # Add new examples to existing anchor
-                for mention in mentions:
-                    if not mention.qdrant_point_id:
-                        continue
+            if not anchor:
+                # Generate embeddings for initial centroid
+                embeddings = embedding_client.generate_embeddings(texts_to_learn)
+                if not embeddings:
+                    continue
+                valid_pairs = [(t, e) for t, e in zip(texts_to_learn, embeddings) if e]
+                if not valid_pairs:
+                    continue
 
-                    # Check if example already exists
-                    existing_example = session.query(AnchorExample).filter_by(
-                        anchor_id=existing_anchor.id,
-                        text=mention.mention_text
-                    ).first()
+                centroid = np.mean([e for _, e in valid_pairs], axis=0).tolist()
+                anchor = CategoryAnchor(
+                    business_type=business_type,
+                    category_name=category.name,
+                    display_name_en=category.display_name_en,
+                    display_name_ar=category.display_name_ar,
+                    is_aspect=not category.has_products,
+                    centroid_embedding=centroid,
+                    sample_terms=[t for t, _ in valid_pairs[:10]],
+                    source="learned",
+                    example_count=len(valid_pairs),
+                    match_count=0,
+                )
+                session.add(anchor)
+                session.flush()
 
-                    if not existing_example:
-                        # Generate embedding for this text
-                        embeddings = embedding_client.generate_embeddings([mention.mention_text])
-                        if embeddings and embeddings[0]:
-                            example = AnchorExample(
-                                anchor_id=existing_anchor.id,
-                                text=mention.mention_text,
-                                embedding=embeddings[0],
-                                source="learned",
-                                source_taxonomy_id=uuid.UUID(taxonomy_id),
-                                mention_count=1,
-                            )
-                            session.add(example)
-                            learned_count += 1
-
-                # Add product texts as examples for product categories
-                for ptext in product_texts:
-                    existing_example = session.query(AnchorExample).filter_by(
-                        anchor_id=existing_anchor.id,
-                        text=ptext
-                    ).first()
-                    if not existing_example:
-                        embeddings = embedding_client.generate_embeddings([ptext])
-                        if embeddings and embeddings[0]:
-                            example = AnchorExample(
-                                anchor_id=existing_anchor.id,
-                                text=ptext,
-                                embedding=embeddings[0],
-                                source="learned",
-                                source_taxonomy_id=uuid.UUID(taxonomy_id),
-                                mention_count=1,
-                            )
-                            session.add(example)
-                            learned_count += 1
-
-                # Recompute centroid
-                _recompute_anchor_centroid(session, existing_anchor)
-
+                for text, emb in valid_pairs:
+                    session.add(AnchorExample(
+                        anchor_id=anchor.id,
+                        text=text,
+                        embedding=emb,
+                        source="learned",
+                        source_taxonomy_id=uuid.UUID(taxonomy_id),
+                        mention_count=1,
+                    ))
+                    learned_count += 1
             else:
-                # Create new learned anchor
-                anchor = None
-                if mentions:
-                    anchor = _create_anchor_from_category(
-                        session=session,
-                        business_type=business_type,
-                        category=category,
-                        mentions=mentions,
-                        taxonomy_id=taxonomy_id,
-                        source="learned"
-                    )
-                    if anchor:
-                        learned_count += len(mentions)
+                # Add to existing anchor — only NEW texts, skip duplicates
+                existing_texts = set(
+                    row[0] for row in session.query(AnchorExample.text)
+                    .filter_by(anchor_id=anchor.id).all()
+                )
+                new_texts = [t for t in texts_to_learn if t not in existing_texts]
+                if not new_texts:
+                    continue
 
-                # If no anchor yet (no mentions or embedding failed), create from product texts
-                if not anchor and product_texts:
-                    prod_embeddings = embedding_client.generate_embeddings(product_texts)
-                    if prod_embeddings:
-                        valid_pairs = [(t, e) for t, e in zip(product_texts, prod_embeddings) if e]
-                        if valid_pairs:
-                            centroid = np.mean([e for _, e in valid_pairs], axis=0).tolist()
-                            anchor = CategoryAnchor(
-                                business_type=business_type,
-                                category_name=category.name,
-                                display_name_en=category.display_name_en,
-                                display_name_ar=category.display_name_ar,
-                                is_aspect=not category.has_products,
-                                centroid_embedding=centroid,
-                                sample_terms=[t for t, _ in valid_pairs[:10]],
-                                source="learned",
-                                example_count=len(valid_pairs),
-                                match_count=0,
-                            )
-                            session.add(anchor)
-                            session.flush()
-                            for ptext, pemb in valid_pairs:
-                                example = AnchorExample(
-                                    anchor_id=anchor.id,
-                                    text=ptext,
-                                    embedding=pemb,
-                                    source="learned",
-                                    source_taxonomy_id=uuid.UUID(taxonomy_id) if taxonomy_id else None,
-                                    mention_count=1,
-                                )
-                                session.add(example)
-                                learned_count += 1
+                embeddings = embedding_client.generate_embeddings(new_texts)
+                if not embeddings:
+                    continue
 
-                # Add product texts as additional examples to mention-based anchor
-                elif anchor and product_texts:
-                    prod_embeddings = embedding_client.generate_embeddings(product_texts)
-                    if prod_embeddings:
-                        for ptext, pemb in zip(product_texts, prod_embeddings):
-                            if pemb:
-                                example = AnchorExample(
-                                    anchor_id=anchor.id,
-                                    text=ptext,
-                                    embedding=pemb,
-                                    source="learned",
-                                    source_taxonomy_id=uuid.UUID(taxonomy_id) if taxonomy_id else None,
-                                    mention_count=1,
-                                )
-                                session.add(example)
-                                learned_count += 1
-                        _recompute_anchor_centroid(session, anchor)
+                for text, emb in zip(new_texts, embeddings):
+                    if emb:
+                        session.add(AnchorExample(
+                            anchor_id=anchor.id,
+                            text=text,
+                            embedding=emb,
+                            source="learned",
+                            source_taxonomy_id=uuid.UUID(taxonomy_id),
+                            mention_count=1,
+                        ))
+                        learned_count += 1
+
+                _recompute_anchor_centroid(session, anchor)
 
         session.commit()
-        logger.info(f"Learned {learned_count} examples from taxonomy {taxonomy_id}")
+        logger.info(f"Learned {learned_count} examples from taxonomy {taxonomy_id}",
+                    extra={"data": {"taxonomy_id": taxonomy_id, "learned": learned_count}})
         return learned_count
 
     except Exception as e:
